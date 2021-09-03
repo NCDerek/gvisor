@@ -315,7 +315,15 @@ type accepted struct {
 	// belong to one list at a time, and endpoints are already stored in the
 	// dispatcher's list.
 	endpoints list.List `state:".([]*endpoint)"`
-	cap       int
+
+	// pendingEndpointsFromSynCookie counts the number of endpoints that were
+	// created after receiving an ACK with a valid cookie, and are currently being
+	// delivered to the accept queue.
+	pendingEndpointsFromSynCookie int
+
+	// cap is the maximum number of endpoints that can be in the accepted endpoint
+	// list.
+	cap int
 }
 
 // endpoint represents a TCP endpoint. This struct serves as the interface
@@ -1085,6 +1093,7 @@ func (e *endpoint) closeNoShutdownLocked() {
 
 // closePendingAcceptableConnections closes all connections that have completed
 // handshake but not yet been delivered to the application.
+// checklocks:e.mu
 func (e *endpoint) closePendingAcceptableConnectionsLocked() {
 	e.acceptMu.Lock()
 	acceptedCopy := e.accepted
@@ -2383,6 +2392,7 @@ func (e *endpoint) Shutdown(flags tcpip.ShutdownFlags) tcpip.Error {
 	return e.shutdownLocked(flags)
 }
 
+// checklocks:e.mu
 func (e *endpoint) shutdownLocked(flags tcpip.ShutdownFlags) tcpip.Error {
 	e.shutdownFlags |= flags
 	switch {
@@ -2490,7 +2500,7 @@ func (e *endpoint) listen(backlog int) tcpip.Error {
 		} else {
 			// Adjust the size of the backlog iff we can fit
 			// existing pending connections into the new one.
-			if e.accepted.endpoints.Len() > backlog {
+			if e.acceptQueueSizeLocked() > backlog {
 				return &tcpip.ErrInvalidEndpointState{}
 			}
 			e.accepted.cap = backlog

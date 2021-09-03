@@ -425,12 +425,15 @@ func (e *endpoint) deliverAccepted(n *endpoint, withSynCookie bool) {
 			}
 
 			e.accepted.endpoints.PushBack(n)
-			if !withSynCookie {
+			if withSynCookie {
+				e.accepted.pendingEndpointsFromSynCookie--
+			} else {
 				atomic.AddInt32(&e.synRcvdCount, -1)
 			}
 			return true
 		}
 	}()
+
 	if delivered {
 		e.waiterQueue.Notify(waiter.ReadableEvents)
 	} else {
@@ -544,9 +547,19 @@ func (e *endpoint) synRcvdBacklogFull() bool {
 
 func (e *endpoint) acceptQueueIsFull() bool {
 	e.acceptMu.Lock()
-	full := e.accepted != (accepted{}) && e.accepted.endpoints.Len() == e.accepted.cap
+	full := e.acceptQueueIsFullLocked()
 	e.acceptMu.Unlock()
 	return full
+}
+
+// checklocks:e.acceptMu
+func (e *endpoint) acceptQueueIsFullLocked() bool {
+	return e.acceptQueueSizeLocked() == e.accepted.cap
+}
+
+// checklocks:e.acceptMu
+func (e *endpoint) acceptQueueSizeLocked() int {
+	return e.accepted.pendingEndpointsFromSynCookie + e.accepted.endpoints.Len()
 }
 
 // handleListenSegment is called when a listening endpoint receives a segment
@@ -755,19 +768,36 @@ func (e *endpoint) handleListenSegment(ctx *listenContext, s *segment) tcpip.Err
 			n.newSegmentWaker.Assert()
 		}
 
-		// Do the delivery in a separate goroutine so
-		// that we don't block the listen loop in case
-		// the application is slow to accept or stops
-		// accepting.
-		//
-		// NOTE: This won't result in an unbounded
-		// number of goroutines as we do check before
-		// entering here that there was at least some
-		// space available in the backlog.
-
 		// Start the protocol goroutine.
 		n.startAcceptedLoop()
 		e.stack.Stats().TCP.PassiveConnectionOpenings.Increment()
+
+		// Deliver the endpoint to the accept queue.
+		e.acceptMu.Lock()
+		if e.accepted == (accepted{}) {
+			e.acceptMu.Unlock()
+			n.notifyProtocolGoroutine(notifyReset)
+			return nil
+		}
+
+		if !e.acceptQueueIsFullLocked() {
+			e.accepted.endpoints.PushBack(n)
+			e.acceptMu.Unlock()
+			e.waiterQueue.Notify(waiter.ReadableEvents)
+			return nil
+		}
+
+		// The accept queue *became* full while we were getting ready to deliver the
+		// endpoint to the accept queue, so we must attempt to perform the delivery
+		// asynchronously. Otherwise it would block the listen loop until there is
+		// space in the accept queue.
+		//
+		// Keep track of the number of endpoints in this
+		// accepted-but-not-yet-delivered state. It is used when determining if the
+		// accept queue is full. We consider that an endpoint in this state takes a
+		// spot in the backlog.
+		e.accepted.pendingEndpointsFromSynCookie++
+		e.acceptMu.Unlock()
 		go e.deliverAccepted(n, true /*withSynCookie*/)
 		return nil
 
