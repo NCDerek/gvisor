@@ -252,10 +252,25 @@ func (e *endpoint) Read(dst io.Writer, opts tcpip.ReadOptions) (tcpip.ReadResult
 	default:
 		panic(fmt.Sprintf("unrecognized network protocol = %d", p.netProto))
 	}
-	if e.ops.GetReceivePacketInfo() {
-		cm.HasIPPacketInfo = true
-		cm.PacketInfo = p.packetInfo
+
+	switch p.netProto {
+	case header.IPv4ProtocolNumber:
+		cm.HasIPPacketInfo = e.ops.GetReceivePacketInfo()
+		if cm.HasIPPacketInfo {
+			cm.PacketInfo = p.packetInfo
+		}
+	case header.IPv6ProtocolNumber:
+		cm.HasIPv6PacketInfo = e.ops.GetIPv6ReceivePacketInfo()
+		if cm.HasIPv6PacketInfo {
+			cm.IPv6PacketInfo = tcpip.IPv6PacketInfo{
+				NIC:  p.packetInfo.NIC,
+				Addr: p.packetInfo.DestinationAddr,
+			}
+		}
+	default:
+		panic(fmt.Sprintf("unrecognized network protocol = %d", p.netProto))
 	}
+
 	if e.ops.GetReceiveOriginalDstAddress() {
 		cm.HasOriginalDstAddress = true
 		cm.OriginalDstAddress = p.destinationAddress
