@@ -49,6 +49,7 @@ type rawPacket struct {
 	receivedAt time.Time             `state:".(int64)"`
 	// senderAddr is the network address of the sender.
 	senderAddr tcpip.FullAddress
+	packetInfo tcpip.IPPacketInfo
 }
 
 // endpoint is the raw socket implementation of tcpip.Endpoint. It is legal to
@@ -207,6 +208,23 @@ func (e *endpoint) Read(dst io.Writer, opts tcpip.ReadOptions) (tcpip.ReadResult
 	}
 	if opts.NeedRemoteAddr {
 		res.RemoteAddr = pkt.senderAddr
+	}
+	switch netProto := e.net.NetProto(); netProto {
+	case header.IPv4ProtocolNumber:
+		res.ControlMessages.HasIPPacketInfo = e.ops.GetReceivePacketInfo()
+		if res.ControlMessages.HasIPPacketInfo {
+			res.ControlMessages.PacketInfo = pkt.packetInfo
+		}
+	case header.IPv6ProtocolNumber:
+		res.ControlMessages.HasIPv6PacketInfo = e.ops.GetIPv6ReceivePacketInfo()
+		if res.ControlMessages.HasIPv6PacketInfo {
+			res.ControlMessages.IPv6PacketInfo = tcpip.IPv6PacketInfo{
+				NIC:  pkt.packetInfo.NIC,
+				Addr: pkt.packetInfo.DestinationAddr,
+			}
+		}
+	default:
+		panic(fmt.Sprintf("unrecognized network protocol = %d", netProto))
 	}
 
 	n, err := pkt.data.ReadTo(dst, opts.Peek)
@@ -435,6 +453,7 @@ func (e *endpoint) HandlePacket(pkt *stack.PacketBuffer) {
 			return false
 		}
 
+		dstAddr := pkt.Network().DestinationAddress()
 		srcAddr := pkt.Network().SourceAddress()
 		info := e.net.Info()
 
@@ -457,7 +476,7 @@ func (e *endpoint) HandlePacket(pkt *stack.PacketBuffer) {
 			}
 
 			// If bound to an address, only accept data for that address.
-			if info.BindAddr != "" && info.BindAddr != pkt.Network().DestinationAddress() {
+			if info.BindAddr != "" && info.BindAddr != dstAddr {
 				return false
 			}
 		default:
@@ -471,6 +490,14 @@ func (e *endpoint) HandlePacket(pkt *stack.PacketBuffer) {
 			senderAddr: tcpip.FullAddress{
 				NIC:  pkt.NICID,
 				Addr: srcAddr,
+			},
+			packetInfo: tcpip.IPPacketInfo{
+				// TODO(gvisor.dev/issue/3556): dstAddr may be a multicast or broadcast
+				// address. LocalAddr should hold a unicast address that can be
+				// used to respond to the incoming packet.
+				LocalAddr:       dstAddr,
+				DestinationAddr: dstAddr,
+				NIC:             pkt.NICID,
 			},
 		}
 

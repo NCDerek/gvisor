@@ -419,6 +419,27 @@ func bytesToIPAddress(addr []byte) tcpip.Address {
 	return tcpip.Address(addr)
 }
 
+// minSockAddrLen returns the minimum length of a socket address for the
+// socket's family.
+func (s *socketOpsCommon) minSockAddrLen() int {
+	const addressFamilySize = 2
+
+	switch s.family {
+	case linux.AF_UNIX:
+		return addressFamilySize
+	case linux.AF_INET:
+		return sockAddrInetSize
+	case linux.AF_INET6:
+		return sockAddrInet6Size
+	case linux.AF_PACKET:
+		return sockAddrLinkSize
+	case linux.AF_UNSPEC:
+		return addressFamilySize
+	default:
+		panic(fmt.Sprintf("s.family unrecognized = %d", s.family))
+	}
+}
+
 func (s *socketOpsCommon) isPacketBased() bool {
 	return s.skType == linux.SOCK_DGRAM || s.skType == linux.SOCK_SEQPACKET || s.skType == linux.SOCK_RDM || s.skType == linux.SOCK_RAW
 }
@@ -545,16 +566,16 @@ func (s *socketOpsCommon) Readiness(mask waiter.EventMask) waiter.EventMask {
 	return s.Endpoint.Readiness(mask)
 }
 
-func (s *socketOpsCommon) checkFamily(family uint16, exact bool) *syserr.Error {
+func (s *socketOpsCommon) checkFamily(family uint16, exact bool) bool {
 	if family == uint16(s.family) {
-		return nil
+		return true
 	}
 	if !exact && family == linux.AF_INET && s.family == linux.AF_INET6 {
 		if !s.Endpoint.SocketOptions().GetV6Only() {
-			return nil
+			return true
 		}
 	}
-	return syserr.ErrInvalidArgument
+	return false
 }
 
 // mapFamily maps the AF_INET ANY address to the IPv4-mapped IPv6 ANY if the
@@ -587,8 +608,8 @@ func (s *socketOpsCommon) Connect(t *kernel.Task, sockaddr []byte, blocking bool
 		return syserr.TranslateNetstackError(err)
 	}
 
-	if err := s.checkFamily(family, false /* exact */); err != nil {
-		return err
+	if !s.checkFamily(family, false /* exact */) {
+		return syserr.ErrInvalidArgument
 	}
 	addr = s.mapFamily(addr, family)
 
@@ -655,14 +676,18 @@ func (s *socketOpsCommon) Bind(t *kernel.Task, sockaddr []byte) *syserr.Error {
 			Addr: tcpip.Address(a.HardwareAddr[:header.EthernetAddressSize]),
 		}
 	} else {
+		if s.minSockAddrLen() > len(sockaddr) {
+			return syserr.ErrInvalidArgument
+		}
+
 		var err *syserr.Error
 		addr, family, err = socket.AddressAndFamily(sockaddr)
 		if err != nil {
 			return err
 		}
 
-		if err = s.checkFamily(family, true /* exact */); err != nil {
-			return err
+		if !s.checkFamily(family, true /* exact */) {
+			return syserr.ErrAddressFamilyNotSupported
 		}
 
 		addr = s.mapFamily(addr, family)
@@ -1342,6 +1367,14 @@ func getSockOptIPv6(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name 
 		}
 
 		v := primitive.Int32(boolToInt32(ep.SocketOptions().GetReceiveOriginalDstAddress()))
+		return &v, nil
+
+	case linux.IPV6_RECVPKTINFO:
+		if outLen < sizeOfInt32 {
+			return nil, syserr.ErrInvalidArgument
+		}
+
+		v := primitive.Int32(boolToInt32(ep.SocketOptions().GetIPv6ReceivePacketInfo()))
 		return &v, nil
 
 	case linux.IP6T_ORIGINAL_DST:
@@ -2100,6 +2133,15 @@ func setSockOptIPv6(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name 
 		ep.SocketOptions().SetReceiveOriginalDstAddress(v != 0)
 		return nil
 
+	case linux.IPV6_RECVPKTINFO:
+		if len(optVal) < sizeOfInt32 {
+			return syserr.ErrInvalidArgument
+		}
+		v := int32(hostarch.ByteOrder.Uint32(optVal))
+
+		ep.SocketOptions().SetIPv6ReceivePacketInfo(v != 0)
+		return nil
+
 	case linux.IPV6_TCLASS:
 		if len(optVal) < sizeOfInt32 {
 			return syserr.ErrInvalidArgument
@@ -2489,7 +2531,6 @@ func emitUnimplementedEventIPv6(t *kernel.Task, name int) {
 		linux.IPV6_RECVHOPLIMIT,
 		linux.IPV6_RECVHOPOPTS,
 		linux.IPV6_RECVPATHMTU,
-		linux.IPV6_RECVPKTINFO,
 		linux.IPV6_RECVRTHDR,
 		linux.IPV6_RTHDR,
 		linux.IPV6_RTHDRDSTOPTS,
@@ -2715,6 +2756,8 @@ func (s *socketOpsCommon) controlMessages(cm tcpip.ControlMessages) socket.Contr
 			TClass:             readCM.TClass,
 			HasIPPacketInfo:    readCM.HasIPPacketInfo,
 			PacketInfo:         readCM.PacketInfo,
+			HasIPv6PacketInfo:  readCM.HasIPv6PacketInfo,
+			IPv6PacketInfo:     readCM.IPv6PacketInfo,
 			OriginalDstAddress: readCM.OriginalDstAddress,
 			SockErr:            readCM.SockErr,
 		},
@@ -2872,8 +2915,8 @@ func (s *socketOpsCommon) SendMsg(t *kernel.Task, src usermem.IOSequence, to []b
 		if err != nil {
 			return 0, err
 		}
-		if err := s.checkFamily(family, false /* exact */); err != nil {
-			return 0, err
+		if !s.checkFamily(family, false /* exact */) {
+			return 0, syserr.ErrInvalidArgument
 		}
 		addrBuf = s.mapFamily(addrBuf, family)
 
