@@ -996,7 +996,7 @@ func (e *endpoint) resetConnectionLocked(err tcpip.Error) {
 		if !sndWndEnd.LessThan(e.snd.SndNxt) || e.snd.SndNxt.Size(sndWndEnd) < (1<<e.snd.SndWndScale) {
 			resetSeqNum = e.snd.SndNxt
 		}
-		e.sendRaw(buffer.VectorisedView{}, header.TCPFlagAck|header.TCPFlagRst, resetSeqNum, e.rcv.RcvNxt, 2)
+		e.sendRaw(buffer.VectorisedView{}, header.TCPFlagAck|header.TCPFlagRst, resetSeqNum, e.rcv.RcvNxt, 0)
 	}
 }
 
