@@ -116,10 +116,6 @@ func (r *ForwarderRequest) ID() stack.TransportEndpointID {
 	return r.segment.id
 }
 
-func (r *ForwarderRequest) GetNICID() tcpip.NICID {
-	return r.segment.nicID
-}
-
 // Complete completes the request, and optionally sends a RST segment back to the
 // sender.
 func (r *ForwarderRequest) Complete(sendReset bool) {
