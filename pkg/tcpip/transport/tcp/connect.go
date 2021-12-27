@@ -1049,7 +1049,7 @@ func (e *endpoint) tryDeliverSegmentFromClosedEndpoint(s *segment) {
 			s.nicID,
 		)
 	}
-	if ep == nil {
+	if ep == nil || ep == e {
 		replyWithReset(e.stack, s, stack.DefaultTOS, 0 /* ttl */)
 		s.decRef()
 		return

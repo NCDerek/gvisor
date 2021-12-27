@@ -258,7 +258,9 @@ func (e *endpoint) handleICMP(pkt *stack.PacketBuffer) {
 		localAddressBroadcast := pkt.NetworkPacketInfo.LocalAddressBroadcast
 
 		// It's possible that a raw socket expects to receive this.
-		e.dispatcher.DeliverTransportPacket(header.ICMPv4ProtocolNumber, pkt)
+		if res := e.dispatcher.DeliverTransportPacket(header.ICMPv4ProtocolNumber, pkt); res == stack.TransportPacketHandled {
+			return
+		}
 		pkt = nil
 
 		// Take the base of the incoming request IP header but replace the options.
