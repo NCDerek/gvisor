@@ -16,9 +16,9 @@ package vfs
 
 import (
 	"io"
-	"sync/atomic"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
@@ -44,19 +44,14 @@ import (
 type FileDescription struct {
 	FileDescriptionRefs
 
-	// flagsMu protects `statusFlags`, `saved`, and `asyncHandler` below.
+	// flagsMu protects `statusFlags` and `asyncHandler` below.
 	flagsMu sync.Mutex `state:"nosave"`
 
 	// statusFlags contains status flags, "initialized by open(2) and possibly
 	// modified by fcntl()" - fcntl(2). statusFlags can be read using atomic
 	// memory operations when it does not need to be synchronized with an
 	// access to asyncHandler.
-	statusFlags uint32
-
-	// saved is true after beforeSave is called. This is used to prevent
-	// double-unregistration of asyncHandler. This does not work properly for
-	// save-resume, which is not currently supported in gVisor (see b/26588733).
-	saved bool `state:"nosave"`
+	statusFlags atomicbitops.Uint32
 
 	// asyncHandler handles O_ASYNC signal generation. It is set with the
 	// F_SETOWN or F_SETOWN_EX fcntls. For asyncHandler to be used, O_ASYNC must
@@ -65,7 +60,7 @@ type FileDescription struct {
 
 	// epolls is the set of epollInterests registered for this FileDescription.
 	// epolls is protected by epollMu.
-	epollMu sync.Mutex `state:"nosave"`
+	epollMu epollMutex `state:"nosave"`
 	epolls  map[*epollInterest]struct{}
 
 	// vd is the filesystem location at which this FileDescription was opened.
@@ -89,7 +84,7 @@ type FileDescription struct {
 	// writable is analogous to Linux's FMODE_WRITE.
 	writable bool
 
-	usedLockBSD uint32
+	usedLockBSD atomicbitops.Uint32
 
 	// impl is the FileDescriptionImpl associated with this Filesystem. impl is
 	// immutable. This should be the last field in FileDescription.
@@ -123,6 +118,9 @@ type FileDescriptionOptions struct {
 	// implementations of FileDescriptionImpl methods that should not be
 	// called.
 	UseDentryMetadata bool
+
+	// If DenySpliceIn is true, splice into descriptor isn't allowed.
+	DenySpliceIn bool
 }
 
 // FileCreationFlags are the set of flags passed to FileDescription.Init() but
@@ -144,7 +142,7 @@ func (fd *FileDescription) Init(impl FileDescriptionImpl, flags uint32, mnt *Mou
 
 	// Remove "file creation flags" to mirror the behavior from file.f_flags in
 	// fs/open.c:do_dentry_open.
-	fd.statusFlags = flags &^ FileCreationFlags
+	fd.statusFlags = atomicbitops.FromUint32(flags &^ FileCreationFlags)
 	fd.vd = VirtualDentry{
 		mount:  mnt,
 		dentry: d,
@@ -186,7 +184,7 @@ func (fd *FileDescription) DecRef(ctx context.Context) {
 		}
 
 		// If BSD locks were used, release any lock that it may have acquired.
-		if atomic.LoadUint32(&fd.usedLockBSD) != 0 {
+		if fd.usedLockBSD.Load() != 0 {
 			fd.impl.UnlockBSD(context.Background(), fd)
 		}
 
@@ -197,7 +195,7 @@ func (fd *FileDescription) DecRef(ctx context.Context) {
 		}
 		fd.vd.DecRef(ctx)
 		fd.flagsMu.Lock()
-		if !fd.saved && fd.statusFlags&linux.O_ASYNC != 0 && fd.asyncHandler != nil {
+		if fd.statusFlags.RacyLoad()&linux.O_ASYNC != 0 && fd.asyncHandler != nil {
 			fd.asyncHandler.Unregister(fd)
 		}
 		fd.asyncHandler = nil
@@ -230,7 +228,7 @@ func (fd *FileDescription) Options() FileDescriptionOptions {
 
 // StatusFlags returns file description status flags, as for fcntl(F_GETFL).
 func (fd *FileDescription) StatusFlags() uint32 {
-	return atomic.LoadUint32(&fd.statusFlags)
+	return fd.statusFlags.Load()
 }
 
 // SetStatusFlags sets file description status flags, as for fcntl(F_SETFL).
@@ -281,13 +279,15 @@ func (fd *FileDescription) SetStatusFlags(ctx context.Context, creds *auth.Crede
 	if fd.asyncHandler != nil {
 		// Use fd.statusFlags instead of oldFlags, which may have become outdated,
 		// to avoid double registering/unregistering.
-		if fd.statusFlags&linux.O_ASYNC == 0 && flags&linux.O_ASYNC != 0 {
-			fd.asyncHandler.Register(fd)
-		} else if fd.statusFlags&linux.O_ASYNC != 0 && flags&linux.O_ASYNC == 0 {
+		if fd.statusFlags.RacyLoad()&linux.O_ASYNC == 0 && flags&linux.O_ASYNC != 0 {
+			if err := fd.asyncHandler.Register(fd); err != nil {
+				return err
+			}
+		} else if fd.statusFlags.RacyLoad()&linux.O_ASYNC != 0 && flags&linux.O_ASYNC == 0 {
 			fd.asyncHandler.Unregister(fd)
 		}
 	}
-	atomic.StoreUint32(&fd.statusFlags, (oldFlags&^settableFlags)|(flags&settableFlags))
+	fd.statusFlags.Store((oldFlags &^ settableFlags) | (flags & settableFlags))
 	fd.flagsMu.Unlock()
 	return nil
 }
@@ -352,17 +352,20 @@ type FileDescriptionImpl interface {
 	// waiter.Waitable methods may be used to poll for I/O events.
 	waiter.Waitable
 
+	// Epollable indicates whether this file can be used with epoll_ctl(2).
+	Epollable() bool
+
 	// PRead reads from the file into dst, starting at the given offset, and
 	// returns the number of bytes read. PRead is permitted to return partial
 	// reads with a nil error.
 	//
 	// Errors:
 	//
-	// - If opts.Flags specifies unsupported options, PRead returns EOPNOTSUPP.
+	//	- If opts.Flags specifies unsupported options, PRead returns EOPNOTSUPP.
 	//
 	// Preconditions:
-	// * The FileDescription was opened for reading.
-	// * FileDescriptionOptions.DenyPRead == false.
+	//	* The FileDescription was opened for reading.
+	//	* FileDescriptionOptions.DenyPRead == false.
 	PRead(ctx context.Context, dst usermem.IOSequence, offset int64, opts ReadOptions) (int64, error)
 
 	// Read is similar to PRead, but does not specify an offset.
@@ -375,7 +378,7 @@ type FileDescriptionImpl interface {
 	//
 	// Errors:
 	//
-	// - If opts.Flags specifies unsupported options, Read returns EOPNOTSUPP.
+	//	- If opts.Flags specifies unsupported options, Read returns EOPNOTSUPP.
 	//
 	// Preconditions: The FileDescription was opened for reading.
 	Read(ctx context.Context, dst usermem.IOSequence, opts ReadOptions) (int64, error)
@@ -390,12 +393,12 @@ type FileDescriptionImpl interface {
 	//
 	// Errors:
 	//
-	// - If opts.Flags specifies unsupported options, PWrite returns
+	//	- If opts.Flags specifies unsupported options, PWrite returns
 	// EOPNOTSUPP.
 	//
 	// Preconditions:
-	// * The FileDescription was opened for writing.
-	// * FileDescriptionOptions.DenyPWrite == false.
+	//	* The FileDescription was opened for writing.
+	//	* FileDescriptionOptions.DenyPWrite == false.
 	PWrite(ctx context.Context, src usermem.IOSequence, offset int64, opts WriteOptions) (int64, error)
 
 	// Write is similar to PWrite, but does not specify an offset, which is
@@ -408,7 +411,7 @@ type FileDescriptionImpl interface {
 	//
 	// Errors:
 	//
-	// - If opts.Flags specifies unsupported options, Write returns EOPNOTSUPP.
+	//	- If opts.Flags specifies unsupported options, Write returns EOPNOTSUPP.
 	//
 	// Preconditions: The FileDescription was opened for writing.
 	Write(ctx context.Context, src usermem.IOSequence, opts WriteOptions) (int64, error)
@@ -458,13 +461,13 @@ type FileDescriptionImpl interface {
 	SupportsLocks() bool
 
 	// LockBSD tries to acquire a BSD-style advisory file lock.
-	LockBSD(ctx context.Context, uid lock.UniqueID, ownerPID int32, t lock.LockType, block lock.Blocker) error
+	LockBSD(ctx context.Context, uid lock.UniqueID, ownerPID int32, t lock.LockType, block bool) error
 
 	// UnlockBSD releases a BSD-style advisory file lock.
 	UnlockBSD(ctx context.Context, uid lock.UniqueID) error
 
 	// LockPOSIX tries to acquire a POSIX-style advisory file lock.
-	LockPOSIX(ctx context.Context, uid lock.UniqueID, ownerPID int32, t lock.LockType, r lock.LockRange, block lock.Blocker) error
+	LockPOSIX(ctx context.Context, uid lock.UniqueID, ownerPID int32, t lock.LockType, r lock.LockRange, block bool) error
 
 	// UnlockPOSIX releases a POSIX-style advisory file lock.
 	UnlockPOSIX(ctx context.Context, uid lock.UniqueID, ComputeLockRange lock.LockRange) error
@@ -545,7 +548,13 @@ func (fd *FileDescription) SetStat(ctx context.Context, opts SetStatOptions) err
 		rp.Release(ctx)
 		return err
 	}
-	return fd.impl.SetStat(ctx, opts)
+	if err := fd.impl.SetStat(ctx, opts); err != nil {
+		return err
+	}
+	if ev := InotifyEventFromStatMask(opts.Stat.Mask); ev != 0 {
+		fd.Dentry().InotifyWithParent(ctx, ev, 0, InodeEvent)
+	}
+	return nil
 }
 
 // StatFS returns metadata for the filesystem containing the file represented
@@ -586,8 +595,8 @@ func (fd *FileDescription) Readiness(mask waiter.EventMask) waiter.EventMask {
 // EventRegister implements waiter.Waitable.EventRegister.
 //
 // It registers e for I/O readiness events in mask.
-func (fd *FileDescription) EventRegister(e *waiter.Entry, mask waiter.EventMask) {
-	fd.impl.EventRegister(e, mask)
+func (fd *FileDescription) EventRegister(e *waiter.Entry) error {
+	return fd.impl.EventRegister(e)
 }
 
 // EventUnregister implements waiter.Waitable.EventUnregister.
@@ -595,6 +604,11 @@ func (fd *FileDescription) EventRegister(e *waiter.Entry, mask waiter.EventMask)
 // It unregisters e for I/O readiness events.
 func (fd *FileDescription) EventUnregister(e *waiter.Entry) {
 	fd.impl.EventUnregister(e)
+}
+
+// Epollable returns whether this file can be used with epoll_ctl(2).
+func (fd *FileDescription) Epollable() bool {
+	return fd.impl.Epollable()
 }
 
 // PRead reads from the file represented by fd into dst, starting at the given
@@ -665,6 +679,7 @@ func (fd *FileDescription) Write(ctx context.Context, src usermem.IOSequence, op
 // IterDirents has been called since the last call to Seek, it continues
 // iteration from the end of the last call.
 func (fd *FileDescription) IterDirents(ctx context.Context, cb IterDirentsCallback) error {
+	defer fd.Dentry().InotifyWithParent(ctx, linux.IN_ACCESS, 0, PathEvent)
 	return fd.impl.IterDirents(ctx, cb)
 }
 
@@ -752,7 +767,11 @@ func (fd *FileDescription) SetXattr(ctx context.Context, opts *SetXattrOptions) 
 		rp.Release(ctx)
 		return err
 	}
-	return fd.impl.SetXattr(ctx, *opts)
+	if err := fd.impl.SetXattr(ctx, *opts); err != nil {
+		return err
+	}
+	fd.Dentry().InotifyWithParent(ctx, linux.IN_ATTRIB, 0, InodeEvent)
+	return nil
 }
 
 // RemoveXattr removes the given extended attribute from the file represented
@@ -768,7 +787,11 @@ func (fd *FileDescription) RemoveXattr(ctx context.Context, name string) error {
 		rp.Release(ctx)
 		return err
 	}
-	return fd.impl.RemoveXattr(ctx, name)
+	if err := fd.impl.RemoveXattr(ctx, name); err != nil {
+		return err
+	}
+	fd.Dentry().InotifyWithParent(ctx, linux.IN_ATTRIB, 0, InodeEvent)
+	return nil
 }
 
 // SyncFS instructs the filesystem containing fd to execute the semantics of
@@ -827,9 +850,9 @@ func (fd *FileDescription) SupportsLocks() bool {
 }
 
 // LockBSD tries to acquire a BSD-style advisory file lock.
-func (fd *FileDescription) LockBSD(ctx context.Context, ownerPID int32, lockType lock.LockType, blocker lock.Blocker) error {
-	atomic.StoreUint32(&fd.usedLockBSD, 1)
-	return fd.impl.LockBSD(ctx, fd, ownerPID, lockType, blocker)
+func (fd *FileDescription) LockBSD(ctx context.Context, ownerPID int32, lockType lock.LockType, block bool) error {
+	fd.usedLockBSD.Store(1)
+	return fd.impl.LockBSD(ctx, fd, ownerPID, lockType, block)
 }
 
 // UnlockBSD releases a BSD-style advisory file lock.
@@ -838,7 +861,7 @@ func (fd *FileDescription) UnlockBSD(ctx context.Context) error {
 }
 
 // LockPOSIX locks a POSIX-style file range lock.
-func (fd *FileDescription) LockPOSIX(ctx context.Context, uid lock.UniqueID, ownerPID int32, t lock.LockType, r lock.LockRange, block lock.Blocker) error {
+func (fd *FileDescription) LockPOSIX(ctx context.Context, uid lock.UniqueID, ownerPID int32, t lock.LockType, r lock.LockRange, block bool) error {
 	return fd.impl.LockPOSIX(ctx, uid, ownerPID, t, r, block)
 }
 
@@ -883,7 +906,7 @@ func (fd *FileDescription) ComputeLockRange(ctx context.Context, start uint64, l
 // implemented by pkg/sentry/fasync:FileAsync, but we unfortunately need this
 // interface to avoid circular dependencies.
 type FileAsync interface {
-	Register(w waiter.Waitable)
+	Register(w waiter.Waitable) error
 	Unregister(w waiter.Waitable)
 }
 
@@ -896,16 +919,18 @@ func (fd *FileDescription) AsyncHandler() FileAsync {
 
 // SetAsyncHandler sets fd.asyncHandler if it has not been set before and
 // returns it.
-func (fd *FileDescription) SetAsyncHandler(newHandler func() FileAsync) FileAsync {
+func (fd *FileDescription) SetAsyncHandler(newHandler func() FileAsync) (FileAsync, error) {
 	fd.flagsMu.Lock()
 	defer fd.flagsMu.Unlock()
 	if fd.asyncHandler == nil {
 		fd.asyncHandler = newHandler()
-		if fd.statusFlags&linux.O_ASYNC != 0 {
-			fd.asyncHandler.Register(fd)
+		if fd.statusFlags.RacyLoad()&linux.O_ASYNC != 0 {
+			if err := fd.asyncHandler.Register(fd); err != nil {
+				return nil, err
+			}
 		}
 	}
-	return fd.asyncHandler
+	return fd.asyncHandler, nil
 }
 
 // CopyRegularFileData copies data from srcFD to dstFD until reading from srcFD

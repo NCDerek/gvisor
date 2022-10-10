@@ -38,6 +38,7 @@ type masterInode struct {
 	kernfs.InodeNoopRefCount
 	kernfs.InodeNotDirectory
 	kernfs.InodeNotSymlink
+	kernfs.InodeWatches
 
 	locks vfs.FileLocks
 
@@ -103,8 +104,9 @@ func (mfd *masterFileDescription) Release(ctx context.Context) {
 }
 
 // EventRegister implements waiter.Waitable.EventRegister.
-func (mfd *masterFileDescription) EventRegister(e *waiter.Entry, mask waiter.EventMask) {
-	mfd.t.ld.masterWaiter.EventRegister(e, mask)
+func (mfd *masterFileDescription) EventRegister(e *waiter.Entry) error {
+	mfd.t.ld.masterWaiter.EventRegister(e)
+	return nil
 }
 
 // EventUnregister implements waiter.Waitable.EventUnregister.
@@ -115,6 +117,11 @@ func (mfd *masterFileDescription) EventUnregister(e *waiter.Entry) {
 // Readiness implements waiter.Waitable.Readiness.
 func (mfd *masterFileDescription) Readiness(mask waiter.EventMask) waiter.EventMask {
 	return mfd.t.ld.masterReadiness()
+}
+
+// Epollable implements FileDescriptionImpl.Epollable.
+func (mfd *masterFileDescription) Epollable() bool {
+	return true
 }
 
 // Read implements vfs.FileDescriptionImpl.Read.

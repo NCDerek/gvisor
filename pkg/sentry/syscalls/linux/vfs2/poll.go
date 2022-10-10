@@ -26,7 +26,6 @@ import (
 	ktime "gvisor.dev/gvisor/pkg/sentry/kernel/time"
 	"gvisor.dev/gvisor/pkg/sentry/limits"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
-	"gvisor.dev/gvisor/pkg/syserr"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
 
@@ -61,28 +60,31 @@ type pollState struct {
 // stored in pfd.FD. If a channel is passed in, the waiter entry in "state" is
 // used to register with the file for event notifications, and a reference to
 // the file is stored in "state".
-func initReadiness(t *kernel.Task, pfd *linux.PollFD, state *pollState, ch chan struct{}) {
+func initReadiness(t *kernel.Task, pfd *linux.PollFD, state *pollState, ch chan struct{}) error {
 	if pfd.FD < 0 {
 		pfd.REvents = 0
-		return
+		return nil
 	}
 
 	file := t.GetFileVFS2(pfd.FD)
 	if file == nil {
 		pfd.REvents = linux.POLLNVAL
-		return
+		return nil
 	}
 
 	if ch == nil {
 		defer file.DecRef(t)
 	} else {
 		state.file = file
-		state.waiter, _ = waiter.NewChannelEntry(ch)
-		file.EventRegister(&state.waiter, waiter.EventMaskFromLinux(uint32(pfd.Events)))
+		state.waiter.Init(waiter.ChannelNotifier(ch), waiter.EventMaskFromLinux(uint32(pfd.Events)))
+		if err := file.EventRegister(&state.waiter); err != nil {
+			return err
+		}
 	}
 
 	r := file.Readiness(waiter.EventMaskFromLinux(uint32(pfd.Events)))
 	pfd.REvents = int16(r.ToLinux()) & pfd.Events
+	return nil
 }
 
 // releaseState releases all the pollState in "state".
@@ -114,7 +116,9 @@ func pollBlock(t *kernel.Task, pfd []linux.PollFD, timeout time.Duration) (time.
 	defer releaseState(t, state)
 	n := uintptr(0)
 	for i := range pfd {
-		initReadiness(t, &pfd[i], &state[i], ch)
+		if err := initReadiness(t, &pfd[i], &state[i], ch); err != nil {
+			return timeout, 0, err
+		}
 		if pfd[i].REvents != 0 {
 			n++
 			ch = nil
@@ -188,7 +192,7 @@ func doPoll(t *kernel.Task, addr hostarch.Addr, nfds uint, timeout time.Duration
 		pfd[i].Events |= linux.POLLHUP | linux.POLLERR
 	}
 	remainingTimeout, n, err := pollBlock(t, pfd, timeout)
-	err = syserr.ConvertIntr(err, linuxerr.EINTR)
+	err = linuxerr.ConvertIntr(err, linuxerr.EINTR)
 
 	// The poll entries are copied out regardless of whether
 	// any are set or not. This aligns with the Linux behavior.
@@ -298,7 +302,7 @@ func doSelect(t *kernel.Task, nfds int, readFDs, writeFDs, exceptFDs hostarch.Ad
 
 	// Do the syscall, then count the number of bits set.
 	if _, _, err = pollBlock(t, pfd, timeout); err != nil {
-		return 0, syserr.ConvertIntr(err, linuxerr.EINTR)
+		return 0, linuxerr.ConvertIntr(err, linuxerr.EINTR)
 	}
 
 	// r, w, and e are currently event mask bitsets; unset bits corresponding

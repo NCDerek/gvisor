@@ -19,22 +19,25 @@ package host
 import (
 	"fmt"
 	"math"
-	"sync/atomic"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/fdnotifier"
 	"gvisor.dev/gvisor/pkg/fspath"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/log"
+	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/kernfs"
 	"gvisor.dev/gvisor/pkg/sentry/hostfd"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	unixsocket "gvisor.dev/gvisor/pkg/sentry/socket/unix"
+	"gvisor.dev/gvisor/pkg/sentry/socket/unix/transport"
+	"gvisor.dev/gvisor/pkg/sentry/uniqueid"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/usermem"
@@ -52,23 +55,39 @@ type virtualOwner struct {
 	// mu protects the fields below and they can be accessed using atomic memory
 	// operations.
 	mu  sync.Mutex `state:"nosave"`
-	uid uint32
-	gid uint32
+	uid atomicbitops.Uint32
+	gid atomicbitops.Uint32
 	// mode is also stored, otherwise setting the host file to `0000` could remove
 	// access to the file.
-	mode uint32
+	mode atomicbitops.Uint32
 }
 
 func (v *virtualOwner) atomicUID() uint32 {
-	return atomic.LoadUint32(&v.uid)
+	return v.uid.Load()
 }
 
 func (v *virtualOwner) atomicGID() uint32 {
-	return atomic.LoadUint32(&v.gid)
+	return v.gid.Load()
 }
 
 func (v *virtualOwner) atomicMode() uint32 {
-	return atomic.LoadUint32(&v.mode)
+	return v.mode.Load()
+}
+
+func isEpollable(fd int) bool {
+	epollfd, err := unix.EpollCreate1(0)
+	if err != nil {
+		// This shouldn't happen. If it does, just say file doesn't support epoll.
+		return false
+	}
+	defer unix.Close(epollfd)
+
+	event := unix.EpollEvent{
+		Fd:     int32(fd),
+		Events: unix.EPOLLIN,
+	}
+	err = unix.EpollCtl(epollfd, unix.EPOLL_CTL_ADD, fd, &event)
+	return err == nil
 }
 
 // inode implements kernfs.Inode.
@@ -80,6 +99,7 @@ type inode struct {
 	kernfs.InodeNotSymlink
 	kernfs.CachedMappable
 	kernfs.InodeTemporary // This holds no meaning as this inode can't be Looked up and is always valid.
+	kernfs.InodeWatches
 
 	locks vfs.FileLocks
 
@@ -102,11 +122,11 @@ type inode struct {
 	// This field is initialized at creation time and is immutable.
 	ftype uint16
 
-	// mayBlock is true if hostFD is non-blocking, and operations on it may
-	// return EAGAIN or EWOULDBLOCK instead of blocking.
+	// epollable indicates whether the hostFD can be used with epoll_ctl(2). This
+	// also indicates that hostFD has been set to non-blocking.
 	//
 	// This field is initialized at creation time and is immutable.
-	mayBlock bool
+	epollable bool
 
 	// seekable is false if lseek(hostFD) returns ESPIPE. We assume that file
 	// offsets are meaningful iff seekable is true.
@@ -134,10 +154,9 @@ type inode struct {
 
 	// If haveBuf is non-zero, hostFD represents a pipe, and buf contains data
 	// read from the pipe from previous calls to inode.beforeSave(). haveBuf
-	// and buf are protected by bufMu. haveBuf is accessed using atomic memory
-	// operations.
+	// and buf are protected by bufMu.
 	bufMu   sync.Mutex `state:"nosave"`
-	haveBuf uint32
+	haveBuf atomicbitops.Uint32
 	buf     []byte
 }
 
@@ -153,20 +172,20 @@ func newInode(ctx context.Context, fs *filesystem, hostFD int, savable bool, fil
 	}
 
 	i := &inode{
-		hostFD:   hostFD,
-		ino:      fs.NextIno(),
-		ftype:    uint16(fileType),
-		mayBlock: fileType != unix.S_IFREG && fileType != unix.S_IFDIR,
-		seekable: seekable,
-		isTTY:    isTTY,
-		savable:  savable,
+		hostFD:    hostFD,
+		ino:       fs.NextIno(),
+		ftype:     uint16(fileType),
+		epollable: isEpollable(hostFD),
+		seekable:  seekable,
+		isTTY:     isTTY,
+		savable:   savable,
 	}
 	i.InitRefs()
 	i.CachedMappable.Init(hostFD)
 
 	// If the hostFD can return EWOULDBLOCK when set to non-blocking, do so and
 	// handle blocking behavior in the sentry.
-	if i.mayBlock {
+	if i.epollable {
 		if err := unix.SetNonblock(i.hostFD, true); err != nil {
 			return nil, err
 		}
@@ -230,9 +249,9 @@ func NewFD(ctx context.Context, mnt *vfs.Mount, hostFD int, opts *NewFDOptions) 
 	}
 	if opts.VirtualOwner {
 		i.virtualOwner.enabled = true
-		i.virtualOwner.uid = uint32(opts.UID)
-		i.virtualOwner.gid = uint32(opts.GID)
-		i.virtualOwner.mode = stat.Mode
+		i.virtualOwner.uid = atomicbitops.FromUint32(uint32(opts.UID))
+		i.virtualOwner.gid = atomicbitops.FromUint32(uint32(opts.GID))
+		i.virtualOwner.mode = atomicbitops.FromUint32(stat.Mode)
 	}
 
 	d := &kernfs.Dentry{}
@@ -502,11 +521,11 @@ func (i *inode) SetStat(ctx context.Context, fs *vfs.Filesystem, creds *auth.Cre
 
 	if m&linux.STATX_MODE != 0 {
 		if i.virtualOwner.enabled {
-			i.virtualOwner.mode = uint32(opts.Stat.Mode)
+			// We hold i.virtualOwner.mu.
+			i.virtualOwner.mode = atomicbitops.FromUint32(uint32(opts.Stat.Mode))
 		} else {
-			if err := unix.Fchmod(i.hostFD, uint32(s.Mode)); err != nil {
-				return err
-			}
+			log.Warningf("sentry seccomp filters don't allow making fchmod(2) syscall")
+			return unix.EPERM
 		}
 	}
 	if m&linux.STATX_SIZE != 0 {
@@ -536,10 +555,12 @@ func (i *inode) SetStat(ctx context.Context, fs *vfs.Filesystem, creds *auth.Cre
 	}
 	if i.virtualOwner.enabled {
 		if m&linux.STATX_UID != 0 {
-			i.virtualOwner.uid = opts.Stat.UID
+			// We hold i.virtualOwner.mu.
+			i.virtualOwner.uid = atomicbitops.FromUint32(opts.Stat.UID)
 		}
 		if m&linux.STATX_GID != 0 {
-			i.virtualOwner.gid = opts.Stat.GID
+			// We hold i.virtualOwner.mu.
+			i.virtualOwner.gid = atomicbitops.FromUint32(opts.Stat.GID)
 		}
 	}
 	return nil
@@ -548,7 +569,7 @@ func (i *inode) SetStat(ctx context.Context, fs *vfs.Filesystem, creds *auth.Cre
 // DecRef implements kernfs.Inode.DecRef.
 func (i *inode) DecRef(ctx context.Context) {
 	i.inodeRefs.DecRef(func() {
-		if i.mayBlock {
+		if i.epollable {
 			fdnotifier.RemoveFD(int32(i.hostFD))
 		}
 		if err := unix.Close(i.hostFD); err != nil {
@@ -624,6 +645,19 @@ func (i *inode) open(ctx context.Context, d *kernfs.Dentry, mnt *vfs.Mount, file
 		log.Warningf("cannot import host fd %d with file type %o", i.hostFD, fileType)
 		return nil, linuxerr.EPERM
 	}
+}
+
+// Create a new host-backed endpoint from the given fd and its corresponding
+// notification queue.
+func newEndpoint(ctx context.Context, hostFD int, queue *waiter.Queue) (transport.Endpoint, error) {
+	// Set up an external transport.Endpoint using the host fd.
+	addr := fmt.Sprintf("hostfd:[%d]", hostFD)
+	e, err := transport.NewHostConnectedEndpoint(hostFD, addr)
+	if err != nil {
+		return nil, err.ToError()
+	}
+	ep := transport.NewExternal(e.SockType(), uniqueid.GlobalProviderFromContext(ctx), queue, e, e)
+	return ep, nil
 }
 
 // fileDescription is embedded by host fd implementations of FileDescriptionImpl.
@@ -725,7 +759,7 @@ func (f *fileDescription) Read(ctx context.Context, dst usermem.IOSequence, opts
 }
 
 func (i *inode) readFromBuf(ctx context.Context, dst *usermem.IOSequence) (int64, error) {
-	if atomic.LoadUint32(&i.haveBuf) == 0 {
+	if i.haveBuf.Load() == 0 {
 		return 0, nil
 	}
 	i.bufMu.Lock()
@@ -737,7 +771,7 @@ func (i *inode) readFromBuf(ctx context.Context, dst *usermem.IOSequence) (int64
 	*dst = dst.DropFirst(n)
 	i.buf = i.buf[n:]
 	if len(i.buf) == 0 {
-		atomic.StoreUint32(&i.haveBuf, 0)
+		i.haveBuf.Store(0)
 		i.buf = nil
 	}
 	return int64(n), err
@@ -891,22 +925,51 @@ func (f *fileDescription) ConfigureMMap(_ context.Context, opts *memmap.MMapOpts
 }
 
 // EventRegister implements waiter.Waitable.EventRegister.
-func (f *fileDescription) EventRegister(e *waiter.Entry, mask waiter.EventMask) {
-	f.inode.queue.EventRegister(e, mask)
-	if f.inode.mayBlock {
-		fdnotifier.UpdateFD(int32(f.inode.hostFD))
+func (f *fileDescription) EventRegister(e *waiter.Entry) error {
+	f.inode.queue.EventRegister(e)
+	if f.inode.epollable {
+		if err := fdnotifier.UpdateFD(int32(f.inode.hostFD)); err != nil {
+			f.inode.queue.EventUnregister(e)
+			return err
+		}
 	}
+	return nil
 }
 
 // EventUnregister implements waiter.Waitable.EventUnregister.
 func (f *fileDescription) EventUnregister(e *waiter.Entry) {
 	f.inode.queue.EventUnregister(e)
-	if f.inode.mayBlock {
-		fdnotifier.UpdateFD(int32(f.inode.hostFD))
+	if f.inode.epollable {
+		if err := fdnotifier.UpdateFD(int32(f.inode.hostFD)); err != nil {
+			panic(fmt.Sprint("UpdateFD:", err))
+		}
 	}
 }
 
 // Readiness uses the poll() syscall to check the status of the underlying FD.
 func (f *fileDescription) Readiness(mask waiter.EventMask) waiter.EventMask {
 	return fdnotifier.NonBlockingPoll(int32(f.inode.hostFD), mask)
+}
+
+// Epollable implements FileDescriptionImpl.Epollable.
+func (f *fileDescription) Epollable() bool {
+	return f.inode.epollable
+}
+
+// Ioctl queries the underlying FD for allowed ioctl commands.
+func (f *fileDescription) Ioctl(ctx context.Context, uio usermem.IO, args arch.SyscallArguments) (uintptr, error) {
+	switch cmd := args[1].Int(); cmd {
+	case linux.FIONREAD:
+		v, err := ioctlFionread(f.inode.hostFD)
+		if err != nil {
+			return 0, err
+		}
+
+		var buf [4]byte
+		hostarch.ByteOrder.PutUint32(buf[:], v)
+		_, err = uio.CopyOut(ctx, args[2].Pointer(), buf[:], usermem.IOOpts{})
+		return 0, err
+	}
+
+	return f.FileDescriptionDefaultImpl.Ioctl(ctx, uio, args)
 }

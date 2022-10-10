@@ -23,7 +23,6 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
-
 	"syscall"
 
 	"golang.org/x/sys/unix"
@@ -54,7 +53,7 @@ var defaultSendBufSize = inet.TCPBufferSize{
 // Stack implements inet.Stack for host sockets.
 type Stack struct {
 	// Stack is immutable.
-	interfaces     map[int32]inet.Interface
+	interfaces     map[int32]*inet.Interface
 	interfaceAddrs map[int32][]inet.InterfaceAddr
 	routes         []inet.Route
 	supportsIPv6   bool
@@ -66,10 +65,14 @@ type Stack struct {
 	netSNMPFile    *os.File
 }
 
+// Destroy implements inet.Stack.Destroy.
+func (*Stack) Destroy() {
+}
+
 // NewStack returns an empty Stack containing no configuration.
 func NewStack() *Stack {
 	return &Stack{
-		interfaces:     make(map[int32]inet.Interface),
+		interfaces:     make(map[int32]*inet.Interface),
 		interfaceAddrs: make(map[int32][]inet.InterfaceAddr),
 	}
 }
@@ -129,7 +132,7 @@ func (s *Stack) Configure() error {
 // ExtractHostInterfaces will populate an interface map and
 // interfaceAddrs map with the results of the equivalent
 // netlink messages.
-func ExtractHostInterfaces(links []syscall.NetlinkMessage, addrs []syscall.NetlinkMessage, interfaces map[int32]inet.Interface, interfaceAddrs map[int32][]inet.InterfaceAddr) error {
+func ExtractHostInterfaces(links []syscall.NetlinkMessage, addrs []syscall.NetlinkMessage, interfaces map[int32]*inet.Interface, interfaceAddrs map[int32][]inet.InterfaceAddr) error {
 	for _, link := range links {
 		if link.Header.Type != unix.RTM_NEWLINK {
 			continue
@@ -138,7 +141,7 @@ func ExtractHostInterfaces(links []syscall.NetlinkMessage, addrs []syscall.Netli
 			return fmt.Errorf("RTM_GETLINK returned RTM_NEWLINK message with invalid data length (%d bytes, expected at least %d bytes)", len(link.Data), unix.SizeofIfInfomsg)
 		}
 		var ifinfo linux.InterfaceInfoMessage
-		ifinfo.UnmarshalUnsafe(link.Data[:ifinfo.SizeBytes()])
+		ifinfo.UnmarshalUnsafe(link.Data)
 		inetIF := inet.Interface{
 			DeviceType: ifinfo.Type,
 			Flags:      ifinfo.Flags,
@@ -158,7 +161,7 @@ func ExtractHostInterfaces(links []syscall.NetlinkMessage, addrs []syscall.Netli
 				inetIF.Name = string(attr.Value[:len(attr.Value)-1])
 			}
 		}
-		interfaces[ifinfo.Index] = inetIF
+		interfaces[ifinfo.Index] = &inetIF
 	}
 
 	for _, addr := range addrs {
@@ -169,7 +172,7 @@ func ExtractHostInterfaces(links []syscall.NetlinkMessage, addrs []syscall.Netli
 			return fmt.Errorf("RTM_GETADDR returned RTM_NEWADDR message with invalid data length (%d bytes, expected at least %d bytes)", len(addr.Data), unix.SizeofIfAddrmsg)
 		}
 		var ifaddr linux.InterfaceAddrMessage
-		ifaddr.UnmarshalUnsafe(addr.Data[:ifaddr.SizeBytes()])
+		ifaddr.UnmarshalUnsafe(addr.Data)
 		inetAddr := inet.InterfaceAddr{
 			Family:    ifaddr.Family,
 			PrefixLen: ifaddr.PrefixLen,
@@ -201,7 +204,7 @@ func ExtractHostRoutes(routeMsgs []syscall.NetlinkMessage) ([]inet.Route, error)
 		}
 
 		var ifRoute linux.RouteMessage
-		ifRoute.UnmarshalUnsafe(routeMsg.Data[:ifRoute.SizeBytes()])
+		ifRoute.UnmarshalUnsafe(routeMsg.Data)
 		inetRoute := inet.Route{
 			Family:   ifRoute.Family,
 			DstLen:   ifRoute.DstLen,
@@ -258,7 +261,15 @@ func addHostInterfaces(s *Stack) error {
 		return fmt.Errorf("RTM_GETADDR failed: %v", err)
 	}
 
-	return ExtractHostInterfaces(links, addrs, s.interfaces, s.interfaceAddrs)
+	if err := ExtractHostInterfaces(links, addrs, s.interfaces, s.interfaceAddrs); err != nil {
+		return err
+	}
+
+	// query interface features for each of the host interfaces.
+	if err := queryInterfaceFeatures(s.interfaces); err != nil {
+		return err
+	}
+	return nil
 }
 
 func addHostRoutes(s *Stack) error {
@@ -304,7 +315,7 @@ func readTCPBufferSizeFile(filename string) (inet.TCPBufferSize, error) {
 func (s *Stack) Interfaces() map[int32]inet.Interface {
 	interfaces := make(map[int32]inet.Interface)
 	for k, v := range s.interfaces {
-		interfaces[k] = v
+		interfaces[k] = *v
 	}
 	return interfaces
 }
@@ -473,6 +484,9 @@ func (s *Stack) Statistics(stat interface{}, arg string) error {
 func (s *Stack) RouteTable() []inet.Route {
 	return append([]inet.Route(nil), s.routes...)
 }
+
+// Pause implements inet.Stack.Pause.
+func (*Stack) Pause() {}
 
 // Resume implements inet.Stack.Resume.
 func (*Stack) Resume() {}

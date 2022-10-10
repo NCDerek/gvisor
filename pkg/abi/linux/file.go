@@ -96,6 +96,11 @@ const (
 	AT_EMPTY_PATH     = 0x1000
 )
 
+// Constants for faccessat2(2).
+const (
+	AT_EACCESS = 0x200
+)
+
 // Constants for all file-related ...at(2) syscalls.
 const (
 	AT_FDCWD = -100
@@ -242,7 +247,7 @@ const (
 
 // Statx represents struct statx.
 //
-// +marshal
+// +marshal boundCheck slice:StatxSlice
 type Statx struct {
 	Mask           uint32
 	Blksize        uint32
@@ -266,10 +271,18 @@ type Statx struct {
 	DevMinor       uint32
 }
 
+// String implements fmt.Stringer.String.
+func (s *Statx) String() string {
+	return fmt.Sprintf("Statx{Mask: %d, Blksize: %d, Attributes: %d, Nlink: %d, UID: %d, GID: %d, Mode: %d, Ino: %d, Size: %d, Blocks: %d, AttributesMask: %d, Atime: %d, Btime: %d, Ctime: %d, Mtime: %d, RdevMajor: %d, RdevMinor: %d, DevMajor: %d, DevMinor: %d}",
+		s.Mask, s.Blksize, s.Attributes, s.Nlink, s.UID, s.GID, s.Mode, s.Ino, s.Size, s.Blocks, s.AttributesMask, s.Atime, s.Btime, s.Ctime, s.Mtime, s.RdevMajor, s.RdevMinor, s.DevMajor, s.DevMinor)
+}
+
 // SizeOfStatx is the size of a Statx struct.
 var SizeOfStatx = (*Statx)(nil).SizeBytes()
 
 // FileMode represents a mode_t.
+//
+// +marshal
 type FileMode uint16
 
 // Permissions returns just the permission bits.
@@ -380,4 +393,10 @@ const (
 	FALLOC_FL_ZERO_RANGE     = 0x10
 	FALLOC_FL_INSERT_RANGE   = 0x20
 	FALLOC_FL_UNSHARE_RANGE  = 0x40
+)
+
+// Constants related to close_range(2). Source: /include/uapi/linux/close_range.h
+const (
+	CLOSE_RANGE_UNSHARE = uint32(1 << 1)
+	CLOSE_RANGE_CLOEXEC = uint32(1 << 2)
 )

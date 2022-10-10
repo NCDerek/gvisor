@@ -20,7 +20,6 @@ import (
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/p9"
-	"gvisor.dev/gvisor/pkg/sentry/fsimpl/host"
 	"gvisor.dev/gvisor/pkg/sentry/socket/unix/transport"
 	"gvisor.dev/gvisor/pkg/syserr"
 	"gvisor.dev/gvisor/pkg/waiter"
@@ -45,25 +44,8 @@ type endpoint struct {
 	path string
 }
 
-func sockTypeToP9(t linux.SockType) (p9.ConnectFlags, bool) {
-	switch t {
-	case linux.SOCK_STREAM:
-		return p9.StreamSocket, true
-	case linux.SOCK_SEQPACKET:
-		return p9.SeqpacketSocket, true
-	case linux.SOCK_DGRAM:
-		return p9.DgramSocket, true
-	}
-	return 0, false
-}
-
-// BidirectionalConnect implements ConnectableEndpoint.BidirectionalConnect.
+// BidirectionalConnect implements BoundEndpoint.BidirectionalConnect.
 func (e *endpoint) BidirectionalConnect(ctx context.Context, ce transport.ConnectingEndpoint, returnConnect func(transport.Receiver, transport.ConnectedEndpoint)) *syserr.Error {
-	cf, ok := sockTypeToP9(ce.Type())
-	if !ok {
-		return syserr.ErrConnectionRefused
-	}
-
 	// No lock ordering required as only the ConnectingEndpoint has a mutex.
 	ce.Lock()
 
@@ -72,12 +54,12 @@ func (e *endpoint) BidirectionalConnect(ctx context.Context, ce transport.Connec
 		ce.Unlock()
 		return syserr.ErrAlreadyConnected
 	}
-	if ce.Listening() {
+	if ce.ListeningLocked() {
 		ce.Unlock()
 		return syserr.ErrInvalidEndpointState
 	}
 
-	c, err := e.newConnectedEndpoint(ctx, cf, ce.WaiterQueue())
+	c, err := e.newConnectedEndpoint(ctx, ce.Type(), ce.WaiterQueue())
 	if err != nil {
 		ce.Unlock()
 		return err
@@ -95,7 +77,7 @@ func (e *endpoint) BidirectionalConnect(ctx context.Context, ce transport.Connec
 // UnidirectionalConnect implements
 // transport.BoundEndpoint.UnidirectionalConnect.
 func (e *endpoint) UnidirectionalConnect(ctx context.Context) (transport.ConnectedEndpoint, *syserr.Error) {
-	c, err := e.newConnectedEndpoint(ctx, p9.DgramSocket, &waiter.Queue{})
+	c, err := e.newConnectedEndpoint(ctx, linux.SOCK_DGRAM, &waiter.Queue{})
 	if err != nil {
 		return nil, err
 	}
@@ -111,25 +93,39 @@ func (e *endpoint) UnidirectionalConnect(ctx context.Context) (transport.Connect
 	return c, nil
 }
 
-func (e *endpoint) newConnectedEndpoint(ctx context.Context, flags p9.ConnectFlags, queue *waiter.Queue) (*host.SCMConnectedEndpoint, *syserr.Error) {
+func (e *endpoint) newConnectedEndpoint(ctx context.Context, sockType linux.SockType, queue *waiter.Queue) (*transport.SCMConnectedEndpoint, *syserr.Error) {
+	if e.dentry.fs.opts.lisaEnabled {
+		hostSockFD, err := e.dentry.controlFDLisa.Connect(ctx, sockType)
+		if err != nil {
+			return nil, syserr.ErrConnectionRefused
+		}
+
+		c, serr := transport.NewSCMEndpoint(hostSockFD, queue, e.path)
+		if serr != nil {
+			unix.Close(hostSockFD)
+			log.Warningf("Gofer returned invalid host socket for BidirectionalConnect; file %+v sockType %d: %v", e.dentry.file, sockType, serr)
+			return nil, serr
+		}
+		return c, nil
+	}
+
+	flags, ok := p9.SocketTypeFromLinux(sockType)
+	if !ok {
+		return nil, syserr.ErrConnectionRefused
+	}
 	hostFile, err := e.dentry.file.connect(ctx, flags)
 	if err != nil {
 		return nil, syserr.ErrConnectionRefused
 	}
-	// Dup the fd so that the new endpoint can manage its lifetime.
-	hostFD, err := unix.Dup(hostFile.FD())
-	if err != nil {
-		log.Warningf("Could not dup host socket fd %d: %v", hostFile.FD(), err)
-		return nil, syserr.FromError(err)
-	}
-	// After duplicating, we no longer need hostFile.
-	hostFile.Close()
 
-	c, serr := host.NewSCMEndpoint(ctx, hostFD, queue, e.path)
+	c, serr := transport.NewSCMEndpoint(hostFile.FD(), queue, e.path)
 	if serr != nil {
-		log.Warningf("Gofer returned invalid host socket for BidirectionalConnect; file %+v flags %+v: %v", e.dentry.file, flags, serr)
+		hostFile.Close()
+		log.Warningf("Gofer returned invalid host socket for BidirectionalConnect; file %+v sockType %d: %v", e.dentry.file, sockType, serr)
 		return nil, serr
 	}
+	// Ownership has been transferred to c.
+	hostFile.Release()
 	return c, nil
 }
 

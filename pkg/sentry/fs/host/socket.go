@@ -16,10 +16,10 @@ package host
 
 import (
 	"fmt"
-	"sync/atomic"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/fd"
@@ -62,7 +62,7 @@ type ConnectedEndpoint struct {
 	// GetSockOpt and message splitting/rejection in SendMsg, but do not
 	// prevent lots of small messages from filling the real send buffer
 	// size on the host.
-	sndbuf int64 `state:"nosave"`
+	sndbuf atomicbitops.Int64 `state:"nosave"`
 
 	// mu protects the fields below.
 	mu sync.RWMutex `state:"nosave"`
@@ -100,7 +100,7 @@ func (c *ConnectedEndpoint) init() *syserr.Error {
 	}
 
 	c.stype = linux.SockType(stype)
-	c.sndbuf = int64(sndbuf)
+	c.sndbuf = atomicbitops.FromInt64(int64(sndbuf))
 
 	return nil
 }
@@ -156,9 +156,7 @@ func NewSocketWithDirent(ctx context.Context, d *fs.Dirent, f *fd.FD, flags fs.F
 	f.Release()
 
 	e.Init()
-
-	ep := transport.NewExternal(ctx, e.stype, uniqueid.GlobalProviderFromContext(ctx), &q, e, e)
-
+	ep := transport.NewExternal(e.stype, uniqueid.GlobalProviderFromContext(ctx), &q, e, e)
 	return unixsocket.NewWithDirent(ctx, d, ep, e.stype, flags), nil
 }
 
@@ -188,9 +186,7 @@ func newSocket(ctx context.Context, orgfd int, saveable bool) (*fs.File, error) 
 
 	e.srfd = srfd
 	e.Init()
-
-	ep := transport.NewExternal(ctx, e.stype, uniqueid.GlobalProviderFromContext(ctx), &q, e, e)
-
+	ep := transport.NewExternal(e.stype, uniqueid.GlobalProviderFromContext(ctx), &q, e, e)
 	return unixsocket.New(ctx, ep, e.stype), nil
 }
 
@@ -263,12 +259,15 @@ func (c *ConnectedEndpoint) GetLocalAddress() (tcpip.FullAddress, tcpip.Error) {
 }
 
 // EventUpdate implements transport.ConnectedEndpoint.EventUpdate.
-func (c *ConnectedEndpoint) EventUpdate() {
+func (c *ConnectedEndpoint) EventUpdate() error {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	if c.file.FD() != -1 {
-		fdnotifier.UpdateFD(int32(c.file.FD()))
+		if err := fdnotifier.UpdateFD(int32(c.file.FD())); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
 // Recv implements transport.Receiver.Recv.
@@ -364,14 +363,14 @@ func (c *ConnectedEndpoint) RecvQueuedSize() int64 {
 
 // SendMaxQueueSize implements transport.Receiver.SendMaxQueueSize.
 func (c *ConnectedEndpoint) SendMaxQueueSize() int64 {
-	return atomic.LoadInt64(&c.sndbuf)
+	return c.sndbuf.Load()
 }
 
 // RecvMaxQueueSize implements transport.Receiver.RecvMaxQueueSize.
 func (c *ConnectedEndpoint) RecvMaxQueueSize() int64 {
 	// N.B. Unix sockets don't use the receive buffer. We'll claim it is
 	// the same size as the send buffer.
-	return atomic.LoadInt64(&c.sndbuf)
+	return c.sndbuf.Load()
 }
 
 // Release implements transport.ConnectedEndpoint.Release and transport.Receiver.Release.
@@ -386,7 +385,7 @@ func (c *ConnectedEndpoint) CloseUnread() {}
 func (c *ConnectedEndpoint) SetSendBufferSize(v int64) (newSz int64) {
 	// gVisor does not permit setting of SO_SNDBUF for host backed unix
 	// domain sockets.
-	return atomic.LoadInt64(&c.sndbuf)
+	return c.sndbuf.Load()
 }
 
 // SetReceiveBufferSize implements transport.ConnectedEndpoint.SetReceiveBufferSize.
@@ -394,7 +393,7 @@ func (c *ConnectedEndpoint) SetReceiveBufferSize(v int64) (newSz int64) {
 	// gVisor does not permit setting of SO_RCVBUF for host backed unix
 	// domain sockets. Receive buffer does not have any effect for unix
 	// sockets and we claim to be the same as send buffer.
-	return atomic.LoadInt64(&c.sndbuf)
+	return c.sndbuf.Load()
 }
 
-// LINT.ThenChange(../../fsimpl/host/socket.go)
+// LINT.ThenChange(../../socket/unix/transport/host.go)

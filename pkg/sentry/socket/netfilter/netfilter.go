@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"math/rand"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/hostarch"
@@ -58,8 +59,8 @@ var nameToID = map[string]stack.TableID{
 
 // DefaultLinuxTables returns the rules of stack.DefaultTables() wrapped for
 // compatibility with netfilter extensions.
-func DefaultLinuxTables(seed uint32) *stack.IPTables {
-	tables := stack.DefaultTables(seed)
+func DefaultLinuxTables(clock tcpip.Clock, rand *rand.Rand) *stack.IPTables {
+	tables := stack.DefaultTables(clock, rand)
 	tables.VisitTargets(func(oldTarget stack.Target) stack.Target {
 		switch val := oldTarget.(type) {
 		case *stack.AcceptTarget:
@@ -176,9 +177,7 @@ func setHooksAndUnderflow(info *linux.IPTGetinfo, table stack.Table, offset uint
 // net/ipv4/netfilter/ip_tables.c:translate_table for reference.
 func SetEntries(task *kernel.Task, stk *stack.Stack, optVal []byte, ipv6 bool) *syserr.Error {
 	var replace linux.IPTReplace
-	replaceBuf := optVal[:linux.SizeOfIPTReplace]
-	optVal = optVal[linux.SizeOfIPTReplace:]
-	replace.UnmarshalBytes(replaceBuf)
+	optVal = replace.UnmarshalBytes(optVal)
 
 	var table stack.Table
 	switch replace.Name.String() {
@@ -240,8 +239,8 @@ func SetEntries(task *kernel.Task, stk *stack.Stack, optVal []byte, ipv6 bool) *
 
 		// We found a user chain. Before inserting it into the table,
 		// check that:
-		// - There's some other rule after it.
-		// - There are no matchers.
+		//	- There's some other rule after it.
+		//	- There are no matchers.
 		if ruleIdx == len(table.Rules)-1 {
 			nflog("user chain must have a rule or default policy")
 			return syserr.ErrInvalidArgument
@@ -286,11 +285,12 @@ func SetEntries(task *kernel.Task, stk *stack.Stack, optVal []byte, ipv6 bool) *
 	}
 
 	// TODO(gvisor.dev/issue/6167): Check the following conditions:
-	// - There are no loops.
-	// - There are no chains without an unconditional final rule.
-	// - There are no chains without an unconditional underflow rule.
+	//	- There are no loops.
+	//	- There are no chains without an unconditional final rule.
+	//	- There are no chains without an unconditional underflow rule.
 
-	return syserr.TranslateNetstackError(stk.IPTables().ReplaceTable(nameToID[replace.Name.String()], table, ipv6))
+	stk.IPTables().ReplaceTable(nameToID[replace.Name.String()], table, ipv6)
+	return nil
 }
 
 // parseMatchers parses 0 or more matchers from optVal. optVal should contain
@@ -306,8 +306,7 @@ func parseMatchers(task *kernel.Task, filter stack.IPHeaderFilter, optVal []byte
 			return nil, fmt.Errorf("optVal has insufficient size for entry match: %d", len(optVal))
 		}
 		var match linux.XTEntryMatch
-		buf := optVal[:match.SizeBytes()]
-		match.UnmarshalUnsafe(buf)
+		match.UnmarshalUnsafe(optVal)
 		nflog("set entries: parsed entry match %q: %+v", match.Name.String(), match)
 
 		// Check some invariants.

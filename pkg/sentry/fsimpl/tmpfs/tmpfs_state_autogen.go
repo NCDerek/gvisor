@@ -377,8 +377,12 @@ func (fs *filesystem) StateFields() []string {
 		"clock",
 		"devMinor",
 		"mopts",
+		"usage",
 		"nextInoMinusOne",
 		"root",
+		"maxFilenameLen",
+		"maxSizeInPages",
+		"pagesUsed",
 	}
 }
 
@@ -392,8 +396,12 @@ func (fs *filesystem) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(2, &fs.clock)
 	stateSinkObject.Save(3, &fs.devMinor)
 	stateSinkObject.Save(4, &fs.mopts)
-	stateSinkObject.Save(5, &fs.nextInoMinusOne)
-	stateSinkObject.Save(6, &fs.root)
+	stateSinkObject.Save(5, &fs.usage)
+	stateSinkObject.Save(6, &fs.nextInoMinusOne)
+	stateSinkObject.Save(7, &fs.root)
+	stateSinkObject.Save(8, &fs.maxFilenameLen)
+	stateSinkObject.Save(9, &fs.maxSizeInPages)
+	stateSinkObject.Save(10, &fs.pagesUsed)
 }
 
 func (fs *filesystem) afterLoad() {}
@@ -405,8 +413,12 @@ func (fs *filesystem) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(2, &fs.clock)
 	stateSourceObject.Load(3, &fs.devMinor)
 	stateSourceObject.Load(4, &fs.mopts)
-	stateSourceObject.Load(5, &fs.nextInoMinusOne)
-	stateSourceObject.Load(6, &fs.root)
+	stateSourceObject.Load(5, &fs.usage)
+	stateSourceObject.Load(6, &fs.nextInoMinusOne)
+	stateSourceObject.Load(7, &fs.root)
+	stateSourceObject.Load(8, &fs.maxFilenameLen)
+	stateSourceObject.Load(9, &fs.maxSizeInPages)
+	stateSourceObject.Load(10, &fs.pagesUsed)
 }
 
 func (f *FilesystemOpts) StateTypeName() string {
@@ -418,6 +430,8 @@ func (f *FilesystemOpts) StateFields() []string {
 		"RootFileType",
 		"RootSymlinkTarget",
 		"FilesystemType",
+		"Usage",
+		"MaxFilenameLen",
 	}
 }
 
@@ -429,6 +443,8 @@ func (f *FilesystemOpts) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(0, &f.RootFileType)
 	stateSinkObject.Save(1, &f.RootSymlinkTarget)
 	stateSinkObject.Save(2, &f.FilesystemType)
+	stateSinkObject.Save(3, &f.Usage)
+	stateSinkObject.Save(4, &f.MaxFilenameLen)
 }
 
 func (f *FilesystemOpts) afterLoad() {}
@@ -438,6 +454,8 @@ func (f *FilesystemOpts) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &f.RootFileType)
 	stateSourceObject.Load(1, &f.RootSymlinkTarget)
 	stateSourceObject.Load(2, &f.FilesystemType)
+	stateSourceObject.Load(3, &f.Usage)
+	stateSourceObject.Load(4, &f.MaxFilenameLen)
 }
 
 func (d *dentry) StateTypeName() string {

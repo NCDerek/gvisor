@@ -18,15 +18,14 @@ package pipe
 import (
 	"fmt"
 	"io"
-	"sync/atomic"
 
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/fs"
-	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
 
@@ -49,13 +48,70 @@ const (
 	atomicIOBytes = 4096
 )
 
+// waitReaders is a wrapper around Pipe.
+//
+// This is used for ctx.Block operations that require the synchronization of
+// readers and writers, along with the careful grabbing and releasing of locks.
+type waitReaders Pipe
+
+// Readiness implements waiter.Waitable.Readiness.
+func (wq *waitReaders) Readiness(mask waiter.EventMask) waiter.EventMask {
+	return ((*Pipe)(wq)).rwReadiness() & mask
+}
+
+// EventRegister implements waiter.Waitable.EventRegister.
+func (wq *waitReaders) EventRegister(e *waiter.Entry) error {
+	((*Pipe)(wq)).queue.EventRegister(e)
+
+	// Notify synchronously.
+	if ((*Pipe)(wq)).HasReaders() {
+		e.NotifyEvent(waiter.EventInternal)
+	}
+
+	return nil
+}
+
+// EventUnregister implements waiter.Waitable.EventUnregister.
+func (wq *waitReaders) EventUnregister(e *waiter.Entry) {
+	((*Pipe)(wq)).queue.EventUnregister(e)
+}
+
+// waitWriters is a wrapper around Pipe.
+//
+// This is used for ctx.Block operations that require the synchronization of
+// readers and writers, along with the careful grabbing and releasing of locks.
+type waitWriters Pipe
+
+// Readiness implements waiter.Waitable.Readiness.
+func (wq *waitWriters) Readiness(mask waiter.EventMask) waiter.EventMask {
+	return ((*Pipe)(wq)).rwReadiness() & mask
+}
+
+// EventRegister implements waiter.Waitable.EventRegister.
+func (wq *waitWriters) EventRegister(e *waiter.Entry) error {
+	((*Pipe)(wq)).queue.EventRegister(e)
+
+	// Notify synchronously.
+	if ((*Pipe)(wq)).HasWriters() {
+		e.NotifyEvent(waiter.EventInternal)
+	}
+
+	return nil
+}
+
+// EventUnregister implements waiter.Waitable.EventUnregister.
+func (wq *waitWriters) EventUnregister(e *waiter.Entry) {
+	((*Pipe)(wq)).queue.EventUnregister(e)
+}
+
 // Pipe is an encapsulation of a platform-independent pipe.
 // It manages a buffered byte queue shared between a reader/writer
 // pair.
 //
 // +stateify savable
 type Pipe struct {
-	waiter.Queue `state:"nosave"`
+	// queue is the waiter queue.
+	queue waiter.Queue
 
 	// isNamed indicates whether this is a named pipe.
 	//
@@ -63,17 +119,19 @@ type Pipe struct {
 	isNamed bool
 
 	// The number of active readers for this pipe.
-	//
-	// Access atomically.
-	readers int32
+	readers atomicbitops.Int32
 
-	// The number of active writes for this pipe.
-	//
-	// Access atomically.
-	writers int32
+	// The total number of readers for this pipe.
+	totalReaders atomicbitops.Int32
+
+	// The number of active writers for this pipe.
+	writers atomicbitops.Int32
+
+	// The total number of writers for this pipe.
+	totalWriters atomicbitops.Int32
 
 	// mu protects all pipe internal state below.
-	mu sync.Mutex `state:"nosave"`
+	mu pipeMutex `state:"nosave"`
 
 	// buf holds the pipe's data. buf is a circular buffer; the first valid
 	// byte in buf is at offset off, and the pipe contains size valid bytes.
@@ -183,11 +241,12 @@ func (p *Pipe) Open(ctx context.Context, d *fs.Dirent, flags fs.FileFlags) *fs.F
 //
 // peekLocked does not mutate the pipe; if the read consumes bytes from the
 // pipe, then the caller is responsible for calling p.consumeLocked() and
-// p.Notify(waiter.WritableEvents). (The latter must be called with p.mu unlocked.)
+// p.queue.Notify(waiter.WritableEvents). (The latter must be called with p.mu
+// unlocked.)
 //
 // Preconditions:
-// * p.mu must be locked.
-// * This pipe must have readers.
+//   - p.mu must be locked.
+//   - This pipe must have readers.
 func (p *Pipe) peekLocked(count int64, f func(safemem.BlockSeq) (uint64, error)) (int64, error) {
 	// Don't block for a zero-length read even if the pipe is empty.
 	if count == 0 {
@@ -217,8 +276,8 @@ func (p *Pipe) peekLocked(count int64, f func(safemem.BlockSeq) (uint64, error))
 // longer be visible to future reads.
 //
 // Preconditions:
-// * p.mu must be locked.
-// * The pipe must contain at least n bytes.
+//   - p.mu must be locked.
+//   - The pipe must contain at least n bytes.
 func (p *Pipe) consumeLocked(n int64) {
 	p.off += n
 	if max := int64(len(p.buf)); p.off >= max {
@@ -237,10 +296,10 @@ func (p *Pipe) consumeLocked(n int64) {
 // Unlike peekLocked, writeLocked assumes that f returns the number of bytes
 // written to the pipe, and increases the number of bytes stored in the pipe
 // accordingly. Callers are still responsible for calling
-// p.Notify(waiter.ReadableEvents) with p.mu unlocked.
+// p.queue.Notify(waiter.ReadableEvents) with p.mu unlocked.
 //
 // Preconditions:
-// * p.mu must be locked.
+//   - p.mu must be locked.
 func (p *Pipe) writeLocked(count int64, f func(safemem.BlockSeq) (uint64, error)) (int64, error) {
 	// Can't write to a pipe with no readers.
 	if !p.HasReaders() {
@@ -314,41 +373,47 @@ func (p *Pipe) writeLocked(count int64, f func(safemem.BlockSeq) (uint64, error)
 
 // rOpen signals a new reader of the pipe.
 func (p *Pipe) rOpen() {
-	atomic.AddInt32(&p.readers, 1)
+	p.readers.Add(1)
+	p.totalReaders.Add(1)
+
+	// Notify for blocking openers.
+	p.queue.Notify(waiter.EventInternal)
 }
 
 // wOpen signals a new writer of the pipe.
 func (p *Pipe) wOpen() {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	p.hadWriter = true
-	atomic.AddInt32(&p.writers, 1)
+	p.writers.Add(1)
+	p.totalWriters.Add(1)
+	p.mu.Unlock()
+
+	// Notify for blocking openers.
+	p.queue.Notify(waiter.EventInternal)
 }
 
 // rClose signals that a reader has closed their end of the pipe.
 func (p *Pipe) rClose() {
-	newReaders := atomic.AddInt32(&p.readers, -1)
-	if newReaders < 0 {
+	if newReaders := p.readers.Add(-1); newReaders < 0 {
 		panic(fmt.Sprintf("Refcounting bug, pipe has negative readers: %v", newReaders))
 	}
 }
 
 // wClose signals that a writer has closed their end of the pipe.
 func (p *Pipe) wClose() {
-	newWriters := atomic.AddInt32(&p.writers, -1)
-	if newWriters < 0 {
+	if newWriters := p.writers.Add(-1); newWriters < 0 {
 		panic(fmt.Sprintf("Refcounting bug, pipe has negative writers: %v.", newWriters))
 	}
 }
 
 // HasReaders returns whether the pipe has any active readers.
 func (p *Pipe) HasReaders() bool {
-	return atomic.LoadInt32(&p.readers) > 0
+	return p.readers.Load() > 0
 }
 
 // HasWriters returns whether the pipe has any active writers.
 func (p *Pipe) HasWriters() bool {
-	return atomic.LoadInt32(&p.writers) > 0
+	return p.writers.Load() > 0
 }
 
 // rReadinessLocked calculates the read readiness.
@@ -405,6 +470,17 @@ func (p *Pipe) rwReadiness() waiter.EventMask {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.rReadinessLocked() | p.wReadinessLocked()
+}
+
+// EventRegister implements waiter.Waitable.EventRegister.
+func (p *Pipe) EventRegister(e *waiter.Entry) error {
+	p.queue.EventRegister(e)
+	return nil
+}
+
+// EventUnregister implements waiter.Waitable.EventUnregister.
+func (p *Pipe) EventUnregister(e *waiter.Entry) {
+	p.queue.EventUnregister(e)
 }
 
 // queued returns the amount of queued data.

@@ -19,31 +19,20 @@ package kvm
 
 import (
 	"runtime"
-	"sync/atomic"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/ring0"
 	"gvisor.dev/gvisor/pkg/ring0/pagetables"
-	"gvisor.dev/gvisor/pkg/sentry/arch/fpu"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 )
-
-type machineArchState struct {
-	//initialvCPUs is the machine vCPUs which has initialized but not used
-	initialvCPUs map[int]*vCPU
-}
 
 type vCPUArchState struct {
 	// PCIDs is the set of PCIDs for this vCPU.
 	//
 	// This starts above fixedKernelPCID.
 	PCIDs *pagetables.PCIDs
-
-	// floatingPointState is the floating point state buffer used in guest
-	// to host transitions. See usage in bluepill_arm64.go.
-	floatingPointState fpu.State
 }
 
 const (
@@ -72,56 +61,75 @@ func (m *machine) mapUpperHalf(pageTable *pagetables.PageTables) {
 	})
 }
 
-// Get all read-only physicalRegions.
-func rdonlyRegionsForSetMem() (phyRegions []physicalRegion) {
-	var rdonlyRegions []region
-
+// archPhysicalRegions fills readOnlyGuestRegions and allocates separate
+// physical regions form them.
+func archPhysicalRegions(physicalRegions []physicalRegion) []physicalRegion {
+	rdRegions := []virtualRegion{}
 	applyVirtualRegions(func(vr virtualRegion) {
 		if excludeVirtualRegion(vr) {
+			return // skip region.
+		}
+		// Skip PROT_NONE mappings. Go-runtime uses them as place
+		// holders for future read-write mappings.
+		if !vr.accessType.Write && vr.accessType.Read {
+			rdRegions = append(rdRegions, vr)
+		}
+	})
+
+	// Add an unreachable region.
+	rdRegions = append(rdRegions, virtualRegion{
+		region: region{
+			virtual: 0xffffffffffffffff,
+			length:  0,
+		},
+	})
+
+	var regions []physicalRegion
+	addValidRegion := func(r *physicalRegion, virtual, length uintptr, readOnly bool) {
+		if length == 0 {
 			return
 		}
-
-		if !vr.accessType.Write && vr.accessType.Read {
-			rdonlyRegions = append(rdonlyRegions, vr.region)
-		}
-
-		// TODO(gvisor.dev/issue/2686): PROT_NONE should be specially treated.
-		// Workaround: treated as rdonly temporarily.
-		if !vr.accessType.Write && !vr.accessType.Read && !vr.accessType.Execute {
-			rdonlyRegions = append(rdonlyRegions, vr.region)
-		}
-	})
-
-	for _, r := range rdonlyRegions {
-		physical, _, ok := translateToPhysical(r.virtual)
-		if !ok {
-			continue
-		}
-
-		phyRegions = append(phyRegions, physicalRegion{
+		regions = append(regions, physicalRegion{
 			region: region{
-				virtual: r.virtual,
-				length:  r.length,
+				virtual: virtual,
+				length:  length,
 			},
-			physical: physical,
+			physical: r.physical + (virtual - r.virtual),
+			readOnly: readOnly,
 		})
 	}
-
-	return phyRegions
-}
-
-// Get all available physicalRegions.
-func availableRegionsForSetMem() (phyRegions []physicalRegion) {
-	var excludeRegions []region
-	applyVirtualRegions(func(vr virtualRegion) {
-		if !vr.accessType.Write {
-			excludeRegions = append(excludeRegions, vr.region)
+	i := 0
+	for _, pr := range physicalRegions {
+		start := pr.virtual
+		end := pr.virtual + pr.length
+		for start < end {
+			rdRegion := rdRegions[i].region
+			rdStart := rdRegion.virtual
+			rdEnd := rdRegion.virtual + rdRegion.length
+			if rdEnd <= start {
+				i++
+				continue
+			}
+			if rdStart > start {
+				newEnd := rdStart
+				if end < rdStart {
+					newEnd = end
+				}
+				addValidRegion(&pr, start, newEnd-start, false)
+				start = rdStart
+				continue
+			}
+			if rdEnd < end {
+				addValidRegion(&pr, start, rdEnd-start, true)
+				start = rdEnd
+				continue
+			}
+			addValidRegion(&pr, start, end-start, start >= rdStart && end <= rdEnd)
+			start = end
 		}
-	})
+	}
 
-	phyRegions = computePhysicalRegions(excludeRegions)
-
-	return phyRegions
+	return regions
 }
 
 // nonCanonical generates a canonical address return.
@@ -160,9 +168,8 @@ func isWriteFault(code uint64) bool {
 //go:nosplit
 func (c *vCPU) fault(signal int32, info *linux.SignalInfo) (hostarch.AccessType, error) {
 	bluepill(c) // Probably no-op, but may not be.
-	faultAddr := c.GetFaultAddr()
+	faultAddr := c.FaultAddr()
 	code, user := c.ErrorCode()
-
 	if !user {
 		// The last fault serviced by this CPU was not a user
 		// fault, so we can't reliably trust the faultAddr or
@@ -173,6 +180,14 @@ func (c *vCPU) fault(signal int32, info *linux.SignalInfo) (hostarch.AccessType,
 	// Reset the pointed SignalInfo.
 	*info = linux.SignalInfo{Signo: signal}
 	info.SetAddr(uint64(faultAddr))
+	accessType := hostarch.AccessType{}
+	if signal == int32(unix.SIGSEGV) {
+		accessType = hostarch.AccessType{
+			Read:    !isWriteFault(uint64(code)),
+			Write:   isWriteFault(uint64(code)),
+			Execute: isInstructionAbort(uint64(code)),
+		}
+	}
 
 	ret := code & _ESR_ELx_FSC
 	switch ret {
@@ -182,12 +197,6 @@ func (c *vCPU) fault(signal int32, info *linux.SignalInfo) (hostarch.AccessType,
 		info.Code = 2 // SEGV_ACCERR.
 	default:
 		info.Code = 2
-	}
-
-	accessType := hostarch.AccessType{
-		Read:    !isWriteFault(uint64(code)),
-		Write:   isWriteFault(uint64(code)),
-		Execute: isInstructionAbort(uint64(code)),
 	}
 
 	return accessType, platform.ErrContextSignal
@@ -207,15 +216,4 @@ func (m *machine) getMaxVCPU() {
 			m.maxVCPUs = int(smaxVCPUs)
 		}
 	}
-}
-
-// getNewVCPU() scan for an available vCPU from initialvCPUs
-func (m *machine) getNewVCPU() *vCPU {
-	for CID, c := range m.initialvCPUs {
-		if atomic.CompareAndSwapUint32(&c.state, vCPUReady, vCPUUser) {
-			delete(m.initialvCPUs, CID)
-			return c
-		}
-	}
-	return nil
 }

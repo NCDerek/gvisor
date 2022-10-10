@@ -223,7 +223,11 @@ func (proc *Proc) execAsync(args *ExecArgs) (*kernel.ThreadGroup, kernel.ThreadI
 			_ = fd.Close()
 		}
 	}()
-	ttyFile, ttyFileVFS2, err := fdimport.Import(ctx, fdTable, args.StdioIsPty, args.KUID, args.KGID, fds)
+	fdMap := make(map[int]*fd.FD, len(fds))
+	for appFD, hostFD := range fds {
+		fdMap[appFD] = hostFD
+	}
+	ttyFile, ttyFileVFS2, err := fdimport.Import(ctx, fdTable, args.StdioIsPty, args.KUID, args.KGID, fdMap)
 	if err != nil {
 		return nil, 0, nil, nil, err
 	}
@@ -375,9 +379,9 @@ func Processes(k *kernel.Kernel, containerID string, out *[]*Process) error {
 }
 
 // formatStartTime formats startTime depending on the current time:
-// - If startTime was today, HH:MM is used.
-// - If startTime was not today but was this year, MonDD is used (e.g. Jan02)
-// - If startTime was not this year, the year is used.
+//   - If startTime was today, HH:MM is used.
+//   - If startTime was not today but was this year, MonDD is used (e.g. Jan02)
+//   - If startTime was not this year, the year is used.
 func formatStartTime(now, startTime ktime.Time) string {
 	nowS, nowNs := now.Unix()
 	n := time.Unix(nowS, nowNs)

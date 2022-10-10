@@ -27,6 +27,7 @@ func (conn *connection) StateFields() []string {
 		"maxRead",
 		"maxWrite",
 		"maxPages",
+		"maxActiveRequests",
 		"minor",
 		"atomicOTrunc",
 		"asyncRead",
@@ -59,13 +60,14 @@ func (conn *connection) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(12, &conn.maxRead)
 	stateSinkObject.Save(13, &conn.maxWrite)
 	stateSinkObject.Save(14, &conn.maxPages)
-	stateSinkObject.Save(15, &conn.minor)
-	stateSinkObject.Save(16, &conn.atomicOTrunc)
-	stateSinkObject.Save(17, &conn.asyncRead)
-	stateSinkObject.Save(18, &conn.writebackCache)
-	stateSinkObject.Save(19, &conn.bigWrites)
-	stateSinkObject.Save(20, &conn.dontMask)
-	stateSinkObject.Save(21, &conn.noOpen)
+	stateSinkObject.Save(15, &conn.maxActiveRequests)
+	stateSinkObject.Save(16, &conn.minor)
+	stateSinkObject.Save(17, &conn.atomicOTrunc)
+	stateSinkObject.Save(18, &conn.asyncRead)
+	stateSinkObject.Save(19, &conn.writebackCache)
+	stateSinkObject.Save(20, &conn.bigWrites)
+	stateSinkObject.Save(21, &conn.dontMask)
+	stateSinkObject.Save(22, &conn.noOpen)
 }
 
 func (conn *connection) afterLoad() {}
@@ -86,13 +88,14 @@ func (conn *connection) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(12, &conn.maxRead)
 	stateSourceObject.Load(13, &conn.maxWrite)
 	stateSourceObject.Load(14, &conn.maxPages)
-	stateSourceObject.Load(15, &conn.minor)
-	stateSourceObject.Load(16, &conn.atomicOTrunc)
-	stateSourceObject.Load(17, &conn.asyncRead)
-	stateSourceObject.Load(18, &conn.writebackCache)
-	stateSourceObject.Load(19, &conn.bigWrites)
-	stateSourceObject.Load(20, &conn.dontMask)
-	stateSourceObject.Load(21, &conn.noOpen)
+	stateSourceObject.Load(15, &conn.maxActiveRequests)
+	stateSourceObject.Load(16, &conn.minor)
+	stateSourceObject.Load(17, &conn.atomicOTrunc)
+	stateSourceObject.Load(18, &conn.asyncRead)
+	stateSourceObject.Load(19, &conn.writebackCache)
+	stateSourceObject.Load(20, &conn.bigWrites)
+	stateSourceObject.Load(21, &conn.dontMask)
+	stateSourceObject.Load(22, &conn.noOpen)
 	stateSourceObject.LoadValue(3, new(bool), func(y interface{}) { conn.loadInitializedChan(y.(bool)) })
 }
 
@@ -127,6 +130,8 @@ func (fd *DeviceFD) StateFields() []string {
 		"FileDescriptionDefaultImpl",
 		"DentryMetadataFileDescriptionImpl",
 		"NoLockFD",
+		"waitQueue",
+		"fullQueueCh",
 		"nextOpID",
 		"queue",
 		"numActiveRequests",
@@ -134,9 +139,7 @@ func (fd *DeviceFD) StateFields() []string {
 		"writeCursor",
 		"writeBuf",
 		"writeCursorFR",
-		"waitQueue",
-		"fullQueueCh",
-		"fs",
+		"conn",
 	}
 }
 
@@ -147,20 +150,20 @@ func (fd *DeviceFD) StateSave(stateSinkObject state.Sink) {
 	fd.beforeSave()
 	var fullQueueChValue int
 	fullQueueChValue = fd.saveFullQueueCh()
-	stateSinkObject.SaveValue(12, fullQueueChValue)
+	stateSinkObject.SaveValue(5, fullQueueChValue)
 	stateSinkObject.Save(0, &fd.vfsfd)
 	stateSinkObject.Save(1, &fd.FileDescriptionDefaultImpl)
 	stateSinkObject.Save(2, &fd.DentryMetadataFileDescriptionImpl)
 	stateSinkObject.Save(3, &fd.NoLockFD)
-	stateSinkObject.Save(4, &fd.nextOpID)
-	stateSinkObject.Save(5, &fd.queue)
-	stateSinkObject.Save(6, &fd.numActiveRequests)
-	stateSinkObject.Save(7, &fd.completions)
-	stateSinkObject.Save(8, &fd.writeCursor)
-	stateSinkObject.Save(9, &fd.writeBuf)
-	stateSinkObject.Save(10, &fd.writeCursorFR)
-	stateSinkObject.Save(11, &fd.waitQueue)
-	stateSinkObject.Save(13, &fd.fs)
+	stateSinkObject.Save(4, &fd.waitQueue)
+	stateSinkObject.Save(6, &fd.nextOpID)
+	stateSinkObject.Save(7, &fd.queue)
+	stateSinkObject.Save(8, &fd.numActiveRequests)
+	stateSinkObject.Save(9, &fd.completions)
+	stateSinkObject.Save(10, &fd.writeCursor)
+	stateSinkObject.Save(11, &fd.writeBuf)
+	stateSinkObject.Save(12, &fd.writeCursorFR)
+	stateSinkObject.Save(13, &fd.conn)
 }
 
 func (fd *DeviceFD) afterLoad() {}
@@ -171,16 +174,16 @@ func (fd *DeviceFD) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(1, &fd.FileDescriptionDefaultImpl)
 	stateSourceObject.Load(2, &fd.DentryMetadataFileDescriptionImpl)
 	stateSourceObject.Load(3, &fd.NoLockFD)
-	stateSourceObject.Load(4, &fd.nextOpID)
-	stateSourceObject.Load(5, &fd.queue)
-	stateSourceObject.Load(6, &fd.numActiveRequests)
-	stateSourceObject.Load(7, &fd.completions)
-	stateSourceObject.Load(8, &fd.writeCursor)
-	stateSourceObject.Load(9, &fd.writeBuf)
-	stateSourceObject.Load(10, &fd.writeCursorFR)
-	stateSourceObject.Load(11, &fd.waitQueue)
-	stateSourceObject.Load(13, &fd.fs)
-	stateSourceObject.LoadValue(12, new(int), func(y interface{}) { fd.loadFullQueueCh(y.(int)) })
+	stateSourceObject.Load(4, &fd.waitQueue)
+	stateSourceObject.Load(6, &fd.nextOpID)
+	stateSourceObject.Load(7, &fd.queue)
+	stateSourceObject.Load(8, &fd.numActiveRequests)
+	stateSourceObject.Load(9, &fd.completions)
+	stateSourceObject.Load(10, &fd.writeCursor)
+	stateSourceObject.Load(11, &fd.writeBuf)
+	stateSourceObject.Load(12, &fd.writeCursorFR)
+	stateSourceObject.Load(13, &fd.conn)
+	stateSourceObject.LoadValue(5, new(int), func(y interface{}) { fd.loadFullQueueCh(y.(int)) })
 }
 
 func (fsType *FilesystemType) StateTypeName() string {
@@ -260,7 +263,6 @@ func (fs *filesystem) StateFields() []string {
 		"devMinor",
 		"conn",
 		"opts",
-		"umounted",
 	}
 }
 
@@ -273,7 +275,6 @@ func (fs *filesystem) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(1, &fs.devMinor)
 	stateSinkObject.Save(2, &fs.conn)
 	stateSinkObject.Save(3, &fs.opts)
-	stateSinkObject.Save(4, &fs.umounted)
 }
 
 func (fs *filesystem) afterLoad() {}
@@ -284,7 +285,6 @@ func (fs *filesystem) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(1, &fs.devMinor)
 	stateSourceObject.Load(2, &fs.conn)
 	stateSourceObject.Load(3, &fs.opts)
-	stateSourceObject.Load(4, &fs.umounted)
 }
 
 func (i *inode) StateTypeName() string {
@@ -298,6 +298,7 @@ func (i *inode) StateFields() []string {
 		"InodeAttrs",
 		"InodeDirectoryNoNewChildren",
 		"InodeNotSymlink",
+		"InodeWatches",
 		"OrderedChildren",
 		"fs",
 		"metadataMu",
@@ -308,6 +309,8 @@ func (i *inode) StateFields() []string {
 		"attributeTime",
 		"version",
 		"link",
+		"isNewFh",
+		"newFhData",
 	}
 }
 
@@ -321,16 +324,19 @@ func (i *inode) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(2, &i.InodeAttrs)
 	stateSinkObject.Save(3, &i.InodeDirectoryNoNewChildren)
 	stateSinkObject.Save(4, &i.InodeNotSymlink)
-	stateSinkObject.Save(5, &i.OrderedChildren)
-	stateSinkObject.Save(6, &i.fs)
-	stateSinkObject.Save(7, &i.metadataMu)
-	stateSinkObject.Save(8, &i.nodeID)
-	stateSinkObject.Save(9, &i.locks)
-	stateSinkObject.Save(10, &i.size)
-	stateSinkObject.Save(11, &i.attributeVersion)
-	stateSinkObject.Save(12, &i.attributeTime)
-	stateSinkObject.Save(13, &i.version)
-	stateSinkObject.Save(14, &i.link)
+	stateSinkObject.Save(5, &i.InodeWatches)
+	stateSinkObject.Save(6, &i.OrderedChildren)
+	stateSinkObject.Save(7, &i.fs)
+	stateSinkObject.Save(8, &i.metadataMu)
+	stateSinkObject.Save(9, &i.nodeID)
+	stateSinkObject.Save(10, &i.locks)
+	stateSinkObject.Save(11, &i.size)
+	stateSinkObject.Save(12, &i.attributeVersion)
+	stateSinkObject.Save(13, &i.attributeTime)
+	stateSinkObject.Save(14, &i.version)
+	stateSinkObject.Save(15, &i.link)
+	stateSinkObject.Save(16, &i.isNewFh)
+	stateSinkObject.Save(17, &i.newFhData)
 }
 
 func (i *inode) afterLoad() {}
@@ -342,16 +348,19 @@ func (i *inode) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(2, &i.InodeAttrs)
 	stateSourceObject.Load(3, &i.InodeDirectoryNoNewChildren)
 	stateSourceObject.Load(4, &i.InodeNotSymlink)
-	stateSourceObject.Load(5, &i.OrderedChildren)
-	stateSourceObject.Load(6, &i.fs)
-	stateSourceObject.Load(7, &i.metadataMu)
-	stateSourceObject.Load(8, &i.nodeID)
-	stateSourceObject.Load(9, &i.locks)
-	stateSourceObject.Load(10, &i.size)
-	stateSourceObject.Load(11, &i.attributeVersion)
-	stateSourceObject.Load(12, &i.attributeTime)
-	stateSourceObject.Load(13, &i.version)
-	stateSourceObject.Load(14, &i.link)
+	stateSourceObject.Load(5, &i.InodeWatches)
+	stateSourceObject.Load(6, &i.OrderedChildren)
+	stateSourceObject.Load(7, &i.fs)
+	stateSourceObject.Load(8, &i.metadataMu)
+	stateSourceObject.Load(9, &i.nodeID)
+	stateSourceObject.Load(10, &i.locks)
+	stateSourceObject.Load(11, &i.size)
+	stateSourceObject.Load(12, &i.attributeVersion)
+	stateSourceObject.Load(13, &i.attributeTime)
+	stateSourceObject.Load(14, &i.version)
+	stateSourceObject.Load(15, &i.link)
+	stateSourceObject.Load(16, &i.isNewFh)
+	stateSourceObject.Load(17, &i.newFhData)
 }
 
 func (r *inodeRefs) StateTypeName() string {
@@ -444,7 +453,6 @@ func (r *Request) StateFields() []string {
 		"id",
 		"hdr",
 		"data",
-		"payload",
 		"async",
 		"noReply",
 	}
@@ -459,9 +467,8 @@ func (r *Request) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(1, &r.id)
 	stateSinkObject.Save(2, &r.hdr)
 	stateSinkObject.Save(3, &r.data)
-	stateSinkObject.Save(4, &r.payload)
-	stateSinkObject.Save(5, &r.async)
-	stateSinkObject.Save(6, &r.noReply)
+	stateSinkObject.Save(4, &r.async)
+	stateSinkObject.Save(5, &r.noReply)
 }
 
 func (r *Request) afterLoad() {}
@@ -472,9 +479,8 @@ func (r *Request) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(1, &r.id)
 	stateSourceObject.Load(2, &r.hdr)
 	stateSourceObject.Load(3, &r.data)
-	stateSourceObject.Load(4, &r.payload)
-	stateSourceObject.Load(5, &r.async)
-	stateSourceObject.Load(6, &r.noReply)
+	stateSourceObject.Load(4, &r.async)
+	stateSourceObject.Load(5, &r.noReply)
 }
 
 func (f *futureResponse) StateTypeName() string {

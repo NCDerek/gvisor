@@ -73,12 +73,12 @@ func (b *byteFullReader) ReadFull(ctx context.Context, dst usermem.IOSequence, o
 // segments have the same layout in the ELF as they expect to have in memory.
 //
 // Namely, this means that we must verify:
-// * PT_LOAD file offsets are equivalent to the memory offset from the first
-//   segment.
-// * No extra zeroed space (memsz) is required.
-// * PT_LOAD segments are in order.
-// * No two PT_LOAD segments occupy parts of the same page.
-// * PT_LOAD segments don't extend beyond the end of the file.
+//   - PT_LOAD file offsets are equivalent to the memory offset from the first
+//     segment.
+//   - No extra zeroed space (memsz) is required.
+//   - PT_LOAD segments are in order.
+//   - No two PT_LOAD segments occupy parts of the same page.
+//   - PT_LOAD segments don't extend beyond the end of the file.
 //
 // ctx may be nil if f does not need it.
 func validateVDSO(ctx context.Context, f fullReader, size uint64) (elfInfo, error) {
@@ -195,7 +195,7 @@ func PrepareVDSO(mfp pgalloc.MemoryFileProvider) (*VDSO, error) {
 	}
 
 	mf := mfp.MemoryFile()
-	vdso, err := mf.Allocate(uint64(size), usage.System)
+	vdso, err := mf.Allocate(uint64(size), pgalloc.AllocOpts{Kind: usage.System})
 	if err != nil {
 		return nil, fmt.Errorf("unable to allocate VDSO memory: %v", err)
 	}
@@ -213,7 +213,7 @@ func PrepareVDSO(mfp pgalloc.MemoryFileProvider) (*VDSO, error) {
 	}
 
 	// Finally, allocate a param page for this VDSO.
-	paramPage, err := mf.Allocate(hostarch.PageSize, usage.System)
+	paramPage, err := mf.Allocate(hostarch.PageSize, pgalloc.AllocOpts{Kind: usage.System})
 	if err != nil {
 		mf.DecRef(vdso)
 		return nil, fmt.Errorf("unable to allocate VDSO param page: %v", err)

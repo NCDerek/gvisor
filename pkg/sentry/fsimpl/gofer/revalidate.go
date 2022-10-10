@@ -15,7 +15,9 @@
 package gofer
 
 import (
+	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/p9"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sync"
 )
@@ -43,7 +45,7 @@ func (errRevalidationStepDone) Error() string {
 // different mounts.
 //
 // Preconditions:
-// * fs.renameMu must be locked.
+//   - fs.renameMu must be locked.
 func (fs *filesystem) revalidatePath(ctx context.Context, rpOrig *vfs.ResolvingPath, start *dentry, ds **[]*dentry) error {
 	// Revalidation is done even if start is synthetic in case the path is
 	// something like: ../non_synthetic_file.
@@ -61,7 +63,7 @@ func (fs *filesystem) revalidatePath(ctx context.Context, rpOrig *vfs.ResolvingP
 // revalidateParentDir does the same as revalidatePath, but stops at the parent.
 //
 // Preconditions:
-// * fs.renameMu must be locked.
+//   - fs.renameMu must be locked.
 func (fs *filesystem) revalidateParentDir(ctx context.Context, rpOrig *vfs.ResolvingPath, start *dentry, ds **[]*dentry) error {
 	// Revalidation is done even if start is synthetic in case the path is
 	// something like: ../non_synthetic_file and parent is non synthetic.
@@ -79,7 +81,7 @@ func (fs *filesystem) revalidateParentDir(ctx context.Context, rpOrig *vfs.Resol
 // revalidateOne does the same as revalidatePath, but checks a single dentry.
 //
 // Preconditions:
-// * fs.renameMu must be locked.
+//   - fs.renameMu must be locked.
 func (fs *filesystem) revalidateOne(ctx context.Context, vfsObj *vfs.VirtualFilesystem, parent *dentry, name string, ds **[]*dentry) error {
 	// Skip revalidation for interop mode different than InteropModeShared or
 	// if the parent is synthetic (child must be synthetic too, but it cannot be
@@ -107,8 +109,8 @@ func (fs *filesystem) revalidateOne(ctx context.Context, vfsObj *vfs.VirtualFile
 // calls to the gofer to handle ".." in the path.
 //
 // Preconditions:
-// * fs.renameMu must be locked.
-// * InteropModeShared is in effect.
+//   - fs.renameMu must be locked.
+//   - InteropModeShared is in effect.
 func (fs *filesystem) revalidate(ctx context.Context, rp *vfs.ResolvingPath, start *dentry, done func() bool, ds **[]*dentry) error {
 	state := makeRevalidateState(start)
 	defer state.release()
@@ -161,17 +163,17 @@ done:
 // also stop for other reasons, like hitting a child not in the cache.
 //
 // Returns:
-// * (dentry, nil): step worked, continue stepping.`
-// * (dentry, errPartialRevalidation): revalidation should be done with the
+//   - (dentry, nil): step worked, continue stepping.`
+//   - (dentry, errPartialRevalidation): revalidation should be done with the
 //     state gathered so far. Then continue stepping with the remainder of the
 //     path, starting at `dentry`.
-// * (nil, errRevalidationStepDone): revalidation doesn't need to step any
+//   - (nil, errRevalidationStepDone): revalidation doesn't need to step any
 //     further. It hit a symlink, a mount point, or an uncached dentry.
 //
 // Preconditions:
-// * fs.renameMu must be locked.
-// * !rp.Done().
-// * InteropModeShared is in effect (assumes no negative dentries).
+//   - fs.renameMu must be locked.
+//   - !rp.Done().
+//   - InteropModeShared is in effect (assumes no negative dentries).
 func (fs *filesystem) revalidateStep(ctx context.Context, rp *vfs.ResolvingPath, d *dentry, state *revalidateState) (*dentry, error) {
 	switch name := rp.Component(); name {
 	case ".":
@@ -226,36 +228,62 @@ func (fs *filesystem) revalidateStep(ctx context.Context, rp *vfs.ResolvingPath,
 // update or invalidate dentries in the cache based on the result.
 //
 // Preconditions:
-// * fs.renameMu must be locked.
-// * InteropModeShared is in effect.
+//   - fs.renameMu must be locked.
+//   - InteropModeShared is in effect.
 func (fs *filesystem) revalidateHelper(ctx context.Context, vfsObj *vfs.VirtualFilesystem, state *revalidateState, ds **[]*dentry) error {
 	if len(state.names) == 0 {
 		return nil
 	}
 	// Lock metadata on all dentries *before* getting attributes for them.
 	state.lockAllMetadata()
-	stats, err := state.start.file.multiGetAttr(ctx, state.names)
-	if err != nil {
-		return err
+
+	var (
+		stats     []p9.FullStat
+		statsLisa []linux.Statx
+		numStats  int
+	)
+	if fs.opts.lisaEnabled {
+		var err error
+		statsLisa, err = state.start.controlFDLisa.WalkStat(ctx, state.names)
+		if err != nil {
+			return err
+		}
+		numStats = len(statsLisa)
+	} else {
+		var err error
+		stats, err = state.start.file.multiGetAttr(ctx, state.names)
+		if err != nil {
+			return err
+		}
+		numStats = len(stats)
 	}
 
 	i := -1
 	for d := state.popFront(); d != nil; d = state.popFront() {
 		i++
-		found := i < len(stats)
+		found := i < numStats
 		if i == 0 && len(state.names[0]) == 0 {
 			if found && !d.isSynthetic() {
 				// First dentry is where the search is starting, just update attributes
 				// since it cannot be replaced.
-				d.updateFromP9AttrsLocked(stats[i].Valid, &stats[i].Attr) // +checklocksforce: acquired by lockAllMetadata.
+				if fs.opts.lisaEnabled {
+					d.updateFromLisaStatLocked(&statsLisa[i]) // +checklocksforce: acquired by lockAllMetadata.
+				} else {
+					d.updateFromP9AttrsLocked(stats[i].Valid, &stats[i].Attr) // +checklocksforce: acquired by lockAllMetadata.
+				}
 			}
 			d.metadataMu.Unlock() // +checklocksforce: see above.
 			continue
 		}
 
-		// Note that synthetic dentries will always fails the comparison check
-		// below.
-		if !found || d.qidPath != stats[i].QID.Path {
+		// Note that synthetic dentries will always fail this comparison check.
+		var shouldInvalidate bool
+		if fs.opts.lisaEnabled {
+			shouldInvalidate = !found || d.inoKey != inoKeyFromStat(&statsLisa[i])
+		} else {
+			shouldInvalidate = !found || d.qidPath != stats[i].QID.Path
+		}
+		if shouldInvalidate {
 			d.metadataMu.Unlock() // +checklocksforce: see above.
 			if !found && d.isSynthetic() {
 				// We have a synthetic file, and no remote file has arisen to replace
@@ -263,10 +291,18 @@ func (fs *filesystem) revalidateHelper(ctx context.Context, vfsObj *vfs.VirtualF
 				return nil
 			}
 			// The file at this path has changed or no longer exists. Mark the
-			// dentry invalidated, and re-evaluate its caching status (i.e. if it
-			// has 0 references, drop it). The dentry will be reloaded next time it's
-			// accessed.
+			// dentry invalidated, and re-evaluate its caching status (i.e. if
+			// it has 0 references, drop it). The dentry will be reloaded next
+			// time it's accessed.
+			//
+			// If the dentry is a mountpoint, InvalidateDentry may drop the
+			// last reference on it, resulting in lock recursion. To avoid
+			// this, take a dentry reference first, then drop it while
+			// deferring the call to dentry.checkCachingLocked().
+			d.IncRef()
 			vfsObj.InvalidateDentry(ctx, &d.vfsd)
+			d.decRefNoCaching()
+			*ds = appendDentry(*ds, d)
 
 			name := state.names[i]
 			d.parent.dirMu.Lock()
@@ -282,7 +318,7 @@ func (fs *filesystem) revalidateHelper(ctx context.Context, vfsObj *vfs.VirtualF
 				*ds = appendDentry(*ds, d)
 
 				d.parent.syntheticChildren--
-				d.parent.dirents = nil
+				d.parent.clearDirentsLocked()
 			}
 
 			// Since the dirMu was released and reacquired, re-check that the
@@ -298,7 +334,11 @@ func (fs *filesystem) revalidateHelper(ctx context.Context, vfsObj *vfs.VirtualF
 		}
 
 		// The file at this path hasn't changed. Just update cached metadata.
-		d.updateFromP9AttrsLocked(stats[i].Valid, &stats[i].Attr) // +checklocksforce: see above.
+		if fs.opts.lisaEnabled {
+			d.updateFromLisaStatLocked(&statsLisa[i]) // +checklocksforce: see above.
+		} else {
+			d.updateFromP9AttrsLocked(stats[i].Valid, &stats[i].Attr) // +checklocksforce: see above.
+		}
 		d.metadataMu.Unlock()
 	}
 
@@ -348,7 +388,7 @@ func (r *revalidateState) release() {
 }
 
 // Preconditions:
-// * d is a descendant of all dentries in r.dentries.
+//   - d is a descendant of all dentries in r.dentries.
 func (r *revalidateState) add(name string, d *dentry) {
 	r.names = append(r.names, name)
 	r.dentries = append(r.dentries, d)

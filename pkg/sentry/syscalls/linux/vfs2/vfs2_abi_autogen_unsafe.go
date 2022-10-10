@@ -23,19 +23,21 @@ func (s *sigSetWithSize) SizeBytes() int {
 }
 
 // MarshalBytes implements marshal.Marshallable.MarshalBytes.
-func (s *sigSetWithSize) MarshalBytes(dst []byte) {
+func (s *sigSetWithSize) MarshalBytes(dst []byte) []byte {
     hostarch.ByteOrder.PutUint64(dst[:8], uint64(s.sigsetAddr))
     dst = dst[8:]
     hostarch.ByteOrder.PutUint64(dst[:8], uint64(s.sizeofSigset))
     dst = dst[8:]
+    return dst
 }
 
 // UnmarshalBytes implements marshal.Marshallable.UnmarshalBytes.
-func (s *sigSetWithSize) UnmarshalBytes(src []byte) {
+func (s *sigSetWithSize) UnmarshalBytes(src []byte) []byte {
     s.sigsetAddr = uint64(hostarch.ByteOrder.Uint64(src[:8]))
     src = src[8:]
     s.sizeofSigset = uint64(hostarch.ByteOrder.Uint64(src[:8]))
     src = src[8:]
+    return src
 }
 
 // Packed implements marshal.Marshallable.Packed.
@@ -45,17 +47,20 @@ func (s *sigSetWithSize) Packed() bool {
 }
 
 // MarshalUnsafe implements marshal.Marshallable.MarshalUnsafe.
-func (s *sigSetWithSize) MarshalUnsafe(dst []byte) {
-    gohacks.Memmove(unsafe.Pointer(&dst[0]), unsafe.Pointer(s),  uintptr(s.SizeBytes()))
+func (s *sigSetWithSize) MarshalUnsafe(dst []byte) []byte {
+    size := s.SizeBytes()
+    gohacks.Memmove(unsafe.Pointer(&dst[0]), unsafe.Pointer(s), uintptr(size))
+    return dst[size:]
 }
 
 // UnmarshalUnsafe implements marshal.Marshallable.UnmarshalUnsafe.
-func (s *sigSetWithSize) UnmarshalUnsafe(src []byte) {
-    gohacks.Memmove(unsafe.Pointer(s), unsafe.Pointer(&src[0]), uintptr(s.SizeBytes()))
+func (s *sigSetWithSize) UnmarshalUnsafe(src []byte) []byte {
+    size := s.SizeBytes()
+    gohacks.Memmove(unsafe.Pointer(s), unsafe.Pointer(&src[0]), uintptr(size))
+    return src[size:]
 }
 
 // CopyOutN implements marshal.Marshallable.CopyOutN.
-//go:nosplit
 func (s *sigSetWithSize) CopyOutN(cc marshal.CopyContext, addr hostarch.Addr, limit int) (int, error) {
     // Construct a slice backed by dst's underlying memory.
     var buf []byte
@@ -72,13 +77,11 @@ func (s *sigSetWithSize) CopyOutN(cc marshal.CopyContext, addr hostarch.Addr, li
 }
 
 // CopyOut implements marshal.Marshallable.CopyOut.
-//go:nosplit
 func (s *sigSetWithSize) CopyOut(cc marshal.CopyContext, addr hostarch.Addr) (int, error) {
     return s.CopyOutN(cc, addr, s.SizeBytes())
 }
 
 // CopyIn implements marshal.Marshallable.CopyIn.
-//go:nosplit
 func (s *sigSetWithSize) CopyIn(cc marshal.CopyContext, addr hostarch.Addr) (int, error) {
     // Construct a slice backed by dst's underlying memory.
     var buf []byte
@@ -116,7 +119,7 @@ func (m *MessageHeader64) SizeBytes() int {
 }
 
 // MarshalBytes implements marshal.Marshallable.MarshalBytes.
-func (m *MessageHeader64) MarshalBytes(dst []byte) {
+func (m *MessageHeader64) MarshalBytes(dst []byte) []byte {
     hostarch.ByteOrder.PutUint64(dst[:8], uint64(m.Name))
     dst = dst[8:]
     hostarch.ByteOrder.PutUint32(dst[:4], uint32(m.NameLen))
@@ -135,10 +138,11 @@ func (m *MessageHeader64) MarshalBytes(dst []byte) {
     dst = dst[4:]
     // Padding: dst[:sizeof(int32)] ~= int32(0)
     dst = dst[4:]
+    return dst
 }
 
 // UnmarshalBytes implements marshal.Marshallable.UnmarshalBytes.
-func (m *MessageHeader64) UnmarshalBytes(src []byte) {
+func (m *MessageHeader64) UnmarshalBytes(src []byte) []byte {
     m.Name = uint64(hostarch.ByteOrder.Uint64(src[:8]))
     src = src[8:]
     m.NameLen = uint32(hostarch.ByteOrder.Uint32(src[:4]))
@@ -157,6 +161,7 @@ func (m *MessageHeader64) UnmarshalBytes(src []byte) {
     src = src[4:]
     // Padding: var _ int32 ~= src[:sizeof(int32)]
     src = src[4:]
+    return src
 }
 
 // Packed implements marshal.Marshallable.Packed.
@@ -166,17 +171,20 @@ func (m *MessageHeader64) Packed() bool {
 }
 
 // MarshalUnsafe implements marshal.Marshallable.MarshalUnsafe.
-func (m *MessageHeader64) MarshalUnsafe(dst []byte) {
-    gohacks.Memmove(unsafe.Pointer(&dst[0]), unsafe.Pointer(m),  uintptr(m.SizeBytes()))
+func (m *MessageHeader64) MarshalUnsafe(dst []byte) []byte {
+    size := m.SizeBytes()
+    gohacks.Memmove(unsafe.Pointer(&dst[0]), unsafe.Pointer(m), uintptr(size))
+    return dst[size:]
 }
 
 // UnmarshalUnsafe implements marshal.Marshallable.UnmarshalUnsafe.
-func (m *MessageHeader64) UnmarshalUnsafe(src []byte) {
-    gohacks.Memmove(unsafe.Pointer(m), unsafe.Pointer(&src[0]), uintptr(m.SizeBytes()))
+func (m *MessageHeader64) UnmarshalUnsafe(src []byte) []byte {
+    size := m.SizeBytes()
+    gohacks.Memmove(unsafe.Pointer(m), unsafe.Pointer(&src[0]), uintptr(size))
+    return src[size:]
 }
 
 // CopyOutN implements marshal.Marshallable.CopyOutN.
-//go:nosplit
 func (m *MessageHeader64) CopyOutN(cc marshal.CopyContext, addr hostarch.Addr, limit int) (int, error) {
     // Construct a slice backed by dst's underlying memory.
     var buf []byte
@@ -193,13 +201,11 @@ func (m *MessageHeader64) CopyOutN(cc marshal.CopyContext, addr hostarch.Addr, l
 }
 
 // CopyOut implements marshal.Marshallable.CopyOut.
-//go:nosplit
 func (m *MessageHeader64) CopyOut(cc marshal.CopyContext, addr hostarch.Addr) (int, error) {
     return m.CopyOutN(cc, addr, m.SizeBytes())
 }
 
 // CopyIn implements marshal.Marshallable.CopyIn.
-//go:nosplit
 func (m *MessageHeader64) CopyIn(cc marshal.CopyContext, addr hostarch.Addr) (int, error) {
     // Construct a slice backed by dst's underlying memory.
     var buf []byte
@@ -238,23 +244,23 @@ func (m *multipleMessageHeader64) SizeBytes() int {
 }
 
 // MarshalBytes implements marshal.Marshallable.MarshalBytes.
-func (m *multipleMessageHeader64) MarshalBytes(dst []byte) {
-    m.msgHdr.MarshalBytes(dst[:m.msgHdr.SizeBytes()])
-    dst = dst[m.msgHdr.SizeBytes():]
+func (m *multipleMessageHeader64) MarshalBytes(dst []byte) []byte {
+    dst = m.msgHdr.MarshalUnsafe(dst)
     hostarch.ByteOrder.PutUint32(dst[:4], uint32(m.msgLen))
     dst = dst[4:]
     // Padding: dst[:sizeof(int32)] ~= int32(0)
     dst = dst[4:]
+    return dst
 }
 
 // UnmarshalBytes implements marshal.Marshallable.UnmarshalBytes.
-func (m *multipleMessageHeader64) UnmarshalBytes(src []byte) {
-    m.msgHdr.UnmarshalBytes(src[:m.msgHdr.SizeBytes()])
-    src = src[m.msgHdr.SizeBytes():]
+func (m *multipleMessageHeader64) UnmarshalBytes(src []byte) []byte {
+    src = m.msgHdr.UnmarshalUnsafe(src)
     m.msgLen = uint32(hostarch.ByteOrder.Uint32(src[:4]))
     src = src[4:]
     // Padding: var _ int32 ~= src[:sizeof(int32)]
     src = src[4:]
+    return src
 }
 
 // Packed implements marshal.Marshallable.Packed.
@@ -264,27 +270,28 @@ func (m *multipleMessageHeader64) Packed() bool {
 }
 
 // MarshalUnsafe implements marshal.Marshallable.MarshalUnsafe.
-func (m *multipleMessageHeader64) MarshalUnsafe(dst []byte) {
+func (m *multipleMessageHeader64) MarshalUnsafe(dst []byte) []byte {
     if m.msgHdr.Packed() {
-        gohacks.Memmove(unsafe.Pointer(&dst[0]), unsafe.Pointer(m),  uintptr(m.SizeBytes()))
-    } else {
-        // Type multipleMessageHeader64 doesn't have a packed layout in memory, fallback to MarshalBytes.
-        m.MarshalBytes(dst)
+        size := m.SizeBytes()
+        gohacks.Memmove(unsafe.Pointer(&dst[0]), unsafe.Pointer(m), uintptr(size))
+        return dst[size:]
     }
+    // Type multipleMessageHeader64 doesn't have a packed layout in memory, fallback to MarshalBytes.
+    return m.MarshalBytes(dst)
 }
 
 // UnmarshalUnsafe implements marshal.Marshallable.UnmarshalUnsafe.
-func (m *multipleMessageHeader64) UnmarshalUnsafe(src []byte) {
+func (m *multipleMessageHeader64) UnmarshalUnsafe(src []byte) []byte {
     if m.msgHdr.Packed() {
-        gohacks.Memmove(unsafe.Pointer(m), unsafe.Pointer(&src[0]), uintptr(m.SizeBytes()))
-    } else {
-        // Type multipleMessageHeader64 doesn't have a packed layout in memory, fallback to UnmarshalBytes.
-        m.UnmarshalBytes(src)
+        size := m.SizeBytes()
+        gohacks.Memmove(unsafe.Pointer(m), unsafe.Pointer(&src[0]), uintptr(size))
+        return src[size:]
     }
+    // Type multipleMessageHeader64 doesn't have a packed layout in memory, fallback to UnmarshalBytes.
+    return m.UnmarshalBytes(src)
 }
 
 // CopyOutN implements marshal.Marshallable.CopyOutN.
-//go:nosplit
 func (m *multipleMessageHeader64) CopyOutN(cc marshal.CopyContext, addr hostarch.Addr, limit int) (int, error) {
     if !m.msgHdr.Packed() {
         // Type multipleMessageHeader64 doesn't have a packed layout in memory, fall back to MarshalBytes.
@@ -308,13 +315,11 @@ func (m *multipleMessageHeader64) CopyOutN(cc marshal.CopyContext, addr hostarch
 }
 
 // CopyOut implements marshal.Marshallable.CopyOut.
-//go:nosplit
 func (m *multipleMessageHeader64) CopyOut(cc marshal.CopyContext, addr hostarch.Addr) (int, error) {
     return m.CopyOutN(cc, addr, m.SizeBytes())
 }
 
 // CopyIn implements marshal.Marshallable.CopyIn.
-//go:nosplit
 func (m *multipleMessageHeader64) CopyIn(cc marshal.CopyContext, addr hostarch.Addr) (int, error) {
     if !m.msgHdr.Packed() {
         // Type multipleMessageHeader64 doesn't have a packed layout in memory, fall back to UnmarshalBytes.

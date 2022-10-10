@@ -141,10 +141,9 @@ func modifyEntries4(task *kernel.Task, stk *stack.Stack, optVal []byte, replace 
 			nflog("optVal has insufficient size for entry %d", len(optVal))
 			return nil, syserr.ErrInvalidArgument
 		}
-		var entry linux.IPTEntry
-		entry.UnmarshalUnsafe(optVal[:entry.SizeBytes()])
 		initialOptValLen := len(optVal)
-		optVal = optVal[entry.SizeBytes():]
+		var entry linux.IPTEntry
+		optVal = entry.UnmarshalUnsafe(optVal)
 
 		if entry.TargetOffset < linux.SizeOfIPTEntry {
 			nflog("entry has too-small target offset %d", entry.TargetOffset)
@@ -236,12 +235,12 @@ func filterFromIPTIP(iptip linux.IPTIP) (stack.IPHeaderFilter, error) {
 
 func containsUnsupportedFields4(iptip linux.IPTIP) bool {
 	// The following features are supported:
-	// - Protocol
-	// - Dst and DstMask
-	// - Src and SrcMask
-	// - The inverse destination IP check flag
-	// - InputInterface, InputInterfaceMask and its inverse.
-	// - OutputInterface, OutputInterfaceMask and its inverse.
+	//	- Protocol
+	//	- Dst and DstMask
+	//	- Src and SrcMask
+	//	- The inverse destination IP check flag
+	//	- InputInterface, InputInterfaceMask and its inverse.
+	//	- OutputInterface, OutputInterfaceMask and its inverse.
 	const flagMask = 0
 	// Disable any supported inverse flags.
 	const inverseMask = linux.IPT_INV_DSTIP | linux.IPT_INV_SRCIP |

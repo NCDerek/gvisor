@@ -37,6 +37,7 @@ type taskInode struct {
 	kernfs.InodeDirectoryNoNewChildren
 	kernfs.InodeNotSymlink
 	kernfs.InodeTemporary
+	kernfs.InodeWatches
 	kernfs.OrderedChildren
 	taskInodeRefs
 
@@ -54,10 +55,10 @@ func (fs *filesystem) newTaskInode(ctx context.Context, task *kernel.Task, pidns
 
 	contents := map[string]kernfs.Inode{
 		"auxv":      fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0444, &auxvData{task: task}),
-		"cmdline":   fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0444, &cmdlineData{task: task, arg: cmdlineDataArg}),
+		"cmdline":   fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0444, &metadataData{task: task, metaType: Cmdline}),
 		"comm":      fs.newComm(ctx, task, fs.NextIno(), 0444),
 		"cwd":       fs.newCwdSymlink(ctx, task, fs.NextIno()),
-		"environ":   fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0444, &cmdlineData{task: task, arg: environDataArg}),
+		"environ":   fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0444, &metadataData{task: task, metaType: Environ}),
 		"exe":       fs.newExeSymlink(ctx, task, fs.NextIno()),
 		"fd":        fs.newFDDirInode(ctx, task),
 		"fdinfo":    fs.newFDInfoDirInode(ctx, task),
@@ -75,6 +76,7 @@ func (fs *filesystem) newTaskInode(ctx context.Context, task *kernel.Task, pidns
 		}),
 		"oom_score":     fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0444, newStaticFile("0\n")),
 		"oom_score_adj": fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0644, &oomScoreAdj{task: task}),
+		"root":          fs.newRootSymlink(ctx, task, fs.NextIno()),
 		"smaps":         fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0444, &smapsData{task: task}),
 		"stat":          fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0444, &taskStatData{task: task, pidns: pidns, tgstats: isThreadGroup}),
 		"statm":         fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0444, &statmData{task: task}),

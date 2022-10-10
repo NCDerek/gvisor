@@ -113,38 +113,6 @@ const (
 	_IOC_DIRSHIFT  = _IOC_SIZESHIFT + _IOC_SIZEBITS
 )
 
-// Constants from uapi/linux/fs.h.
-const (
-	FS_IOC_GETFLAGS = 2148034049
-	FS_VERITY_FL    = 1048576
-)
-
-// Constants from uapi/linux/fsverity.h.
-const (
-	FS_VERITY_HASH_ALG_SHA256 = 1
-	FS_VERITY_HASH_ALG_SHA512 = 2
-
-	FS_IOC_ENABLE_VERITY  = 1082156677
-	FS_IOC_MEASURE_VERITY = 3221513862
-)
-
-// DigestMetadata is a helper struct for VerityDigest.
-//
-// +marshal
-type DigestMetadata struct {
-	DigestAlgorithm uint16
-	DigestSize      uint16
-}
-
-// SizeOfDigestMetadata is the size of struct DigestMetadata.
-const SizeOfDigestMetadata = 4
-
-// VerityDigest is struct from uapi/linux/fsverity.h.
-type VerityDigest struct {
-	Metadata DigestMetadata
-	Digest   []byte
-}
-
 // IOC outputs the result of _IOC macro in asm-generic/ioctl.h.
 func IOC(dir, typ, nr, size uint32) uint32 {
 	return uint32(dir)<<_IOC_DIRSHIFT | typ<<_IOC_TYPESHIFT | nr<<_IOC_NRSHIFT | size<<_IOC_SIZESHIFT
@@ -170,18 +138,3 @@ const (
 	KCOV_MODE_TRACE_PC  = 2
 	KCOV_MODE_TRACE_CMP = 3
 )
-
-// Attestation ioctls.
-var (
-	SIGN_ATTESTATION_REPORT = IOC(_IOC_READ, 's', 1, 65)
-)
-
-// SizeOfQuoteInputData is the number of bytes in the input data of ioctl call
-// to get quote.
-const SizeOfQuoteInputData = 64
-
-// SignReport is a struct that gets signed quote from input data.
-type SignReport struct {
-	data  [64]byte
-	quote []byte
-}

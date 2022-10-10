@@ -20,7 +20,6 @@ package kvm
 import (
 	"fmt"
 	"reflect"
-	"sync/atomic"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -28,7 +27,6 @@ import (
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/ring0"
 	"gvisor.dev/gvisor/pkg/ring0/pagetables"
-	"gvisor.dev/gvisor/pkg/sentry/arch/fpu"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 	ktime "gvisor.dev/gvisor/pkg/sentry/time"
 )
@@ -54,12 +52,9 @@ func (m *machine) initArchState() error {
 	// The reason for the difference is that ARM64 and x86_64 have different KVM timer mechanisms.
 	// If we create vCPU dynamically on ARM64, the timer for vCPU would mess up for a short time.
 	// For more detail, please refer to https://github.com/google/gvisor/issues/5739
-	m.initialvCPUs = make(map[int]*vCPU)
 	m.mu.Lock()
-	for int(m.nextID) < m.maxVCPUs-1 {
-		c := m.newVCPU()
-		c.state = 0
-		m.initialvCPUs[c.id] = c
+	for i := 0; i < m.maxVCPUs; i++ {
+		m.createVCPU(i)
 	}
 	m.mu.Unlock()
 	return nil
@@ -127,7 +122,7 @@ func (c *vCPU) initArchState() error {
 
 	// pc
 	reg.id = _KVM_ARM64_REGS_PC
-	data = uint64(reflect.ValueOf(ring0.Start).Pointer())
+	data = uint64(ring0.AddrOfStart())
 	if err := c.setOneRegister(&reg); err != nil {
 		return err
 	}
@@ -141,7 +136,7 @@ func (c *vCPU) initArchState() error {
 
 	// vbar_el1
 	reg.id = _KVM_ARM64_REGS_VBAR_EL1
-	vectorLocation := reflect.ValueOf(ring0.Vectors).Pointer()
+	vectorLocation := ring0.AddrOfVectors()
 	data = uint64(ring0.KernelStartAddress | vectorLocation)
 	if err := c.setOneRegister(&reg); err != nil {
 		return err
@@ -158,8 +153,6 @@ func (c *vCPU) initArchState() error {
 		// practice, this should not happen, however.
 		c.PCIDs = pagetables.NewPCIDs(fixedKernelPCID+1, poolPCIDs)
 	}
-
-	c.floatingPointState = fpu.NewState()
 
 	return c.setSystemTime()
 }
@@ -240,7 +233,7 @@ func (c *vCPU) setSystemTime() error {
 func (c *vCPU) loadSegments(tid uint64) {
 	// TODO(gvisor.dev/issue/1238):  TLS is not supported.
 	// Get TLS from tpidr_el0.
-	atomic.StoreUint64(&c.tid, tid)
+	c.tid.Store(tid)
 }
 
 func (c *vCPU) setOneRegister(reg *kvmOneReg) error {
@@ -332,4 +325,16 @@ func (c *vCPU) SwitchToUser(switchOpts ring0.SwitchOpts, info *linux.SignalInfo)
 		panic(fmt.Sprintf("unexpected vector: 0x%x", vector))
 	}
 
+}
+
+//go:nosplit
+func seccompMmapSyscall(context unsafe.Pointer) (uintptr, uintptr, unix.Errno) {
+	ctx := bluepillArchContext(context)
+
+	// MAP_DENYWRITE is deprecated and ignored by kernel. We use it only for seccomp filters.
+	addr, _, e := unix.RawSyscall6(uintptr(ctx.Regs[8]), uintptr(ctx.Regs[0]), uintptr(ctx.Regs[1]),
+		uintptr(ctx.Regs[2]), uintptr(ctx.Regs[3])|unix.MAP_DENYWRITE, uintptr(ctx.Regs[4]), uintptr(ctx.Regs[5]))
+	ctx.Regs[0] = uint64(addr)
+
+	return addr, uintptr(ctx.Regs[1]), e
 }

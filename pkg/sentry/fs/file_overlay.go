@@ -16,6 +16,7 @@ package fs
 
 import (
 	"io"
+	"math"
 
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
@@ -99,14 +100,13 @@ func (f *overlayFileOperations) Release(ctx context.Context) {
 }
 
 // EventRegister implements FileOperations.EventRegister.
-func (f *overlayFileOperations) EventRegister(we *waiter.Entry, mask waiter.EventMask) {
+func (f *overlayFileOperations) EventRegister(we *waiter.Entry) error {
 	f.upperMu.Lock()
 	defer f.upperMu.Unlock()
 	if f.upper != nil {
-		f.upper.EventRegister(we, mask)
-		return
+		return f.upper.EventRegister(we)
 	}
-	f.lower.EventRegister(we, mask)
+	return f.lower.EventRegister(we)
 }
 
 // EventUnregister implements FileOperations.Unregister.
@@ -360,10 +360,13 @@ func (*overlayFileOperations) ConfigureMMap(ctx context.Context, file *File, opt
 		return linuxerr.ENODEV
 	}
 
-	// FIXME(jamieliu): This is a copy/paste of fsutil.GenericConfigureMMap,
-	// which we can't use because the overlay implementation is in package fs,
-	// so depending on fs/fsutil would create a circular dependency. Move
-	// overlay to fs/overlay.
+	// TODO(gvisor.dev/issue/1624): This is a copy/paste of
+	// fsutil.GenericConfigureMMap, which we can't use because the overlay
+	// implementation is in package fs, so depending on fs/fsutil would create
+	// a circular dependency. VFS2 overlay doesn't have this issue.
+	if opts.Offset+opts.Length > math.MaxInt64 {
+		return linuxerr.EOVERFLOW
+	}
 	opts.Mappable = o
 	opts.MappingIdentity = file
 	file.IncRef()

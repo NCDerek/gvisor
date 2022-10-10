@@ -19,22 +19,21 @@ package config
 
 import (
 	"fmt"
-	"strings"
 
 	"gvisor.dev/gvisor/pkg/refs"
-	controlpb "gvisor.dev/gvisor/pkg/sentry/control/control_go_proto"
 	"gvisor.dev/gvisor/pkg/sentry/watchdog"
 )
 
 // Config holds configuration that is not part of the runtime spec.
 //
 // Follow these steps to add a new flag:
-//   1. Create a new field in Config.
-//   2. Add a field tag with the flag name
-//   3. Register a new flag in flags.go, with name and description
-//   4. Add any necessary validation into validate()
-//   5. If adding an enum, follow the same pattern as FileAccessType
-//
+//  1. Create a new field in Config.
+//  2. Add a field tag with the flag name
+//  3. Register a new flag in flags.go, with same name and add a description
+//  4. Add any necessary validation into validate()
+//  5. If adding an enum, follow the same pattern as FileAccessType
+//  6. Evaluate if the flag can be changed with OCI annotations. See
+//     overrideAllowlist for more details
 type Config struct {
 	// RootDir is the runtime root directory.
 	RootDir string `flag:"root"`
@@ -72,10 +71,8 @@ type Config struct {
 	// Overlay is whether to wrap the root filesystem in an overlay.
 	Overlay bool `flag:"overlay"`
 
-	// Verity is whether there's one or more verity file system to mount.
-	Verity bool `flag:"verity"`
-
-	// FSGoferHostUDS enables the gofer to mount a host UDS.
+	// FSGoferHostUDS enables the gofer to create and connect to host unix
+	// domain sockets.
 	FSGoferHostUDS bool `flag:"fsgofer-host-uds"`
 
 	// Network indicates what type of network to use.
@@ -89,11 +86,12 @@ type Config struct {
 	// AllowPacketEndpointWrite enables write operations on packet endpoints.
 	AllowPacketEndpointWrite bool `flag:"TESTONLY-allow-packet-endpoint-write"`
 
-	// HardwareGSO indicates that hardware segmentation offload is enabled.
-	HardwareGSO bool `flag:"gso"`
+	// HostGSO indicates that host segmentation offload is enabled.
+	HostGSO bool `flag:"gso"`
 
-	// SoftwareGSO indicates that software segmentation offload is enabled.
-	SoftwareGSO bool `flag:"software-gso"`
+	// GvisorGSO indicates that gVisor segmentation offload is enabled. The flag
+	// retains its old name of "software" GSO for API consistency.
+	GvisorGSO bool `flag:"software-gso"`
 
 	// TXChecksumOffload indicates that TX Checksum Offload is enabled.
 	TXChecksumOffload bool `flag:"tx-checksum-offload"`
@@ -108,8 +106,16 @@ type Config struct {
 	// LogPackets indicates that all network packets should be logged.
 	LogPackets bool `flag:"log-packets"`
 
+	// PCAP is a file to which network packets should be logged in PCAP format.
+	PCAP string `flag:"pcap-log"`
+
 	// Platform is the platform to run on.
 	Platform string `flag:"platform"`
+
+	// PlatformDevicePath is the path to the device file used by the platform.
+	// e.g. "/dev/kvm" for the KVM platform.
+	// If unset, a sane platform-specific default will be used.
+	PlatformDevicePath string `flag:"platform_device_path"`
 
 	// Strace indicates that strace should be enabled.
 	Strace bool `flag:"strace"`
@@ -130,6 +136,13 @@ type Config struct {
 	// disabled. Pardon the double negation, but default to enabled is important.
 	DisableSeccomp bool
 
+	// EnableCoreTags indicates whether the Sentry process and children will be
+	// run in a core tagged process. This isolates the sentry from sharing
+	// physical cores with other core tagged processes. This is useful as a
+	// mitigation for hyperthreading side channel based attacks. Requires host
+	// linux kernel >= 5.14.
+	EnableCoreTags bool `flag:"enable-core-tags"`
+
 	// WatchdogAction sets what action the watchdog takes when triggered.
 	WatchdogAction watchdog.Action `flag:"watchdog-action"`
 
@@ -140,10 +153,27 @@ type Config struct {
 	// ProfileEnable is set to prepare the sandbox to be profiled.
 	ProfileEnable bool `flag:"profile"`
 
-	// Controls defines the controls that may be enabled.
-	Controls controlConfig `flag:"controls"`
+	// ProfileBlock collects a block profile to the passed file for the
+	// duration of the container execution. Requires ProfileEnabled.
+	ProfileBlock string `flag:"profile-block"`
 
-	// RestoreFile is the path to the saved container image
+	// ProfileCPU collects a CPU profile to the passed file for the
+	// duration of the container execution. Requires ProfileEnabled.
+	ProfileCPU string `flag:"profile-cpu"`
+
+	// ProfileHeap collects a heap profile to the passed file for the
+	// duration of the container execution. Requires ProfileEnabled.
+	ProfileHeap string `flag:"profile-heap"`
+
+	// ProfileMutex collects a mutex profile to the passed file for the
+	// duration of the container execution. Requires ProfileEnabled.
+	ProfileMutex string `flag:"profile-mutex"`
+
+	// TraceFile collects a Go runtime execution trace to the passed file
+	// for the duration of the container execution.
+	TraceFile string `flag:"trace"`
+
+	// RestoreFile is the path to the saved container image.
 	RestoreFile string
 
 	// NumNetworkChannels controls the number of AF_PACKET sockets that map
@@ -170,8 +200,8 @@ type Config struct {
 	// E.g. 0.2 CPU quota will result in 1, and 1.9 in 2.
 	CPUNumFromQuota bool `flag:"cpu-num-from-quota"`
 
-	// Enables VFS2.
-	VFS2 bool `flag:"vfs2"`
+	// Enable lisafs.
+	Lisafs bool `flag:"lisafs"`
 
 	// Enables FUSE usage.
 	FUSE bool `flag:"fuse"`
@@ -184,6 +214,32 @@ type Config struct {
 
 	// Mounts the cgroup filesystem backed by the sentry's cgroupfs.
 	Cgroupfs bool `flag:"cgroupfs"`
+
+	// Don't configure cgroups.
+	IgnoreCgroups bool `flag:"ignore-cgroups"`
+
+	// Use systemd to configure cgroups.
+	SystemdCgroup bool `flag:"systemd-cgroup"`
+
+	// PodInitConfig is the path to configuration file with additional steps to
+	// take during pod creation.
+	PodInitConfig string `flag:"pod-init-config"`
+
+	// Use pools to manage buffer memory instead of heap.
+	BufferPooling bool `flag:"buffer-pooling"`
+
+	// AFXDP defines whether to use an AF_XDP socket to receive packets
+	// (rather than AF_PACKET). Enabling it disables RX checksum offload.
+	AFXDP bool `flag:"EXPERIMENTAL-afxdp"`
+
+	// FDLimit specifies a limit on the number of host file descriptors that can
+	// be open simultaneously by the sentry and gofer. It applies separately to
+	// each.
+	FDLimit int `flag:"fdlimit"`
+
+	// DCache sets the global dirent cache size. If zero, per-mount caches are
+	// used.
+	DCache int `flag:"dcache"`
 
 	// TestOnlyAllowRunAsCurrentUserWithoutChroot should only be used in
 	// tests. It allows runsc to start the sandbox process as the current
@@ -206,6 +262,21 @@ func (c *Config) validate() error {
 	}
 	if c.NumNetworkChannels <= 0 {
 		return fmt.Errorf("num_network_channels must be > 0, got: %d", c.NumNetworkChannels)
+	}
+	// Require profile flags to explicitly opt-in to profiling with
+	// -profile rather than implying it since these options have security
+	// implications.
+	if c.ProfileBlock != "" && !c.ProfileEnable {
+		return fmt.Errorf("profile-block flag requires enabling profiling with profile flag")
+	}
+	if c.ProfileCPU != "" && !c.ProfileEnable {
+		return fmt.Errorf("profile-cpu flag requires enabling profiling with profile flag")
+	}
+	if c.ProfileHeap != "" && !c.ProfileEnable {
+		return fmt.Errorf("profile-heap flag requires enabling profiling with profile flag")
+	}
+	if c.ProfileMutex != "" && !c.ProfileEnable {
+		return fmt.Errorf("profile-mutex flag requires enabling profiling with profile flag")
 	}
 	return nil
 }
@@ -357,96 +428,6 @@ func (q QueueingDiscipline) String() string {
 		return "fifo"
 	}
 	panic(fmt.Sprintf("Invalid qdisc %d", q))
-}
-
-// controlConfig represents control endpoints.
-type controlConfig struct {
-	Controls *controlpb.ControlConfig
-}
-
-// Set implements flag.Value.
-func (c *controlConfig) Set(v string) error {
-	controls := strings.Split(v, ",")
-	var controlList []controlpb.ControlConfig_Endpoint
-	for _, control := range controls {
-		switch control {
-		case "EVENTS":
-			controlList = append(controlList, controlpb.ControlConfig_EVENTS)
-		case "FS":
-			controlList = append(controlList, controlpb.ControlConfig_FS)
-		case "LIFECYCLE":
-			controlList = append(controlList, controlpb.ControlConfig_LIFECYCLE)
-		case "LOGGING":
-			controlList = append(controlList, controlpb.ControlConfig_LOGGING)
-		case "PROFILE":
-			controlList = append(controlList, controlpb.ControlConfig_PROFILE)
-		case "USAGE":
-			controlList = append(controlList, controlpb.ControlConfig_USAGE)
-		case "PROC":
-			controlList = append(controlList, controlpb.ControlConfig_PROC)
-		case "STATE":
-			controlList = append(controlList, controlpb.ControlConfig_STATE)
-		case "DEBUG":
-			controlList = append(controlList, controlpb.ControlConfig_DEBUG)
-		default:
-			return fmt.Errorf("invalid control %q", control)
-		}
-	}
-	c.Controls.AllowedControls = controlList
-	return nil
-}
-
-// Get implements flag.Value.
-func (c *controlConfig) Get() interface{} {
-	return *c
-}
-
-// String implements flag.Value.
-func (c *controlConfig) String() string {
-	v := ""
-	for _, control := range c.Controls.GetAllowedControls() {
-		if len(v) > 0 {
-			v += ","
-		}
-		switch control {
-		case controlpb.ControlConfig_EVENTS:
-			v += "EVENTS"
-		case controlpb.ControlConfig_FS:
-			v += "FS"
-		case controlpb.ControlConfig_LIFECYCLE:
-			v += "LIFECYCLE"
-		case controlpb.ControlConfig_LOGGING:
-			v += "LOGGING"
-		case controlpb.ControlConfig_PROFILE:
-			v += "PROFILE"
-		case controlpb.ControlConfig_USAGE:
-			v += "USAGE"
-		case controlpb.ControlConfig_PROC:
-			v += "PROC"
-		case controlpb.ControlConfig_STATE:
-			v += "STATE"
-		case controlpb.ControlConfig_DEBUG:
-			v += "DEBUG"
-		default:
-			panic(fmt.Sprintf("Invalid control %d", control))
-		}
-	}
-	return v
-}
-
-func defaultControlConfig() *controlConfig {
-	c := controlConfig{}
-	c.Controls = &controlpb.ControlConfig{}
-	c.Controls.AllowedControls = append(c.Controls.AllowedControls, controlpb.ControlConfig_EVENTS)
-	c.Controls.AllowedControls = append(c.Controls.AllowedControls, controlpb.ControlConfig_FS)
-	c.Controls.AllowedControls = append(c.Controls.AllowedControls, controlpb.ControlConfig_LIFECYCLE)
-	c.Controls.AllowedControls = append(c.Controls.AllowedControls, controlpb.ControlConfig_LOGGING)
-	c.Controls.AllowedControls = append(c.Controls.AllowedControls, controlpb.ControlConfig_PROFILE)
-	c.Controls.AllowedControls = append(c.Controls.AllowedControls, controlpb.ControlConfig_USAGE)
-	c.Controls.AllowedControls = append(c.Controls.AllowedControls, controlpb.ControlConfig_PROC)
-	c.Controls.AllowedControls = append(c.Controls.AllowedControls, controlpb.ControlConfig_STATE)
-	c.Controls.AllowedControls = append(c.Controls.AllowedControls, controlpb.ControlConfig_DEBUG)
-	return &c
 }
 
 func leakModePtr(v refs.LeakMode) *refs.LeakMode {

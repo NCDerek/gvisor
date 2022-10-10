@@ -223,6 +223,12 @@ func (rp *ResolvingPath) Final() bool {
 	return rp.curPart == 0 && !rp.pit.NextOk()
 }
 
+// Pit returns a copy of rp's current path iterator. Modifying the iterator
+// does not change rp.
+func (rp *ResolvingPath) Pit() fspath.Iterator {
+	return rp.pit
+}
+
 // Component returns the current path component in the stream represented by
 // rp.
 //
@@ -301,6 +307,7 @@ func (rp *ResolvingPath) CheckMount(ctx context.Context, d *Dentry) error {
 //
 // If path is terminated with '/', the '/' is considered the last element and
 // any symlink before that is followed:
+//
 //   - For most non-creating walks, the last path component is handled by
 //     fs/namei.c:lookup_last(), which sets LOOKUP_FOLLOW if the first byte
 //     after the path component is non-NULL (which is only possible if it's '/')
@@ -370,7 +377,7 @@ func (rp *ResolvingPath) relpathPrepend(path fspath.Path) {
 
 // HandleJump is called when the current path component is a "magic" link to
 // the given VirtualDentry, like /proc/[pid]/fd/[fd]. If the calling Filesystem
-// method should continue path traversal, HandleMagicSymlink updates the path
+// method should continue path traversal, HandleJump updates the path
 // component stream to reflect the magic link target and returns nil. Otherwise
 // it returns a non-nil error.
 //

@@ -37,6 +37,7 @@ type replicaInode struct {
 	kernfs.InodeNoopRefCount
 	kernfs.InodeNotDirectory
 	kernfs.InodeNotSymlink
+	kernfs.InodeWatches
 
 	locks vfs.FileLocks
 
@@ -112,8 +113,9 @@ var _ vfs.FileDescriptionImpl = (*replicaFileDescription)(nil)
 func (rfd *replicaFileDescription) Release(ctx context.Context) {}
 
 // EventRegister implements waiter.Waitable.EventRegister.
-func (rfd *replicaFileDescription) EventRegister(e *waiter.Entry, mask waiter.EventMask) {
-	rfd.inode.t.ld.replicaWaiter.EventRegister(e, mask)
+func (rfd *replicaFileDescription) EventRegister(e *waiter.Entry) error {
+	rfd.inode.t.ld.replicaWaiter.EventRegister(e)
+	return nil
 }
 
 // EventUnregister implements waiter.Waitable.EventUnregister.
@@ -124,6 +126,11 @@ func (rfd *replicaFileDescription) EventUnregister(e *waiter.Entry) {
 // Readiness implements waiter.Waitable.Readiness.
 func (rfd *replicaFileDescription) Readiness(mask waiter.EventMask) waiter.EventMask {
 	return rfd.inode.t.ld.replicaReadiness()
+}
+
+// Epollable implements FileDescriptionImpl.Epollable.
+func (rfd *replicaFileDescription) Epollable() bool {
+	return true
 }
 
 // Read implements vfs.FileDescriptionImpl.Read.

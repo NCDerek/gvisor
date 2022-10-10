@@ -70,6 +70,9 @@ func Splice(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscal
 	if !inFile.IsReadable() || !outFile.IsWritable() {
 		return 0, nil, linuxerr.EBADF
 	}
+	if outFile.Options().DenySpliceIn {
+		return 0, nil, linuxerr.EINVAL
+	}
 
 	// The operation is non-blocking if anything is non-blocking.
 	//
@@ -213,6 +216,9 @@ func Tee(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallCo
 	if !inFile.IsReadable() || !outFile.IsWritable() {
 		return 0, nil, linuxerr.EBADF
 	}
+	if outFile.Options().DenySpliceIn {
+		return 0, nil, linuxerr.EINVAL
+	}
 
 	// The operation is non-blocking if anything is non-blocking.
 	//
@@ -284,6 +290,9 @@ func Sendfile(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Sysc
 	defer outFile.DecRef(t)
 	if !outFile.IsWritable() {
 		return 0, nil, linuxerr.EBADF
+	}
+	if outFile.Options().DenySpliceIn {
+		return 0, nil, linuxerr.EINVAL
 	}
 
 	// Verify that the outFile Append flag is not set.
@@ -371,8 +380,20 @@ func Sendfile(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Sysc
 		}
 	} else {
 		// Read inFile to buffer, then write the contents to outFile.
-		buf := make([]byte, count)
+		//
+		// The buffer size has to be limited to avoid large memory
+		// allocations and long delays. In Linux, the buffer size is
+		// limited by a size of an internl pipe. Here, we repeat this
+		// behavior.
+		bufSize := count
+		if bufSize > pipe.MaximumPipeSize {
+			bufSize = pipe.MaximumPipeSize
+		}
+		buf := make([]byte, bufSize)
 		for {
+			if int64(len(buf)) > count-total {
+				buf = buf[:count-total]
+			}
 			var readN int64
 			if offset != -1 {
 				readN, err = inFile.PRead(t, usermem.BytesIOSequence(buf), offset, vfs.ReadOptions{})
@@ -414,7 +435,6 @@ func Sendfile(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Sysc
 			}
 
 			total += readN
-			buf = buf[readN:]
 			if total == count {
 				break
 			}
@@ -470,8 +490,10 @@ type dualWaiter struct {
 func (dw *dualWaiter) waitForBoth(t *kernel.Task) error {
 	if dw.inFile.Readiness(eventMaskRead)&eventMaskRead == 0 {
 		if dw.inCh == nil {
-			dw.inW, dw.inCh = waiter.NewChannelEntry(nil)
-			dw.inFile.EventRegister(&dw.inW, eventMaskRead)
+			dw.inW, dw.inCh = waiter.NewChannelEntry(eventMaskRead)
+			if err := dw.inFile.EventRegister(&dw.inW); err != nil {
+				return err
+			}
 			// We might be ready now. Try again before blocking.
 			return nil
 		}
@@ -489,8 +511,10 @@ func (dw *dualWaiter) waitForOut(t *kernel.Task) error {
 	// can be "ready" but will reject writes of certain sizes with
 	// EWOULDBLOCK. See b/172075629, b/170743336.
 	if dw.outCh == nil {
-		dw.outW, dw.outCh = waiter.NewChannelEntry(nil)
-		dw.outFile.EventRegister(&dw.outW, eventMaskWrite)
+		dw.outW, dw.outCh = waiter.NewChannelEntry(eventMaskWrite)
+		if err := dw.outFile.EventRegister(&dw.outW); err != nil {
+			return err
+		}
 		// We might be ready to write now. Try again before blocking.
 		return nil
 	}

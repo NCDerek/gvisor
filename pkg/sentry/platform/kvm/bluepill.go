@@ -19,8 +19,8 @@ import (
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/ring0"
-	"gvisor.dev/gvisor/pkg/safecopy"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
+	"gvisor.dev/gvisor/pkg/sighandling"
 )
 
 // bluepill enters guest mode.
@@ -61,15 +61,22 @@ var (
 	// This is called by bluepillHandler.
 	savedHandler uintptr
 
+	// savedSigsysHandler is a pointer to the previos handler of the SIGSYS signals.
+	savedSigsysHandler uintptr
+
 	// dieTrampolineAddr is the address of dieTrampoline.
 	dieTrampolineAddr uintptr
 )
+
+// _SYS_KVM_RETURN_TO_HOST is the system call that is used to transition
+// to host.
+const _SYS_KVM_RETURN_TO_HOST = ^uintptr(0)
 
 // redpill invokes a syscall with -1.
 //
 //go:nosplit
 func redpill() {
-	unix.RawSyscall(^uintptr(0), 0, 0, 0)
+	unix.RawSyscall(_SYS_KVM_RETURN_TO_HOST, 0, 0, 0)
 }
 
 // dieHandler is called by dieTrampoline.
@@ -94,7 +101,7 @@ func (c *vCPU) die(context *arch.SignalContext64, msg string) {
 
 func init() {
 	// Install the handler.
-	if err := safecopy.ReplaceSignalHandler(bluepillSignal, addrOfSighandler(), &savedHandler); err != nil {
+	if err := sighandling.ReplaceSignalHandler(bluepillSignal, addrOfSighandler(), &savedHandler); err != nil {
 		panic(fmt.Sprintf("Unable to set handler for signal %d: %v", bluepillSignal, err))
 	}
 

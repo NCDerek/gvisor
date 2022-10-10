@@ -90,13 +90,19 @@ func (s *SocketVFS2) Readiness(mask waiter.EventMask) waiter.EventMask {
 }
 
 // EventRegister implements waiter.Waitable.EventRegister.
-func (s *SocketVFS2) EventRegister(e *waiter.Entry, mask waiter.EventMask) {
-	s.socketOpsCommon.EventRegister(e, mask)
+func (s *SocketVFS2) EventRegister(e *waiter.Entry) error {
+	s.socketOpsCommon.EventRegister(e)
+	return nil
 }
 
 // EventUnregister implements waiter.Waitable.EventUnregister.
 func (s *SocketVFS2) EventUnregister(e *waiter.Entry) {
 	s.socketOpsCommon.EventUnregister(e)
+}
+
+// Epollable implements FileDescriptionImpl.Epollable.
+func (s *SocketVFS2) Epollable() bool {
+	return true
 }
 
 // Read implements vfs.FileDescriptionImpl.

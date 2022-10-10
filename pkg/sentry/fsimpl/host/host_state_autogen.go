@@ -6,30 +6,6 @@ import (
 	"gvisor.dev/gvisor/pkg/state"
 )
 
-func (r *ConnectedEndpointRefs) StateTypeName() string {
-	return "pkg/sentry/fsimpl/host.ConnectedEndpointRefs"
-}
-
-func (r *ConnectedEndpointRefs) StateFields() []string {
-	return []string{
-		"refCount",
-	}
-}
-
-func (r *ConnectedEndpointRefs) beforeSave() {}
-
-// +checklocksignore
-func (r *ConnectedEndpointRefs) StateSave(stateSinkObject state.Sink) {
-	r.beforeSave()
-	stateSinkObject.Save(0, &r.refCount)
-}
-
-// +checklocksignore
-func (r *ConnectedEndpointRefs) StateLoad(stateSourceObject state.Source) {
-	stateSourceObject.Load(0, &r.refCount)
-	stateSourceObject.AfterLoad(r.afterLoad)
-}
-
 func (v *virtualOwner) StateTypeName() string {
 	return "pkg/sentry/fsimpl/host.virtualOwner"
 }
@@ -75,12 +51,13 @@ func (i *inode) StateFields() []string {
 		"InodeNotSymlink",
 		"CachedMappable",
 		"InodeTemporary",
+		"InodeWatches",
 		"locks",
 		"inodeRefs",
 		"hostFD",
 		"ino",
 		"ftype",
-		"mayBlock",
+		"epollable",
 		"seekable",
 		"isTTY",
 		"savable",
@@ -99,19 +76,20 @@ func (i *inode) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(2, &i.InodeNotSymlink)
 	stateSinkObject.Save(3, &i.CachedMappable)
 	stateSinkObject.Save(4, &i.InodeTemporary)
-	stateSinkObject.Save(5, &i.locks)
-	stateSinkObject.Save(6, &i.inodeRefs)
-	stateSinkObject.Save(7, &i.hostFD)
-	stateSinkObject.Save(8, &i.ino)
-	stateSinkObject.Save(9, &i.ftype)
-	stateSinkObject.Save(10, &i.mayBlock)
-	stateSinkObject.Save(11, &i.seekable)
-	stateSinkObject.Save(12, &i.isTTY)
-	stateSinkObject.Save(13, &i.savable)
-	stateSinkObject.Save(14, &i.queue)
-	stateSinkObject.Save(15, &i.virtualOwner)
-	stateSinkObject.Save(16, &i.haveBuf)
-	stateSinkObject.Save(17, &i.buf)
+	stateSinkObject.Save(5, &i.InodeWatches)
+	stateSinkObject.Save(6, &i.locks)
+	stateSinkObject.Save(7, &i.inodeRefs)
+	stateSinkObject.Save(8, &i.hostFD)
+	stateSinkObject.Save(9, &i.ino)
+	stateSinkObject.Save(10, &i.ftype)
+	stateSinkObject.Save(11, &i.epollable)
+	stateSinkObject.Save(12, &i.seekable)
+	stateSinkObject.Save(13, &i.isTTY)
+	stateSinkObject.Save(14, &i.savable)
+	stateSinkObject.Save(15, &i.queue)
+	stateSinkObject.Save(16, &i.virtualOwner)
+	stateSinkObject.Save(17, &i.haveBuf)
+	stateSinkObject.Save(18, &i.buf)
 }
 
 // +checklocksignore
@@ -121,19 +99,20 @@ func (i *inode) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(2, &i.InodeNotSymlink)
 	stateSourceObject.Load(3, &i.CachedMappable)
 	stateSourceObject.Load(4, &i.InodeTemporary)
-	stateSourceObject.Load(5, &i.locks)
-	stateSourceObject.Load(6, &i.inodeRefs)
-	stateSourceObject.Load(7, &i.hostFD)
-	stateSourceObject.Load(8, &i.ino)
-	stateSourceObject.Load(9, &i.ftype)
-	stateSourceObject.Load(10, &i.mayBlock)
-	stateSourceObject.Load(11, &i.seekable)
-	stateSourceObject.Load(12, &i.isTTY)
-	stateSourceObject.Load(13, &i.savable)
-	stateSourceObject.Load(14, &i.queue)
-	stateSourceObject.Load(15, &i.virtualOwner)
-	stateSourceObject.Load(16, &i.haveBuf)
-	stateSourceObject.Load(17, &i.buf)
+	stateSourceObject.Load(5, &i.InodeWatches)
+	stateSourceObject.Load(6, &i.locks)
+	stateSourceObject.Load(7, &i.inodeRefs)
+	stateSourceObject.Load(8, &i.hostFD)
+	stateSourceObject.Load(9, &i.ino)
+	stateSourceObject.Load(10, &i.ftype)
+	stateSourceObject.Load(11, &i.epollable)
+	stateSourceObject.Load(12, &i.seekable)
+	stateSourceObject.Load(13, &i.isTTY)
+	stateSourceObject.Load(14, &i.savable)
+	stateSourceObject.Load(15, &i.queue)
+	stateSourceObject.Load(16, &i.virtualOwner)
+	stateSourceObject.Load(17, &i.haveBuf)
+	stateSourceObject.Load(18, &i.buf)
 	stateSourceObject.AfterLoad(i.afterLoad)
 }
 
@@ -247,39 +226,6 @@ func (r *inodeRefs) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.AfterLoad(r.afterLoad)
 }
 
-func (c *ConnectedEndpoint) StateTypeName() string {
-	return "pkg/sentry/fsimpl/host.ConnectedEndpoint"
-}
-
-func (c *ConnectedEndpoint) StateFields() []string {
-	return []string{
-		"ConnectedEndpointRefs",
-		"fd",
-		"addr",
-		"stype",
-	}
-}
-
-func (c *ConnectedEndpoint) beforeSave() {}
-
-// +checklocksignore
-func (c *ConnectedEndpoint) StateSave(stateSinkObject state.Sink) {
-	c.beforeSave()
-	stateSinkObject.Save(0, &c.ConnectedEndpointRefs)
-	stateSinkObject.Save(1, &c.fd)
-	stateSinkObject.Save(2, &c.addr)
-	stateSinkObject.Save(3, &c.stype)
-}
-
-// +checklocksignore
-func (c *ConnectedEndpoint) StateLoad(stateSourceObject state.Source) {
-	stateSourceObject.Load(0, &c.ConnectedEndpointRefs)
-	stateSourceObject.Load(1, &c.fd)
-	stateSourceObject.Load(2, &c.addr)
-	stateSourceObject.Load(3, &c.stype)
-	stateSourceObject.AfterLoad(c.afterLoad)
-}
-
 func (t *TTYFileDescription) StateTypeName() string {
 	return "pkg/sentry/fsimpl/host.TTYFileDescription"
 }
@@ -315,13 +261,11 @@ func (t *TTYFileDescription) StateLoad(stateSourceObject state.Source) {
 }
 
 func init() {
-	state.Register((*ConnectedEndpointRefs)(nil))
 	state.Register((*virtualOwner)(nil))
 	state.Register((*inode)(nil))
 	state.Register((*filesystemType)(nil))
 	state.Register((*filesystem)(nil))
 	state.Register((*fileDescription)(nil))
 	state.Register((*inodeRefs)(nil))
-	state.Register((*ConnectedEndpoint)(nil))
 	state.Register((*TTYFileDescription)(nil))
 }

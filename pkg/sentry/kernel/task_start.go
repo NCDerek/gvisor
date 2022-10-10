@@ -15,7 +15,11 @@
 package kernel
 
 import (
+	"fmt"
+
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
+	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
@@ -93,6 +97,9 @@ type TaskConfig struct {
 
 	// ContainerID is the container the new task belongs to.
 	ContainerID string
+
+	// UserCounters is user resource counters.
+	UserCounters *userCounters
 }
 
 // NewTask creates a new task defined by cfg.
@@ -102,15 +109,25 @@ type TaskConfig struct {
 // If successful, NewTask transfers references held by cfg to the new task.
 // Otherwise, NewTask releases them.
 func (ts *TaskSet) NewTask(ctx context.Context, cfg *TaskConfig) (*Task, error) {
-	t, err := ts.newTask(cfg)
-	if err != nil {
+	var err error
+	cleanup := func() {
 		cfg.TaskImage.release()
 		cfg.FSContext.DecRef(ctx)
 		cfg.FDTable.DecRef(ctx)
 		cfg.IPCNamespace.DecRef(ctx)
+		cfg.NetworkNamespace.DecRef()
 		if cfg.MountNamespaceVFS2 != nil {
 			cfg.MountNamespaceVFS2.DecRef(ctx)
 		}
+	}
+	if err := cfg.UserCounters.incRLimitNProc(ctx); err != nil {
+		cleanup()
+		return nil, err
+	}
+	t, err := ts.newTask(ctx, cfg)
+	if err != nil {
+		cfg.UserCounters.decRLimitNProc()
+		cleanup()
 		return nil, err
 	}
 	return t, nil
@@ -118,7 +135,8 @@ func (ts *TaskSet) NewTask(ctx context.Context, cfg *TaskConfig) (*Task, error) 
 
 // newTask is a helper for TaskSet.NewTask that only takes ownership of parts
 // of cfg if it succeeds.
-func (ts *TaskSet) newTask(cfg *TaskConfig) (*Task, error) {
+func (ts *TaskSet) newTask(ctx context.Context, cfg *TaskConfig) (*Task, error) {
+	srcT := TaskFromContext(ctx)
 	tg := cfg.ThreadGroup
 	image := cfg.TaskImage
 	t := &Task{
@@ -129,18 +147,16 @@ func (ts *TaskSet) newTask(cfg *TaskConfig) (*Task, error) {
 		},
 		runState:           (*runApp)(nil),
 		interruptChan:      make(chan struct{}, 1),
-		signalMask:         cfg.SignalMask,
+		signalMask:         atomicbitops.FromUint64(uint64(cfg.SignalMask)),
 		signalStack:        linux.SignalStack{Flags: linux.SS_DISABLE},
 		image:              *image,
 		fsContext:          cfg.FSContext,
 		fdTable:            cfg.FDTable,
-		p:                  cfg.Kernel.Platform.NewContext(),
 		k:                  cfg.Kernel,
 		ptraceTracees:      make(map[*Task]struct{}),
 		allowedCPUMask:     cfg.AllowedCPUMask.Copy(),
 		ioUsage:            &usage.IO{},
 		niceness:           cfg.Niceness,
-		netns:              cfg.NetworkNamespace,
 		utsns:              cfg.UTSNamespace,
 		ipcns:              cfg.IPCNamespace,
 		abstractSockets:    cfg.AbstractSocketNamespace,
@@ -151,12 +167,45 @@ func (ts *TaskSet) newTask(cfg *TaskConfig) (*Task, error) {
 		futexWaiter:        futex.NewWaiter(),
 		containerID:        cfg.ContainerID,
 		cgroups:            make(map[Cgroup]struct{}),
+		userCounters:       cfg.UserCounters,
 	}
+	t.netns.Store(cfg.NetworkNamespace)
 	t.creds.Store(cfg.Credentials)
 	t.endStopCond.L = &t.tg.signalHandlers.mu
 	t.ptraceTracer.Store((*Task)(nil))
 	// We don't construct t.blockingTimer until Task.run(); see that function
 	// for justification.
+
+	var cu cleanup.Cleanup
+	defer cu.Clean()
+
+	// Reserve cgroup PIDs controller charge. This is either commited when the
+	// new task enters the cgroup below, or rolled back on failure.
+	//
+	// We may also get here from a non-task context (for example, when
+	// creating the init task, or from the exec control command). In these cases
+	// we skip charging the pids controller, as non-userspace task creation
+	// bypasses pid limits.
+	if srcT != nil {
+		var (
+			charged bool
+			err     error
+			hid     uint32
+		)
+		if charged, hid, err = srcT.ChargeFor(t, CgroupControllerPIDs, CgroupResourcePID, 1); err != nil {
+			return nil, err
+		}
+		if charged {
+			cu.Add(func() {
+				// Since ts.mu was dropped after the corresponding charge, the
+				// hierarchy referenced by hid may no longer exist. If so, this
+				// uncharge will be a no-op.
+				if _, _, err := srcT.ChargeForOnHierarchy(t, hid, CgroupControllerPIDs, CgroupResourcePID, -1); err != nil {
+					panic(fmt.Sprintf("Failed to clean up PIDs charge on task creation failure: %v", err))
+				}
+			})
+		}
+	}
 
 	// Make the new task (and possibly thread group) visible to the rest of
 	// the system atomically.
@@ -190,7 +239,8 @@ func (ts *TaskSet) newTask(cfg *TaskConfig) (*Task, error) {
 	}
 
 	if VFS2Enabled {
-		t.EnterInitialCgroups(t.parent)
+		// srcT may be nil, in which case we default to root cgroups.
+		t.EnterInitialCgroups(srcT)
 	}
 
 	if tg.leader == nil {
@@ -211,15 +261,20 @@ func (ts *TaskSet) newTask(cfg *TaskConfig) (*Task, error) {
 	tg.activeTasks++
 
 	// Propagate external TaskSet stops to the new task.
-	t.stopCount = ts.stopCount
+	t.stopCount = atomicbitops.FromInt32(ts.stopCount)
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	t.cpu = assignCPU(t.allowedCPUMask, ts.Root.tids[t])
+	t.cpu = atomicbitops.FromInt32(assignCPU(t.allowedCPUMask, ts.Root.tids[t]))
 
 	t.startTime = t.k.RealtimeClock().Now()
 
+	// As a final step, initialize the platform context. This may require
+	// other pieces to be initialized as the task is used the context.
+	t.p = cfg.Kernel.Platform.NewContext(t.AsyncContext())
+
+	cu.Release()
 	return t, nil
 }
 
@@ -233,28 +288,26 @@ func (ts *TaskSet) assignTIDsLocked(t *Task) error {
 		tid ThreadID
 	}
 	var allocatedTIDs []allocatedTID
+	var tid ThreadID
+	var err error
 	for ns := t.tg.pidns; ns != nil; ns = ns.parent {
-		tid, err := ns.allocateTID()
-		if err != nil {
-			// Failure. Remove the tids we already allocated in descendant
-			// namespaces.
-			for _, a := range allocatedTIDs {
-				delete(a.ns.tasks, a.tid)
-				delete(a.ns.tids, t)
-				if t.tg.leader == nil {
-					delete(a.ns.tgids, t.tg)
-				}
-			}
-			return err
+		if tid, err = ns.allocateTID(); err != nil {
+			break
 		}
-		ns.tasks[tid] = t
-		ns.tids[t] = tid
-		if t.tg.leader == nil {
-			// New thread group.
-			ns.tgids[t.tg] = tid
+		if err = ns.addTask(t, tid); err != nil {
+			break
 		}
 		allocatedTIDs = append(allocatedTIDs, allocatedTID{ns, tid})
 	}
+	if err != nil {
+		// Failure. Remove the tids we already allocated in descendant
+		// namespaces.
+		for _, a := range allocatedTIDs {
+			a.ns.deleteTask(t)
+		}
+		return err
+	}
+	t.tg.pidWithinNS.Store(int32(t.tg.pidns.tgids[t.tg]))
 	return nil
 }
 

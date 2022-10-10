@@ -17,6 +17,7 @@
 package eventfd
 
 import (
+	"fmt"
 	"math"
 
 	"golang.org/x/sys/unix"
@@ -54,7 +55,7 @@ type EventOperations struct {
 
 	// Queue is used to notify interested parties when the event object
 	// becomes readable or writable.
-	wq waiter.Queue `state:"zerovalue"`
+	wq waiter.Queue
 
 	// val is the current value of the event counter.
 	val uint64
@@ -264,14 +265,17 @@ func (e *EventOperations) Readiness(mask waiter.EventMask) waiter.EventMask {
 }
 
 // EventRegister implements waiter.Waitable.EventRegister.
-func (e *EventOperations) EventRegister(entry *waiter.Entry, mask waiter.EventMask) {
-	e.wq.EventRegister(entry, mask)
+func (e *EventOperations) EventRegister(entry *waiter.Entry) error {
+	e.wq.EventRegister(entry)
 
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.hostfd >= 0 {
-		fdnotifier.UpdateFD(int32(e.hostfd))
+		if err := fdnotifier.UpdateFD(int32(e.hostfd)); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
 // EventUnregister implements waiter.Waitable.EventUnregister.
@@ -281,6 +285,8 @@ func (e *EventOperations) EventUnregister(entry *waiter.Entry) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.hostfd >= 0 {
-		fdnotifier.UpdateFD(int32(e.hostfd))
+		if err := fdnotifier.UpdateFD(int32(e.hostfd)); err != nil {
+			panic(fmt.Sprint("UpdateFD:", err))
+		}
 	}
 }

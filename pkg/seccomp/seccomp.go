@@ -41,11 +41,14 @@ const (
 // used because it only kills the offending thread and often keeps the sentry
 // hanging.
 //
+// denyRules describes forbidden syscalls. rules describes allowed syscalls.
+// denyRules is executed before rules.
+//
 // Be aware that RET_TRAP sends SIGSYS to the process and it may be ignored,
 // making it possible for the process to continue running after a violation.
 // However, it will leave a SECCOMP audit event trail behind. In any case, the
 // syscall is still blocked from executing.
-func Install(rules SyscallRules) error {
+func Install(rules SyscallRules, denyRules SyscallRules) error {
 	defaultAction, err := defaultAction()
 	if err != nil {
 		return err
@@ -57,6 +60,10 @@ func Install(rules SyscallRules) error {
 	log.Infof("Installing seccomp filters for %d syscalls (action=%v)", len(rules), defaultAction)
 
 	instrs, err := BuildProgram([]RuleSet{
+		{
+			Rules:  denyRules,
+			Action: defaultAction,
+		},
 		{
 			Rules:  rules,
 			Action: linux.SECCOMP_RET_ALLOW,
@@ -400,19 +407,22 @@ func addSyscallArgsCheck(p *bpf.ProgramBuilder, rules []Rule, action linux.BPFAc
 // is as follows:
 //
 // // SYS_PIPE(22), root
-//   (A == 22) ? goto argument check : continue
-//   (A > 22) ? goto index_35 : goto index_9
+//
+//	(A == 22) ? goto argument check : continue
+//	(A > 22) ? goto index_35 : goto index_9
 //
 // index_9:  // SYS_MMAP(9), leaf
-//   A == 9) ? goto argument check : defaultLabel
+//
+//	A == 9) ? goto argument check : defaultLabel
 //
 // index_35:  // SYS_NANOSLEEP(35), single child
-//   (A == 35) ? goto argument check : continue
-//   (A > 35) ? goto index_50 : goto defaultLabel
+//
+//	(A == 35) ? goto argument check : continue
+//	(A > 35) ? goto index_50 : goto defaultLabel
 //
 // index_50:  // SYS_LISTEN(50), leaf
-//   (A == 50) ? goto argument check : goto defaultLabel
 //
+//	(A == 50) ? goto argument check : goto defaultLabel
 func buildBSTProgram(n *node, rules []RuleSet, program *bpf.ProgramBuilder) error {
 	// Root node is never referenced by label, skip it.
 	if !n.root {

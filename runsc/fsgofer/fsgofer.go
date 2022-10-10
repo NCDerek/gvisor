@@ -16,8 +16,8 @@
 // a simple mapping from a path prefix that is added to the path requested
 // by the sandbox. Ex:
 //
-//   prefix: "/docker/imgs/alpine"
-//   app path: /bin/ls => /docker/imgs/alpine/bin/ls
+//	prefix: "/docker/imgs/alpine"
+//	app path: /bin/ls => /docker/imgs/alpine/bin/ls
 package fsgofer
 
 import (
@@ -47,15 +47,10 @@ const (
 	openFlags = unix.O_NOFOLLOW | unix.O_CLOEXEC
 
 	allowedOpenFlags = unix.O_TRUNC
-)
 
-// verityXattrs are the extended attributes used by verity file system.
-var verityXattrs = map[string]struct{}{
-	"user.merkle.offset":         {},
-	"user.merkle.size":           {},
-	"user.merkle.childrenOffset": {},
-	"user.merkle.childrenSize":   {},
-}
+	// UNIX_PATH_MAX as defined in include/uapi/linux/un.h.
+	unixPathMax = 108
+)
 
 // join is equivalent to path.Join() but skips path.Clean() which is expensive.
 func join(parent, child string) string {
@@ -70,12 +65,9 @@ type Config struct {
 	// PanicOnWrite panics on attempts to write to RO mounts.
 	PanicOnWrite bool
 
-	// HostUDS signals whether the gofer can mount a host's UDS.
+	// HostUDS signals whether the gofer can create and connect to host
+	// unix domain sockets.
 	HostUDS bool
-
-	// EnableVerityXattr allows access to extended attributes used by the
-	// verity file system.
-	EnableVerityXattr bool
 }
 
 type attachPoint struct {
@@ -140,6 +132,18 @@ func (a *attachPoint) Attach() (p9.File, error) {
 	return lf, nil
 }
 
+// ServerOptions implements p9.Attacher. It's safe to call SetAttr and Allocate
+// on deleted files because fsgofer either uses an existing FD or opens a new
+// one using the magic symlink in `/proc/[pid]/fd` and cannot mistakely open
+// a file that was created in the same path as the delete file.
+func (a *attachPoint) ServerOptions() p9.AttacherOptions {
+	return p9.AttacherOptions{
+		SetAttrOnDeleted:      true,
+		AllocateOnDeleted:     true,
+		MultiGetAttrSupported: true,
+	}
+}
+
 // makeQID returns a unique QID for the given stat buffer.
 func (a *attachPoint) makeQID(stat *unix.Stat_t) p9.QID {
 	a.deviceMu.Lock()
@@ -186,10 +190,10 @@ func (a *attachPoint) makeQID(stat *unix.Stat_t) p9.QID {
 // multiple files are only being opened for read (esp. startup).
 //
 // File operations must use "at" functions whenever possible:
-//   * Local operations must use AT_EMPTY_PATH:
-//  	   fchownat(fd, "", AT_EMPTY_PATH, ...), instead of chown(fullpath, ...)
-//   * Creation operations must use (fd + name):
-//       mkdirat(fd, name, ...), instead of mkdir(fullpath, ...)
+//   - Local operations must use AT_EMPTY_PATH:
+//     fchownat(fd, "", AT_EMPTY_PATH, ...), instead of chown(fullpath, ...)
+//   - Creation operations must use (fd + name):
+//     mkdirat(fd, name, ...), instead of mkdir(fullpath, ...)
 //
 // Apart from being faster, it also adds another layer of defense against
 // symlink attacks (note that O_NOFOLLOW applies only to the last element in
@@ -806,27 +810,11 @@ func (l *localFile) SetAttr(valid p9.SetAttrMask, attr p9.SetAttr) error {
 }
 
 func (l *localFile) GetXattr(name string, size uint64) (string, error) {
-	if !l.attachPoint.conf.EnableVerityXattr {
-		return "", unix.EOPNOTSUPP
-	}
-	if _, ok := verityXattrs[name]; !ok {
-		return "", unix.EOPNOTSUPP
-	}
-	buffer := make([]byte, size)
-	if _, err := unix.Fgetxattr(l.file.FD(), name, buffer); err != nil {
-		return "", err
-	}
-	return string(buffer), nil
+	return "", unix.EOPNOTSUPP
 }
 
 func (l *localFile) SetXattr(name string, value string, flags uint32) error {
-	if !l.attachPoint.conf.EnableVerityXattr {
-		return unix.EOPNOTSUPP
-	}
-	if _, ok := verityXattrs[name]; !ok {
-		return unix.EOPNOTSUPP
-	}
-	return unix.Fsetxattr(l.file.FD(), name, []byte(value), int(flags))
+	return unix.EOPNOTSUPP
 }
 
 func (*localFile) ListXattr(uint64) (map[string]struct{}, error) {
@@ -854,7 +842,7 @@ func (*localFile) Rename(p9.File, string) error {
 	panic("rename called directly")
 }
 
-// RenameAt implements p9.File.RenameAt.
+// RenameAt implements p9.File.
 func (l *localFile) RenameAt(oldName string, directory p9.File, newName string) error {
 	if err := l.checkROMount(); err != nil {
 		return err
@@ -1001,7 +989,7 @@ func (l *localFile) UnlinkAt(name string, flags uint32) error {
 }
 
 // Readdir implements p9.File.
-func (l *localFile) Readdir(offset uint64, count uint32) ([]p9.Dirent, error) {
+func (l *localFile) Readdir(direntOffset uint64, count uint32) ([]p9.Dirent, error) {
 	if l.mode != p9.ReadOnly && l.mode != p9.ReadWrite {
 		return nil, unix.EBADF
 	}
@@ -1022,18 +1010,18 @@ func (l *localFile) Readdir(offset uint64, count uint32) ([]p9.Dirent, error) {
 	// offset is 0, since this is side-effectual (equivalent to rewinddir(3),
 	// which causes the directory stream to resynchronize with the directory's
 	// current contents).
-	if l.lastDirentOffset != offset || offset == 0 {
+	if l.lastDirentOffset != direntOffset || direntOffset == 0 {
 		if _, err := unix.Seek(l.file.FD(), 0, 0); err != nil {
 			return nil, extractErrno(err)
 		}
-		skip = offset
+		skip = direntOffset
 	}
 
-	dirents, err := l.readDirent(l.file.FD(), offset, count, skip)
+	dirents, err := l.readDirent(l.file.FD(), direntOffset, count, skip)
 	if err == nil {
 		// On success, remember the offset that was returned at the current
 		// position.
-		l.lastDirentOffset = offset + uint64(len(dirents))
+		l.lastDirentOffset = direntOffset + uint64(len(dirents))
 	} else {
 		// On failure, the state is unknown, force call to seek() next time.
 		l.lastDirentOffset = math.MaxUint64
@@ -1041,57 +1029,62 @@ func (l *localFile) Readdir(offset uint64, count uint32) ([]p9.Dirent, error) {
 	return dirents, err
 }
 
-func (l *localFile) readDirent(f int, offset uint64, count uint32, skip uint64) ([]p9.Dirent, error) {
+func (l *localFile) readDirent(f int, direntOffset uint64, count uint32, skip uint64) ([]p9.Dirent, error) {
 	var dirents []p9.Dirent
 
-	// Limit 'count' to cap the slice size that is returned.
-	const maxCount = 100000
+	// p9.Dirent takes 5 extra bytes to be encoded than a unix.Dirent.
+	// count will be used to count against the number of bytes read from the
+	// host. So scale it down, so that when encoding the same dirents in p9, we
+	// don't hit count limit. Scale down to 80%.
+	count = (count * 8) / 10
+	// Limit 'count' to cap the amount of data that is returned.
+	const maxCount = 102_400
 	if count > maxCount {
 		count = maxCount
 	}
 
 	// Pre-allocate buffers that will be reused to get partial results.
 	direntsBuf := make([]byte, 8192)
-	names := make([]string, 0, 100)
-
-	end := offset + uint64(count)
-	for offset < end {
-		dirSize, err := unix.ReadDirent(f, direntsBuf)
+	for bytesRead := 0; bytesRead < int(count); {
+		bufEnd := len(direntsBuf)
+		if remaining := int(count) - bytesRead; remaining < bufEnd {
+			bufEnd = remaining
+		}
+		n, err := unix.Getdents(f, direntsBuf[:bufEnd])
 		if err != nil {
+			if err == unix.EINVAL && bufEnd < unixDirentMaxSize {
+				// getdents64(2) returns EINVAL when the result buffer is too small. If
+				// bufEnd is smaller than the max size of unix.Dirent, then just break
+				// here to return all dirents collected till now.
+				return dirents, nil
+			}
 			return dirents, err
 		}
-		if dirSize <= 0 {
+		if n <= 0 {
 			return dirents, nil
 		}
 
-		names := names[:0]
-		_, _, names = unix.ParseDirent(direntsBuf[:dirSize], -1, names)
-
-		// Skip over entries that the caller is not interested in.
-		if skip > 0 {
-			if skip > uint64(len(names)) {
-				skip -= uint64(len(names))
-				names = names[:0]
-			} else {
-				names = names[skip:]
-				skip = 0
-			}
-		}
-		for _, name := range names {
+		parseDirents(direntsBuf[:n], func(ino uint64, off int64, ftype uint8, name string, reclen uint16) bool {
 			stat, err := statAt(l.file.FD(), name)
 			if err != nil {
-				log.Warningf("Readdir is skipping file with failed stat %q, err: %v", l.hostPath, err)
-				continue
+				log.Warningf("Readdir is skipping file %q with failed stat, err: %v", path.Join(l.hostPath, name), err)
+				return true
+			}
+			if skip > 0 {
+				skip--
+				return true
 			}
 			qid := l.attachPoint.makeQID(&stat)
-			offset++
+			direntOffset++
 			dirents = append(dirents, p9.Dirent{
 				QID:    qid,
 				Type:   qid.Type,
 				Name:   name,
-				Offset: offset,
+				Offset: direntOffset,
 			})
-		}
+			bytesRead += int(reclen)
+			return true
+		})
 	}
 	return dirents, nil
 }
@@ -1118,8 +1111,80 @@ func (l *localFile) Flush() error {
 	return nil
 }
 
+// Bind implements p9.File.
+func (l *localFile) Bind(sockType uint32, sockName string, uid p9.UID, gid p9.GID) (p9.File, p9.QID, p9.AttrMask, p9.Attr, error) {
+	if !l.attachPoint.conf.HostUDS {
+		// Bind on host UDS is not allowed. As per mknod(2), which is invoked as
+		// part of bind(2), if "the filesystem containing pathname does not support
+		// the type of node requested." then EPERM must be returned.
+		return nil, p9.QID{}, p9.AttrMask{}, p9.Attr{}, unix.EPERM
+	}
+
+	// TODO(gvisor.dev/issue/1003): Due to different app vs replacement
+	// mappings, the app path may have fit in the sockaddr, but we can't
+	// fit f.path in our sockaddr. We'd need to redirect through a shorter
+	// path in order to actually connect to this socket.
+	sockPath := path.Join(l.hostPath, sockName)
+	if len(sockPath) >= unixPathMax {
+		return nil, p9.QID{}, p9.AttrMask{}, p9.Attr{}, unix.EINVAL
+	}
+
+	// Create socket only for supported types.
+	if !isSockTypeSupported(sockType) {
+		return nil, p9.QID{}, p9.AttrMask{}, p9.Attr{}, unix.ENXIO
+	}
+	sock, err := unix.Socket(unix.AF_UNIX, int(sockType), 0)
+	if err != nil {
+		return nil, p9.QID{}, p9.AttrMask{}, p9.Attr{}, extractErrno(err)
+	}
+
+	// Revert operations on error paths.
+	didBind := false
+	cu := cleanup.Make(func() {
+		_ = unix.Close(sock)
+		if didBind {
+			if err := unix.Unlinkat(l.file.FD(), sockName, 0); err != nil {
+				log.Warningf("error unlinking file %q after failure: %v", sockPath, err)
+			}
+		}
+	})
+	defer cu.Clean()
+
+	// socket FD must be non blocking because RPC operations like Accept on this
+	// socket must be non blocking.
+	if err := unix.SetNonblock(sock, true); err != nil {
+		return nil, p9.QID{}, p9.AttrMask{}, p9.Attr{}, extractErrno(err)
+	}
+
+	// Bind at the given path which should create the socket file.
+	if err := unix.Bind(sock, &unix.SockaddrUnix{Name: sockPath}); err != nil {
+		return nil, p9.QID{}, p9.AttrMask{}, p9.Attr{}, extractErrno(err)
+	}
+	didBind = true
+
+	// Open socket to change ownership.
+	tempSockFD, err := fd.OpenAt(l.file, sockName, unix.O_PATH|openFlags, 0)
+	if err != nil {
+		return nil, p9.QID{}, p9.AttrMask{}, p9.Attr{}, extractErrno(err)
+	}
+	defer tempSockFD.Close()
+
+	if _, err = setOwnerIfNeeded(tempSockFD.FD(), uid, gid); err != nil {
+		return nil, p9.QID{}, p9.AttrMask{}, p9.Attr{}, extractErrno(err)
+	}
+
+	// Generate file for this socket by walking on it.
+	qid, sockF, valid, attr, err := l.WalkGetAttr([]string{sockName})
+	if err != nil {
+		return nil, p9.QID{}, p9.AttrMask{}, p9.Attr{}, err
+	}
+
+	cu.Release()
+	return &socketLocalFile{localFile: sockF.(*localFile), sock: sock}, qid[0], valid, attr, nil
+}
+
 // Connect implements p9.File.
-func (l *localFile) Connect(flags p9.ConnectFlags) (*fd.FD, error) {
+func (l *localFile) Connect(socketType p9.SocketType) (*fd.FD, error) {
 	if !l.attachPoint.conf.HostUDS {
 		return nil, unix.ECONNREFUSED
 	}
@@ -1128,24 +1193,16 @@ func (l *localFile) Connect(flags p9.ConnectFlags) (*fd.FD, error) {
 	// mappings, the app path may have fit in the sockaddr, but we can't
 	// fit f.path in our sockaddr. We'd need to redirect through a shorter
 	// path in order to actually connect to this socket.
-	const UNIX_PATH_MAX = 108 // defined in afunix.h
-	if len(l.hostPath) > UNIX_PATH_MAX {
+	if len(l.hostPath) >= unixPathMax {
 		return nil, unix.ECONNREFUSED
 	}
 
-	var stype int
-	switch flags {
-	case p9.StreamSocket:
-		stype = unix.SOCK_STREAM
-	case p9.DgramSocket:
-		stype = unix.SOCK_DGRAM
-	case p9.SeqpacketSocket:
-		stype = unix.SOCK_SEQPACKET
-	default:
+	stype, ok := socketType.ToLinux()
+	if !ok {
 		return nil, unix.ENXIO
 	}
 
-	f, err := unix.Socket(unix.AF_UNIX, stype, 0)
+	f, err := unix.Socket(unix.AF_UNIX, int(stype), 0)
 	if err != nil {
 		return nil, err
 	}
@@ -1225,6 +1282,7 @@ func (l *localFile) checkROMount() error {
 	return nil
 }
 
+// MultiGetAttr implements p9.File.
 func (l *localFile) MultiGetAttr(names []string) ([]p9.FullStat, error) {
 	stats := make([]p9.FullStat, 0, len(names))
 
@@ -1241,6 +1299,12 @@ func (l *localFile) MultiGetAttr(names []string) ([]p9.FullStat, error) {
 		names = names[1:]
 	}
 
+	// Note that while performing the walk below, we do not have read
+	// concurrency guarantee for any descendants. So files can be created/deleted
+	// while the walk is being performed. However, this should be fine from a
+	// security perspective as we are using host FDs to walk and checking that
+	// each opened path component is a directory. We also set O_NOFOLLOW to
+	// ensure no symlinks are accidentally followed during walk.
 	parent := l.file.FD()
 	closeParent := func() {
 		if parent != l.file.FD() {
@@ -1278,4 +1342,23 @@ func (l *localFile) MultiGetAttr(names []string) ([]p9.FullStat, error) {
 		parent = child
 	}
 	return stats, nil
+}
+
+// socketLocalFile is an extension of localFile which is only created via Bind
+// and additionally implements Listen and Accept. It also tracks the lifecycle
+// of the socket FD created by socket(2) in addition to the FD opened on the
+// socket file itself.
+type socketLocalFile struct {
+	*localFile
+	sock int
+}
+
+// Close implements p9.File.
+func (l *socketLocalFile) Close() error {
+	err := l.localFile.Close()
+	err2 := unix.Close(l.sock)
+	if err != nil {
+		return err
+	}
+	return err2
 }

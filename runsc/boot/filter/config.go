@@ -134,9 +134,15 @@ var allowedSyscalls = seccomp.SyscallRules{
 	},
 	unix.SYS_GETTID:       {},
 	unix.SYS_GETTIMEOFDAY: {},
-	// SYS_IOCTL is needed for terminal support, but we only allow
-	// setting/getting termios and winsize.
 	unix.SYS_IOCTL: []seccomp.Rule{
+		// These commands are needed for host FD.
+		{
+			seccomp.MatchAny{}, /* fd */
+			seccomp.EqualTo(linux.FIONREAD),
+			seccomp.MatchAny{}, /* int* */
+		},
+		// These commands are needed for terminal support, but we only allow
+		// setting/getting termios and winsize.
 		{
 			seccomp.MatchAny{}, /* fd */
 			seccomp.EqualTo(linux.TCGETS),
@@ -167,6 +173,11 @@ var allowedSyscalls = seccomp.SyscallRules{
 			seccomp.EqualTo(linux.TIOCGWINSZ),
 			seccomp.MatchAny{}, /* winsize struct */
 		},
+		{
+			seccomp.MatchAny{}, /* fd */
+			seccomp.EqualTo(linux.SIOCGIFTXQLEN),
+			seccomp.MatchAny{}, /* ifreq struct */
+		},
 	},
 	unix.SYS_LSEEK:   {},
 	unix.SYS_MADVISE: {},
@@ -177,18 +188,7 @@ var allowedSyscalls = seccomp.SyscallRules{
 		},
 	},
 	unix.SYS_MINCORE: {},
-	// Used by the Go runtime as a temporarily workaround for a Linux
-	// 5.2-5.4 bug.
-	//
-	// See src/runtime/os_linux_x86.go.
-	//
-	// TODO(b/148688965): Remove once this is gone from Go.
-	unix.SYS_MLOCK: []seccomp.Rule{
-		{
-			seccomp.MatchAny{},
-			seccomp.EqualTo(4096),
-		},
-	},
+	unix.SYS_MLOCK:   {},
 	unix.SYS_MMAP: []seccomp.Rule{
 		{
 			seccomp.MatchAny{},
@@ -234,6 +234,7 @@ var allowedSyscalls = seccomp.SyscallRules{
 		},
 	},
 	unix.SYS_MPROTECT:  {},
+	unix.SYS_MUNLOCK:   {},
 	unix.SYS_MUNMAP:    {},
 	unix.SYS_NANOSLEEP: {},
 	unix.SYS_PPOLL:     {},
@@ -304,6 +305,22 @@ var allowedSyscalls = seccomp.SyscallRules{
 			seccomp.EqualTo(unix.SPLICE_F_NONBLOCK), /* flags */
 		},
 	},
+	unix.SYS_TIMER_CREATE: []seccomp.Rule{
+		{
+			seccomp.EqualTo(unix.CLOCK_THREAD_CPUTIME_ID), /* which */
+			seccomp.MatchAny{},                            /* sevp */
+			seccomp.MatchAny{},                            /* timerid */
+		},
+	},
+	unix.SYS_TIMER_DELETE: []seccomp.Rule{},
+	unix.SYS_TIMER_SETTIME: []seccomp.Rule{
+		{
+			seccomp.MatchAny{}, /* timerid */
+			seccomp.EqualTo(0), /* flags */
+			seccomp.MatchAny{}, /* new_value */
+			seccomp.EqualTo(0), /* old_value */
+		},
+	},
 	unix.SYS_TGKILL: []seccomp.Rule{
 		{
 			seccomp.EqualTo(uint64(os.Getpid())),
@@ -357,6 +374,16 @@ func hostInetFilters() seccomp.SyscallRules {
 			{
 				seccomp.MatchAny{},
 				seccomp.EqualTo(unix.SOL_IP),
+				seccomp.EqualTo(unix.IP_TTL),
+			},
+			{
+				seccomp.MatchAny{},
+				seccomp.EqualTo(unix.SOL_IP),
+				seccomp.EqualTo(unix.IP_RECVTTL),
+			},
+			{
+				seccomp.MatchAny{},
+				seccomp.EqualTo(unix.SOL_IP),
 				seccomp.EqualTo(unix.IP_PKTINFO),
 			},
 			{
@@ -378,6 +405,26 @@ func hostInetFilters() seccomp.SyscallRules {
 				seccomp.MatchAny{},
 				seccomp.EqualTo(unix.SOL_IPV6),
 				seccomp.EqualTo(unix.IPV6_RECVTCLASS),
+			},
+			{
+				seccomp.MatchAny{},
+				seccomp.EqualTo(unix.SOL_IPV6),
+				seccomp.EqualTo(unix.IPV6_RECVPKTINFO),
+			},
+			{
+				seccomp.MatchAny{},
+				seccomp.EqualTo(unix.SOL_IPV6),
+				seccomp.EqualTo(unix.IPV6_UNICAST_HOPS),
+			},
+			{
+				seccomp.MatchAny{},
+				seccomp.EqualTo(unix.SOL_IPV6),
+				seccomp.EqualTo(unix.IPV6_MULTICAST_HOPS),
+			},
+			{
+				seccomp.MatchAny{},
+				seccomp.EqualTo(unix.SOL_IPV6),
+				seccomp.EqualTo(unix.IPV6_RECVHOPLIMIT),
 			},
 			{
 				seccomp.MatchAny{},
@@ -436,6 +483,16 @@ func hostInetFilters() seccomp.SyscallRules {
 			},
 			{
 				seccomp.MatchAny{},
+				seccomp.EqualTo(unix.SOL_SOCKET),
+				seccomp.EqualTo(unix.SO_RCVTIMEO),
+			},
+			{
+				seccomp.MatchAny{},
+				seccomp.EqualTo(unix.SOL_SOCKET),
+				seccomp.EqualTo(unix.SO_SNDTIMEO),
+			},
+			{
+				seccomp.MatchAny{},
 				seccomp.EqualTo(unix.SOL_TCP),
 				seccomp.EqualTo(unix.TCP_NODELAY),
 			},
@@ -448,6 +505,16 @@ func hostInetFilters() seccomp.SyscallRules {
 				seccomp.MatchAny{},
 				seccomp.EqualTo(unix.SOL_TCP),
 				seccomp.EqualTo(linux.TCP_INQ),
+			},
+			{
+				seccomp.MatchAny{},
+				seccomp.EqualTo(unix.SOL_TCP),
+				seccomp.EqualTo(linux.TCP_MAXSEG),
+			},
+			{
+				seccomp.MatchAny{},
+				seccomp.EqualTo(unix.SOL_TCP),
+				seccomp.EqualTo(linux.TCP_CONGESTION),
 			},
 		},
 		unix.SYS_IOCTL: []seccomp.Rule{
@@ -519,6 +586,18 @@ func hostInetFilters() seccomp.SyscallRules {
 			},
 			{
 				seccomp.MatchAny{},
+				seccomp.EqualTo(unix.SOL_TCP),
+				seccomp.EqualTo(linux.TCP_MAXSEG),
+				seccomp.MatchAny{},
+				seccomp.EqualTo(4),
+			},
+			{
+				seccomp.MatchAny{},
+				seccomp.EqualTo(unix.SOL_TCP),
+				seccomp.EqualTo(linux.TCP_CONGESTION),
+			},
+			{
+				seccomp.MatchAny{},
 				seccomp.EqualTo(unix.SOL_IP),
 				seccomp.EqualTo(unix.IP_TOS),
 				seccomp.MatchAny{},
@@ -534,7 +613,28 @@ func hostInetFilters() seccomp.SyscallRules {
 			{
 				seccomp.MatchAny{},
 				seccomp.EqualTo(unix.SOL_IP),
+				seccomp.EqualTo(unix.IP_TTL),
+				seccomp.MatchAny{},
+				seccomp.EqualTo(4),
+			},
+			{
+				seccomp.MatchAny{},
+				seccomp.EqualTo(unix.SOL_IP),
+				seccomp.EqualTo(unix.IP_RECVTTL),
+				seccomp.MatchAny{},
+				seccomp.EqualTo(4),
+			},
+			{
+				seccomp.MatchAny{},
+				seccomp.EqualTo(unix.SOL_IP),
 				seccomp.EqualTo(unix.IP_PKTINFO),
+				seccomp.MatchAny{},
+				seccomp.EqualTo(4),
+			},
+			{
+				seccomp.MatchAny{},
+				seccomp.EqualTo(unix.SOL_IPV6),
+				seccomp.EqualTo(unix.IPV6_RECVPKTINFO),
 				seccomp.MatchAny{},
 				seccomp.EqualTo(4),
 			},
@@ -563,6 +663,27 @@ func hostInetFilters() seccomp.SyscallRules {
 				seccomp.MatchAny{},
 				seccomp.EqualTo(unix.SOL_IPV6),
 				seccomp.EqualTo(unix.IPV6_RECVTCLASS),
+				seccomp.MatchAny{},
+				seccomp.EqualTo(4),
+			},
+			{
+				seccomp.MatchAny{},
+				seccomp.EqualTo(unix.SOL_IPV6),
+				seccomp.EqualTo(unix.IPV6_UNICAST_HOPS),
+				seccomp.MatchAny{},
+				seccomp.EqualTo(4),
+			},
+			{
+				seccomp.MatchAny{},
+				seccomp.EqualTo(unix.SOL_IPV6),
+				seccomp.EqualTo(unix.IPV6_MULTICAST_HOPS),
+				seccomp.MatchAny{},
+				seccomp.EqualTo(4),
+			},
+			{
+				seccomp.MatchAny{},
+				seccomp.EqualTo(unix.SOL_IPV6),
+				seccomp.EqualTo(unix.IPV6_RECVHOPLIMIT),
 				seccomp.MatchAny{},
 				seccomp.EqualTo(4),
 			},
@@ -630,7 +751,7 @@ func hostInetFilters() seccomp.SyscallRules {
 
 func controlServerFilters(fd int) seccomp.SyscallRules {
 	return seccomp.SyscallRules{
-		unix.SYS_ACCEPT: []seccomp.Rule{
+		unix.SYS_ACCEPT4: []seccomp.Rule{
 			{
 				seccomp.EqualTo(fd),
 			},

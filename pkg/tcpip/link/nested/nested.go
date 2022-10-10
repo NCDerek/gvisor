@@ -51,12 +51,22 @@ func (e *Endpoint) Init(child stack.LinkEndpoint, embedder stack.NetworkDispatch
 }
 
 // DeliverNetworkPacket implements stack.NetworkDispatcher.
-func (e *Endpoint) DeliverNetworkPacket(remote, local tcpip.LinkAddress, protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) {
+func (e *Endpoint) DeliverNetworkPacket(protocol tcpip.NetworkProtocolNumber, pkt stack.PacketBufferPtr) {
 	e.mu.RLock()
 	d := e.dispatcher
 	e.mu.RUnlock()
 	if d != nil {
-		d.DeliverNetworkPacket(remote, local, protocol, pkt)
+		d.DeliverNetworkPacket(protocol, pkt)
+	}
+}
+
+// DeliverLinkPacket implements stack.NetworkDispatcher.
+func (e *Endpoint) DeliverLinkPacket(protocol tcpip.NetworkProtocolNumber, pkt stack.PacketBufferPtr, incoming bool) {
+	e.mu.RLock()
+	d := e.dispatcher
+	e.mu.RUnlock()
+	if d != nil {
+		d.DeliverLinkPacket(protocol, pkt, incoming)
 	}
 }
 
@@ -102,14 +112,9 @@ func (e *Endpoint) LinkAddress() tcpip.LinkAddress {
 	return e.child.LinkAddress()
 }
 
-// WritePacket implements stack.LinkEndpoint.
-func (e *Endpoint) WritePacket(r stack.RouteInfo, protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) tcpip.Error {
-	return e.child.WritePacket(r, protocol, pkt)
-}
-
 // WritePackets implements stack.LinkEndpoint.
-func (e *Endpoint) WritePackets(r stack.RouteInfo, pkts stack.PacketBufferList, protocol tcpip.NetworkProtocolNumber) (int, tcpip.Error) {
-	return e.child.WritePackets(r, pkts, protocol)
+func (e *Endpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) {
+	return e.child.WritePackets(pkts)
 }
 
 // Wait implements stack.LinkEndpoint.
@@ -139,11 +144,6 @@ func (e *Endpoint) ARPHardwareType() header.ARPHardwareType {
 }
 
 // AddHeader implements stack.LinkEndpoint.AddHeader.
-func (e *Endpoint) AddHeader(local, remote tcpip.LinkAddress, protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) {
-	e.child.AddHeader(local, remote, protocol, pkt)
-}
-
-// WriteRawPacket implements stack.LinkEndpoint.
-func (e *Endpoint) WriteRawPacket(pkt *stack.PacketBuffer) tcpip.Error {
-	return e.child.WriteRawPacket(pkt)
+func (e *Endpoint) AddHeader(pkt stack.PacketBufferPtr) {
+	e.child.AddHeader(pkt)
 }

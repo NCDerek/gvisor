@@ -133,56 +133,35 @@ func (d *auxvData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	return nil
 }
 
-// execArgType enumerates the types of exec arguments that are exposed through
-// proc.
-type execArgType int
+// MetadataType enumerates the types of metadata that is exposed through proc.
+type MetadataType int
 
 const (
-	cmdlineDataArg execArgType = iota
-	environDataArg
+	// Cmdline represents /proc/[pid]/cmdline.
+	Cmdline MetadataType = iota
+
+	// Environ represents /proc/[pid]/environ.
+	Environ
 )
 
-// cmdlineData implements vfs.DynamicBytesSource for /proc/[pid]/cmdline.
-//
-// +stateify savable
-type cmdlineData struct {
-	kernfs.DynamicBytesFile
-
-	task *kernel.Task
-
-	// arg is the type of exec argument this file contains.
-	arg execArgType
-}
-
-var _ dynamicInode = (*cmdlineData)(nil)
-
-// Generate implements vfs.DynamicBytesSource.Generate.
-func (d *cmdlineData) Generate(ctx context.Context, buf *bytes.Buffer) error {
-	if d.task.ExitState() == kernel.TaskExitDead {
-		return linuxerr.ESRCH
-	}
-	m, err := getMMIncRef(d.task)
-	if err != nil {
-		// Return empty file.
-		return nil
-	}
-	defer m.DecUsers(ctx)
-
+// GetMetadata fetches the process's metadata of type t and writes it into
+// buf. The process is identified by mm.
+func GetMetadata(ctx context.Context, mm *mm.MemoryManager, buf *bytes.Buffer, t MetadataType) error {
 	// Figure out the bounds of the exec arg we are trying to read.
 	var ar hostarch.AddrRange
-	switch d.arg {
-	case cmdlineDataArg:
+	switch t {
+	case Cmdline:
 		ar = hostarch.AddrRange{
-			Start: m.ArgvStart(),
-			End:   m.ArgvEnd(),
+			Start: mm.ArgvStart(),
+			End:   mm.ArgvEnd(),
 		}
-	case environDataArg:
+	case Environ:
 		ar = hostarch.AddrRange{
-			Start: m.EnvvStart(),
-			End:   m.EnvvEnd(),
+			Start: mm.EnvvStart(),
+			End:   mm.EnvvEnd(),
 		}
 	default:
-		panic(fmt.Sprintf("unknown exec arg type %v", d.arg))
+		panic(fmt.Sprintf("unknown exec arg type %v", t))
 	}
 	if ar.Start == 0 || ar.End == 0 {
 		// Don't attempt to read before the start/end are set up.
@@ -193,7 +172,7 @@ func (d *cmdlineData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	// until Linux 4.9 (272ddc8b3735 "proc: don't use FOLL_FORCE for reading
 	// cmdline and environment").
 	writer := &bufferWriter{buf: buf}
-	if n, err := m.CopyInTo(ctx, hostarch.AddrRangeSeqOf(ar), writer, usermem.IOOpts{}); n == 0 || err != nil {
+	if n, err := mm.CopyInTo(ctx, hostarch.AddrRangeSeqOf(ar), writer, usermem.IOOpts{}); n == 0 || err != nil {
 		// Nothing to copy or something went wrong.
 		return err
 	}
@@ -201,7 +180,7 @@ func (d *cmdlineData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	// On Linux, if the NULL byte at the end of the argument vector has been
 	// overwritten, it continues reading the environment vector as part of
 	// the argument vector.
-	if d.arg == cmdlineDataArg && buf.Bytes()[buf.Len()-1] != 0 {
+	if t == Cmdline && buf.Bytes()[buf.Len()-1] != 0 {
 		if end := bytes.IndexByte(buf.Bytes(), 0); end != -1 {
 			// If we found a NULL character somewhere else in argv, truncate the
 			// return up to the NULL terminator (including it).
@@ -211,8 +190,8 @@ func (d *cmdlineData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 
 		// There is no NULL terminator in the string, return into envp.
 		arEnvv := hostarch.AddrRange{
-			Start: m.EnvvStart(),
-			End:   m.EnvvEnd(),
+			Start: mm.EnvvStart(),
+			End:   mm.EnvvEnd(),
 		}
 
 		// Upstream limits the returned amount to one page of slop.
@@ -231,7 +210,7 @@ func (d *cmdlineData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 			}
 			arEnvv.End = end
 		}
-		if _, err := m.CopyInTo(ctx, hostarch.AddrRangeSeqOf(arEnvv), writer, usermem.IOOpts{}); err != nil {
+		if _, err := mm.CopyInTo(ctx, hostarch.AddrRangeSeqOf(arEnvv), writer, usermem.IOOpts{}); err != nil {
 			return err
 		}
 
@@ -244,6 +223,37 @@ func (d *cmdlineData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	}
 
 	return nil
+}
+
+// metadataData implements vfs.DynamicBytesSource for proc metadata fields like:
+//
+//   - /proc/[pid]/cmdline
+//   - /proc/[pid]/environ
+//
+// +stateify savable
+type metadataData struct {
+	kernfs.DynamicBytesFile
+
+	task *kernel.Task
+
+	// arg is the type of exec argument this file contains.
+	metaType MetadataType
+}
+
+var _ dynamicInode = (*metadataData)(nil)
+
+// Generate implements vfs.DynamicBytesSource.Generate.
+func (d *metadataData) Generate(ctx context.Context, buf *bytes.Buffer) error {
+	if d.task.ExitState() == kernel.TaskExitDead {
+		return linuxerr.ESRCH
+	}
+	m, err := getMMIncRef(d.task)
+	if err != nil {
+		// Return empty file.
+		return nil
+	}
+	defer m.DecUsers(ctx)
+	return GetMetadata(ctx, m, buf, d.metaType)
 }
 
 // +stateify savable
@@ -303,6 +313,7 @@ type idMapData struct {
 }
 
 var _ dynamicInode = (*idMapData)(nil)
+var _ vfs.WritableDynamicBytesSource = (*idMapData)(nil)
 
 // Generate implements vfs.WritableDynamicBytesSource.Generate.
 func (d *idMapData) Generate(ctx context.Context, buf *bytes.Buffer) error {
@@ -319,7 +330,7 @@ func (d *idMapData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 }
 
 // Write implements vfs.WritableDynamicBytesSource.Write.
-func (d *idMapData) Write(ctx context.Context, src usermem.IOSequence, offset int64) (int64, error) {
+func (d *idMapData) Write(ctx context.Context, _ *vfs.FileDescription, src usermem.IOSequence, offset int64) (int64, error) {
 	// "In addition, the number of bytes written to the file must be less than
 	// the system page size, and the write must be performed at the start of
 	// the file ..." - user_namespaces(7)
@@ -383,6 +394,7 @@ type memInode struct {
 	kernfs.InodeNoopRefCount
 	kernfs.InodeNotDirectory
 	kernfs.InodeNotSymlink
+	kernfs.InodeWatches
 
 	task  *kernel.Task
 	locks vfs.FileLocks
@@ -532,7 +544,7 @@ var _ dynamicInode = (*mapsData)(nil)
 // Generate implements vfs.DynamicBytesSource.Generate.
 func (d *mapsData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	if mm := getMM(d.task); mm != nil {
-		mm.ReadMapsDataInto(ctx, buf)
+		mm.ReadMapsDataInto(ctx, mm.MapsCallbackFuncForBuffer(buf))
 	}
 	return nil
 }
@@ -664,6 +676,7 @@ type statusInode struct {
 	kernfs.InodeNoopRefCount
 	kernfs.InodeNotDirectory
 	kernfs.InodeNotSymlink
+	kernfs.InodeWatches
 
 	task  *kernel.Task
 	pidns *kernel.PIDNamespace
@@ -718,7 +731,7 @@ func (s *statusInode) Open(ctx context.Context, rp *vfs.ResolvingPath, d *kernfs
 	if err := fd.vfsfd.Init(fd, opts.Flags, rp.Mount(), d.VFSDentry(), &vfs.FileDescriptionOptions{}); err != nil {
 		return nil, err
 	}
-	fd.SetDataSource(fd)
+	fd.DynamicBytesFileDescriptionImpl.Init(&fd.vfsfd, fd)
 	return &fd.vfsfd, nil
 }
 
@@ -832,13 +845,13 @@ func (i *ioData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	io := usage.IO{}
 	io.Accumulate(i.IOUsage())
 
-	fmt.Fprintf(buf, "char: %d\n", io.CharsRead)
-	fmt.Fprintf(buf, "wchar: %d\n", io.CharsWritten)
-	fmt.Fprintf(buf, "syscr: %d\n", io.ReadSyscalls)
-	fmt.Fprintf(buf, "syscw: %d\n", io.WriteSyscalls)
-	fmt.Fprintf(buf, "read_bytes: %d\n", io.BytesRead)
-	fmt.Fprintf(buf, "write_bytes: %d\n", io.BytesWritten)
-	fmt.Fprintf(buf, "cancelled_write_bytes: %d\n", io.BytesWriteCancelled)
+	fmt.Fprintf(buf, "char: %d\n", io.CharsRead.RacyLoad())
+	fmt.Fprintf(buf, "wchar: %d\n", io.CharsWritten.RacyLoad())
+	fmt.Fprintf(buf, "syscr: %d\n", io.ReadSyscalls.RacyLoad())
+	fmt.Fprintf(buf, "syscw: %d\n", io.WriteSyscalls.RacyLoad())
+	fmt.Fprintf(buf, "read_bytes: %d\n", io.BytesRead.RacyLoad())
+	fmt.Fprintf(buf, "write_bytes: %d\n", io.BytesWritten.RacyLoad())
+	fmt.Fprintf(buf, "cancelled_write_bytes: %d\n", io.BytesWriteCancelled.RacyLoad())
 	return nil
 }
 
@@ -863,7 +876,7 @@ func (o *oomScoreAdj) Generate(ctx context.Context, buf *bytes.Buffer) error {
 }
 
 // Write implements vfs.WritableDynamicBytesSource.Write.
-func (o *oomScoreAdj) Write(ctx context.Context, src usermem.IOSequence, offset int64) (int64, error) {
+func (o *oomScoreAdj) Write(ctx context.Context, _ *vfs.FileDescription, src usermem.IOSequence, offset int64) (int64, error) {
 	if src.NumBytes() == 0 {
 		return 0, nil
 	}
@@ -895,6 +908,7 @@ type exeSymlink struct {
 	kernfs.InodeAttrs
 	kernfs.InodeNoopRefCount
 	kernfs.InodeSymlink
+	kernfs.InodeWatches
 
 	fs   *filesystem
 	task *kernel.Task
@@ -921,8 +935,7 @@ func (s *exeSymlink) Readlink(ctx context.Context, _ *vfs.Mount) (string, error)
 
 	root := vfs.RootFromContext(ctx)
 	if !root.Ok() {
-		// It could have raced with process deletion.
-		return "", linuxerr.ESRCH
+		panic("procfs Readlink requires context with root value")
 	}
 	defer s.fs.SafeDecRef(ctx, root)
 
@@ -967,6 +980,7 @@ type cwdSymlink struct {
 	kernfs.InodeAttrs
 	kernfs.InodeNoopRefCount
 	kernfs.InodeSymlink
+	kernfs.InodeWatches
 
 	fs   *filesystem
 	task *kernel.Task
@@ -993,8 +1007,7 @@ func (s *cwdSymlink) Readlink(ctx context.Context, _ *vfs.Mount) (string, error)
 
 	root := vfs.RootFromContext(ctx)
 	if !root.Ok() {
-		// It could have raced with process deletion.
-		return "", linuxerr.ESRCH
+		panic("procfs Readlink requires context with root value")
 	}
 	defer s.fs.SafeDecRef(ctx, root)
 
@@ -1018,6 +1031,67 @@ func (s *cwdSymlink) Getlink(ctx context.Context, _ *vfs.Mount) (vfs.VirtualDent
 	}
 	// The reference is transferred to the caller.
 	return cwd, "", nil
+}
+
+// rootSymlink is an symlink for the /proc/[pid]/root file.
+//
+// +stateify savable
+type rootSymlink struct {
+	implStatFS
+	kernfs.InodeAttrs
+	kernfs.InodeNoopRefCount
+	kernfs.InodeSymlink
+	kernfs.InodeWatches
+
+	fs   *filesystem
+	task *kernel.Task
+}
+
+var _ kernfs.Inode = (*rootSymlink)(nil)
+
+func (fs *filesystem) newRootSymlink(ctx context.Context, task *kernel.Task, ino uint64) kernfs.Inode {
+	inode := &rootSymlink{
+		fs:   fs,
+		task: task,
+	}
+	inode.Init(ctx, task.Credentials(), linux.UNNAMED_MAJOR, fs.devMinor, ino, linux.ModeSymlink|0777)
+	return inode
+}
+
+// Readlink implements kernfs.Inode.Readlink.
+func (s *rootSymlink) Readlink(ctx context.Context, _ *vfs.Mount) (string, error) {
+	root, _, err := s.Getlink(ctx, nil)
+	if err != nil {
+		return "", err
+	}
+	defer s.fs.SafeDecRef(ctx, root)
+
+	vfsRoot := vfs.RootFromContext(ctx)
+	if !vfsRoot.Ok() {
+		panic("procfs Readlink requires context with root value")
+	}
+	defer s.fs.SafeDecRef(ctx, vfsRoot)
+
+	vfsObj := root.Mount().Filesystem().VirtualFilesystem()
+	name, _ := vfsObj.PathnameWithDeleted(ctx, vfsRoot, root)
+	return name, nil
+}
+
+// Getlink implements kernfs.Inode.Getlink.
+func (s *rootSymlink) Getlink(ctx context.Context, _ *vfs.Mount) (vfs.VirtualDentry, string, error) {
+	if !kernel.ContextCanTrace(ctx, s.task, false) {
+		return vfs.VirtualDentry{}, "", linuxerr.EACCES
+	}
+	if err := checkTaskState(s.task); err != nil {
+		return vfs.VirtualDentry{}, "", err
+	}
+	root := s.task.FSContext().RootDirectoryVFS2()
+	if !root.Ok() {
+		// It could have raced with process deletion.
+		return vfs.VirtualDentry{}, "", linuxerr.ESRCH
+	}
+	// The reference is transferred to the caller.
+	return root, "", nil
 }
 
 // mountInfoData is used to implement /proc/[pid]/mountinfo.
@@ -1141,6 +1215,7 @@ type namespaceInode struct {
 	kernfs.InodeNoopRefCount
 	kernfs.InodeNotDirectory
 	kernfs.InodeNotSymlink
+	kernfs.InodeWatches
 
 	locks vfs.FileLocks
 }

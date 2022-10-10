@@ -43,6 +43,7 @@ type tasksInode struct {
 	kernfs.InodeDirectoryNoNewChildren
 	kernfs.InodeNotSymlink
 	kernfs.InodeTemporary // This holds no meaning as this inode can't be Looked up and is always valid.
+	kernfs.InodeWatches
 	kernfs.OrderedChildren
 	tasksInodeRefs
 
@@ -65,17 +66,18 @@ var _ kernfs.Inode = (*tasksInode)(nil)
 func (fs *filesystem) newTasksInode(ctx context.Context, k *kernel.Kernel, pidns *kernel.PIDNamespace, fakeCgroupControllers map[string]string) *tasksInode {
 	root := auth.NewRootCredentials(pidns.UserNamespace())
 	contents := map[string]kernfs.Inode{
-		"cmdline":     fs.newInode(ctx, root, 0444, &cmdLineData{}),
-		"cpuinfo":     fs.newInode(ctx, root, 0444, newStaticFileSetStat(cpuInfoData(k))),
-		"filesystems": fs.newInode(ctx, root, 0444, &filesystemsData{}),
-		"loadavg":     fs.newInode(ctx, root, 0444, &loadavgData{}),
-		"sys":         fs.newSysDir(ctx, root, k),
-		"meminfo":     fs.newInode(ctx, root, 0444, &meminfoData{}),
-		"mounts":      kernfs.NewStaticSymlink(ctx, root, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), "self/mounts"),
-		"net":         kernfs.NewStaticSymlink(ctx, root, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), "self/net"),
-		"stat":        fs.newInode(ctx, root, 0444, &statData{}),
-		"uptime":      fs.newInode(ctx, root, 0444, &uptimeData{}),
-		"version":     fs.newInode(ctx, root, 0444, &versionData{}),
+		"cmdline":        fs.newInode(ctx, root, 0444, &cmdLineData{}),
+		"cpuinfo":        fs.newInode(ctx, root, 0444, newStaticFileSetStat(cpuInfoData(k))),
+		"filesystems":    fs.newInode(ctx, root, 0444, &filesystemsData{}),
+		"loadavg":        fs.newInode(ctx, root, 0444, &loadavgData{}),
+		"sys":            fs.newSysDir(ctx, root, k),
+		"meminfo":        fs.newInode(ctx, root, 0444, &meminfoData{}),
+		"mounts":         kernfs.NewStaticSymlink(ctx, root, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), "self/mounts"),
+		"net":            kernfs.NewStaticSymlink(ctx, root, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), "self/net"),
+		"sentry-meminfo": fs.newInode(ctx, root, 0444, &sentryMeminfoData{}),
+		"stat":           fs.newInode(ctx, root, 0444, &statData{}),
+		"uptime":         fs.newInode(ctx, root, 0444, &uptimeData{}),
+		"version":        fs.newInode(ctx, root, 0444, &versionData{}),
 	}
 	// If fakeCgroupControllers are provided, don't create a cgroupfs backed
 	// /proc/cgroup as it will not match the fake controllers.
@@ -257,10 +259,6 @@ func newStaticFileSetStat(data string) *staticFileSetStat {
 
 func cpuInfoData(k *kernel.Kernel) string {
 	features := k.FeatureSet()
-	if features == nil {
-		// Kernel is always initialized with a FeatureSet.
-		panic("cpuinfo read with nil FeatureSet")
-	}
 	var buf bytes.Buffer
 	for i, max := uint(0), k.ApplicationCores(); i < max; i++ {
 		features.WriteCPUInfoTo(i, &buf)
@@ -268,6 +266,6 @@ func cpuInfoData(k *kernel.Kernel) string {
 	return buf.String()
 }
 
-func shmData(v uint64) dynamicInode {
+func ipcData(v uint64) dynamicInode {
 	return newStaticFile(strconv.FormatUint(v, 10))
 }

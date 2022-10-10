@@ -16,10 +16,8 @@ package transport
 
 import (
 	"gvisor.dev/gvisor/pkg/context"
-	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/syserr"
 	"gvisor.dev/gvisor/pkg/tcpip"
-	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
 
@@ -32,7 +30,7 @@ type queue struct {
 	ReaderQueue *waiter.Queue
 	WriterQueue *waiter.Queue
 
-	mu       sync.Mutex `state:"nosave"`
+	mu       queueMutex `state:"nosave"`
 	closed   bool
 	unread   bool
 	used     int64
@@ -59,12 +57,14 @@ func (q *queue) Close() {
 // q.WriterQueue.Notify(waiter.WritableEvents)
 func (q *queue) Reset(ctx context.Context) {
 	q.mu.Lock()
-	for cur := q.dataList.Front(); cur != nil; cur = cur.Next() {
-		cur.Release(ctx)
-	}
+	dataList := q.dataList
 	q.dataList.Reset()
 	q.used = 0
 	q.mu.Unlock()
+
+	for cur := dataList.Front(); cur != nil; cur = cur.Next() {
+		cur.Release(ctx)
+	}
 }
 
 // DecRef implements RefCounter.DecRef.
@@ -166,7 +166,7 @@ func (q *queue) Enqueue(ctx context.Context, data [][]byte, c ControlMessages, f
 	notify = q.dataList.Front() == nil
 	q.used += l
 	q.dataList.PushBack(&message{
-		Data:    buffer.View(v),
+		Data:    v,
 		Control: c,
 		Address: from,
 	})

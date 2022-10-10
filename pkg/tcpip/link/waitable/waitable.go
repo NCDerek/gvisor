@@ -28,6 +28,9 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
 
+var _ stack.NetworkDispatcher = (*Endpoint)(nil)
+var _ stack.LinkEndpoint = (*Endpoint)(nil)
+
 // Endpoint is a waitable link-layer endpoint.
 type Endpoint struct {
 	dispatchGate sync.Gate
@@ -50,12 +53,22 @@ func New(lower stack.LinkEndpoint) *Endpoint {
 // It is called by the link-layer endpoint being wrapped when a packet arrives,
 // and only forwards to the actual dispatcher if Wait or WaitDispatch haven't
 // been called.
-func (e *Endpoint) DeliverNetworkPacket(remote, local tcpip.LinkAddress, protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) {
+func (e *Endpoint) DeliverNetworkPacket(protocol tcpip.NetworkProtocolNumber, pkt stack.PacketBufferPtr) {
 	if !e.dispatchGate.Enter() {
 		return
 	}
 
-	e.dispatcher.DeliverNetworkPacket(remote, local, protocol, pkt)
+	e.dispatcher.DeliverNetworkPacket(protocol, pkt)
+	e.dispatchGate.Leave()
+}
+
+// DeliverLinkPacket implements stack.NetworkDispatcher.
+func (e *Endpoint) DeliverLinkPacket(protocol tcpip.NetworkProtocolNumber, pkt stack.PacketBufferPtr, incoming bool) {
+	if !e.dispatchGate.Enter() {
+		return
+	}
+
+	e.dispatcher.DeliverLinkPacket(protocol, pkt, incoming)
 	e.dispatchGate.Leave()
 }
 
@@ -96,28 +109,15 @@ func (e *Endpoint) LinkAddress() tcpip.LinkAddress {
 	return e.lower.LinkAddress()
 }
 
-// WritePacket implements stack.LinkEndpoint.WritePacket. It is called by
-// higher-level protocols to write packets. It only forwards packets to the
-// lower endpoint if Wait or WaitWrite haven't been called.
-func (e *Endpoint) WritePacket(r stack.RouteInfo, protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) tcpip.Error {
-	if !e.writeGate.Enter() {
-		return nil
-	}
-
-	err := e.lower.WritePacket(r, protocol, pkt)
-	e.writeGate.Leave()
-	return err
-}
-
 // WritePackets implements stack.LinkEndpoint.WritePackets. It is called by
 // higher-level protocols to write packets. It only forwards packets to the
 // lower endpoint if Wait or WaitWrite haven't been called.
-func (e *Endpoint) WritePackets(r stack.RouteInfo, pkts stack.PacketBufferList, protocol tcpip.NetworkProtocolNumber) (int, tcpip.Error) {
+func (e *Endpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) {
 	if !e.writeGate.Enter() {
 		return pkts.Len(), nil
 	}
 
-	n, err := e.lower.WritePackets(r, pkts, protocol)
+	n, err := e.lower.WritePackets(pkts)
 	e.writeGate.Leave()
 	return n, err
 }
@@ -143,9 +143,6 @@ func (e *Endpoint) ARPHardwareType() header.ARPHardwareType {
 }
 
 // AddHeader implements stack.LinkEndpoint.AddHeader.
-func (e *Endpoint) AddHeader(local, remote tcpip.LinkAddress, protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) {
-	e.lower.AddHeader(local, remote, protocol, pkt)
+func (e *Endpoint) AddHeader(pkt stack.PacketBufferPtr) {
+	e.lower.AddHeader(pkt)
 }
-
-// WriteRawPacket implements stack.LinkEndpoint.
-func (*Endpoint) WriteRawPacket(*stack.PacketBuffer) tcpip.Error { return &tcpip.ErrNotSupported{} }

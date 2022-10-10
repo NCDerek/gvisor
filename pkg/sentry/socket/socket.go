@@ -20,10 +20,11 @@ package socket
 import (
 	"bytes"
 	"fmt"
-	"sync/atomic"
+	"time"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/marshal"
@@ -51,8 +52,19 @@ type ControlMessages struct {
 func packetInfoToLinux(packetInfo tcpip.IPPacketInfo) linux.ControlMessageIPPacketInfo {
 	var p linux.ControlMessageIPPacketInfo
 	p.NIC = int32(packetInfo.NIC)
-	copy(p.LocalAddr[:], []byte(packetInfo.LocalAddr))
-	copy(p.DestinationAddr[:], []byte(packetInfo.DestinationAddr))
+	copy(p.LocalAddr[:], packetInfo.LocalAddr)
+	copy(p.DestinationAddr[:], packetInfo.DestinationAddr)
+	return p
+}
+
+// ipv6PacketInfoToLinux converts IPv6PacketInfo from tcpip format to Linux
+// format.
+func ipv6PacketInfoToLinux(packetInfo tcpip.IPv6PacketInfo) linux.ControlMessageIPv6PacketInfo {
+	var p linux.ControlMessageIPv6PacketInfo
+	if n := copy(p.Addr[:], packetInfo.Addr); n != len(p.Addr) {
+		panic(fmt.Sprintf("got copy(%x, %x) = %d, want = %d", p.Addr, packetInfo.Addr, n, len(p.Addr)))
+	}
+	p.NIC = uint32(packetInfo.NIC)
 	return p
 }
 
@@ -107,27 +119,38 @@ func sockErrCmsgToLinux(sockErr *tcpip.SockError) linux.SockErrCMsg {
 	}
 }
 
-// NewIPControlMessages converts the tcpip ControlMessgaes (which does not
-// have Linux specific format) to Linux format.
-func NewIPControlMessages(family int, cmgs tcpip.ControlMessages) IPControlMessages {
+// NewIPControlMessages converts the tcpip.ReceivableControlMessages (which does
+// not have Linux specific format) to Linux format.
+func NewIPControlMessages(family int, cmgs tcpip.ReceivableControlMessages) IPControlMessages {
 	var orgDstAddr linux.SockAddr
 	if cmgs.HasOriginalDstAddress {
 		orgDstAddr, _ = ConvertAddress(family, cmgs.OriginalDstAddress)
 	}
-	return IPControlMessages{
+	cm := IPControlMessages{
 		HasTimestamp:       cmgs.HasTimestamp,
 		Timestamp:          cmgs.Timestamp,
 		HasInq:             cmgs.HasInq,
 		Inq:                cmgs.Inq,
 		HasTOS:             cmgs.HasTOS,
 		TOS:                cmgs.TOS,
+		HasTTL:             cmgs.HasTTL,
+		TTL:                uint32(cmgs.TTL),
+		HasHopLimit:        cmgs.HasHopLimit,
+		HopLimit:           uint32(cmgs.HopLimit),
 		HasTClass:          cmgs.HasTClass,
 		TClass:             cmgs.TClass,
 		HasIPPacketInfo:    cmgs.HasIPPacketInfo,
 		PacketInfo:         packetInfoToLinux(cmgs.PacketInfo),
+		HasIPv6PacketInfo:  cmgs.HasIPv6PacketInfo,
 		OriginalDstAddress: orgDstAddr,
 		SockErr:            sockErrCmsgToLinux(cmgs.SockErr),
 	}
+
+	if cm.HasIPv6PacketInfo {
+		cm.IPv6PacketInfo = ipv6PacketInfoToLinux(cmgs.IPv6PacketInfo)
+	}
+
+	return cm
 }
 
 // IPControlMessages contains socket control messages for IP sockets.
@@ -138,9 +161,9 @@ type IPControlMessages struct {
 	// HasTimestamp indicates whether Timestamp is valid/set.
 	HasTimestamp bool
 
-	// Timestamp is the time (in ns) that the last packet used to create
-	// the read data was received.
-	Timestamp int64
+	// Timestamp is the time that the last packet used to create the read data
+	// was received.
+	Timestamp time.Time `state:".(int64)"`
 
 	// HasInq indicates whether Inq is valid/set.
 	HasInq bool
@@ -154,6 +177,18 @@ type IPControlMessages struct {
 	// TOS is the IPv4 type of service of the associated packet.
 	TOS uint8
 
+	// HasTTL indicates whether TTL is valid/set.
+	HasTTL bool
+
+	// TTL is the IPv4 Time To Live of the associated packet.
+	TTL uint32
+
+	// HasHopLimit indicates whether HopLimit is valid/set.
+	HasHopLimit bool
+
+	// HopLimit is the IPv6 Hop Limit of the associated packet.
+	HopLimit uint32
+
 	// HasTClass indicates whether TClass is valid/set.
 	HasTClass bool
 
@@ -165,6 +200,12 @@ type IPControlMessages struct {
 
 	// PacketInfo holds interface and address data on an incoming packet.
 	PacketInfo linux.ControlMessageIPPacketInfo
+
+	// HasIPv6PacketInfo indicates whether IPv6PacketInfo is set.
+	HasIPv6PacketInfo bool
+
+	// PacketInfo holds interface and address data on an incoming packet.
+	IPv6PacketInfo linux.ControlMessageIPv6PacketInfo
 
 	// OriginalDestinationAddress holds the original destination address
 	// and port of the incoming packet.
@@ -444,121 +485,32 @@ type SendReceiveTimeout struct {
 	// send is length of the send timeout in nanoseconds.
 	//
 	// send must be accessed atomically.
-	send int64
+	send atomicbitops.Int64
 
 	// recv is length of the receive timeout in nanoseconds.
 	//
 	// recv must be accessed atomically.
-	recv int64
+	recv atomicbitops.Int64
 }
 
 // SetRecvTimeout implements Socket.SetRecvTimeout.
 func (to *SendReceiveTimeout) SetRecvTimeout(nanoseconds int64) {
-	atomic.StoreInt64(&to.recv, nanoseconds)
+	to.recv.Store(nanoseconds)
 }
 
 // RecvTimeout implements Socket.RecvTimeout.
 func (to *SendReceiveTimeout) RecvTimeout() int64 {
-	return atomic.LoadInt64(&to.recv)
+	return to.recv.Load()
 }
 
 // SetSendTimeout implements Socket.SetSendTimeout.
 func (to *SendReceiveTimeout) SetSendTimeout(nanoseconds int64) {
-	atomic.StoreInt64(&to.send, nanoseconds)
+	to.send.Store(nanoseconds)
 }
 
 // SendTimeout implements Socket.SendTimeout.
 func (to *SendReceiveTimeout) SendTimeout() int64 {
-	return atomic.LoadInt64(&to.send)
-}
-
-// GetSockOptEmitUnimplementedEvent emits unimplemented event if name is valid.
-// It contains names that are valid for GetSockOpt when level is SOL_SOCKET.
-func GetSockOptEmitUnimplementedEvent(t *kernel.Task, name int) {
-	switch name {
-	case linux.SO_ACCEPTCONN,
-		linux.SO_BPF_EXTENSIONS,
-		linux.SO_COOKIE,
-		linux.SO_DOMAIN,
-		linux.SO_ERROR,
-		linux.SO_GET_FILTER,
-		linux.SO_INCOMING_NAPI_ID,
-		linux.SO_MEMINFO,
-		linux.SO_PEERCRED,
-		linux.SO_PEERGROUPS,
-		linux.SO_PEERNAME,
-		linux.SO_PEERSEC,
-		linux.SO_PROTOCOL,
-		linux.SO_SNDLOWAT,
-		linux.SO_TYPE:
-
-		t.Kernel().EmitUnimplementedEvent(t)
-
-	default:
-		emitUnimplementedEvent(t, name)
-	}
-}
-
-// SetSockOptEmitUnimplementedEvent emits unimplemented event if name is valid.
-// It contains names that are valid for SetSockOpt when level is SOL_SOCKET.
-func SetSockOptEmitUnimplementedEvent(t *kernel.Task, name int) {
-	switch name {
-	case linux.SO_ATTACH_BPF,
-		linux.SO_ATTACH_FILTER,
-		linux.SO_ATTACH_REUSEPORT_CBPF,
-		linux.SO_ATTACH_REUSEPORT_EBPF,
-		linux.SO_CNX_ADVICE,
-		linux.SO_DETACH_FILTER,
-		linux.SO_SNDBUFFORCE:
-
-		t.Kernel().EmitUnimplementedEvent(t)
-
-	default:
-		emitUnimplementedEvent(t, name)
-	}
-}
-
-// emitUnimplementedEvent emits unimplemented event if name is valid. It
-// contains names that are common between Get and SetSocketOpt when level is
-// SOL_SOCKET.
-func emitUnimplementedEvent(t *kernel.Task, name int) {
-	switch name {
-	case linux.SO_BINDTODEVICE,
-		linux.SO_BROADCAST,
-		linux.SO_BSDCOMPAT,
-		linux.SO_BUSY_POLL,
-		linux.SO_DEBUG,
-		linux.SO_DONTROUTE,
-		linux.SO_INCOMING_CPU,
-		linux.SO_KEEPALIVE,
-		linux.SO_LINGER,
-		linux.SO_LOCK_FILTER,
-		linux.SO_MARK,
-		linux.SO_MAX_PACING_RATE,
-		linux.SO_NOFCS,
-		linux.SO_OOBINLINE,
-		linux.SO_PASSCRED,
-		linux.SO_PASSSEC,
-		linux.SO_PEEK_OFF,
-		linux.SO_PRIORITY,
-		linux.SO_RCVBUF,
-		linux.SO_RCVLOWAT,
-		linux.SO_RCVTIMEO,
-		linux.SO_REUSEADDR,
-		linux.SO_REUSEPORT,
-		linux.SO_RXQ_OVFL,
-		linux.SO_SELECT_ERR_QUEUE,
-		linux.SO_SNDBUF,
-		linux.SO_SNDTIMEO,
-		linux.SO_TIMESTAMP,
-		linux.SO_TIMESTAMPING,
-		linux.SO_TIMESTAMPNS,
-		linux.SO_TXTIME,
-		linux.SO_WIFI_STATUS,
-		linux.SO_ZEROCOPY:
-
-		t.Kernel().EmitUnimplementedEvent(t)
-	}
+	return to.send.Load()
 }
 
 // UnmarshalSockAddr unmarshals memory representing a struct sockaddr to one of
@@ -570,19 +522,19 @@ func UnmarshalSockAddr(family int, data []byte) linux.SockAddr {
 	switch family {
 	case unix.AF_INET:
 		var addr linux.SockAddrInet
-		addr.UnmarshalUnsafe(data[:addr.SizeBytes()])
+		addr.UnmarshalUnsafe(data)
 		return &addr
 	case unix.AF_INET6:
 		var addr linux.SockAddrInet6
-		addr.UnmarshalUnsafe(data[:addr.SizeBytes()])
+		addr.UnmarshalUnsafe(data)
 		return &addr
 	case unix.AF_UNIX:
 		var addr linux.SockAddrUnix
-		addr.UnmarshalUnsafe(data[:addr.SizeBytes()])
+		addr.UnmarshalUnsafe(data)
 		return &addr
 	case unix.AF_NETLINK:
 		var addr linux.SockAddrNetlink
-		addr.UnmarshalUnsafe(data[:addr.SizeBytes()])
+		addr.UnmarshalUnsafe(data)
 		return &addr
 	default:
 		panic(fmt.Sprintf("Unsupported socket family %v", family))
@@ -713,7 +665,7 @@ func AddressAndFamily(addr []byte) (tcpip.FullAddress, uint16, *syserr.Error) {
 		if len(addr) < sockAddrInetSize {
 			return tcpip.FullAddress{}, family, syserr.ErrInvalidArgument
 		}
-		a.UnmarshalUnsafe(addr[:sockAddrInetSize])
+		a.UnmarshalUnsafe(addr)
 
 		out := tcpip.FullAddress{
 			Addr: BytesToIPAddress(a.Addr[:]),
@@ -726,7 +678,7 @@ func AddressAndFamily(addr []byte) (tcpip.FullAddress, uint16, *syserr.Error) {
 		if len(addr) < sockAddrInet6Size {
 			return tcpip.FullAddress{}, family, syserr.ErrInvalidArgument
 		}
-		a.UnmarshalUnsafe(addr[:sockAddrInet6Size])
+		a.UnmarshalUnsafe(addr)
 
 		out := tcpip.FullAddress{
 			Addr: BytesToIPAddress(a.Addr[:]),
@@ -742,7 +694,7 @@ func AddressAndFamily(addr []byte) (tcpip.FullAddress, uint16, *syserr.Error) {
 		if len(addr) < sockAddrLinkSize {
 			return tcpip.FullAddress{}, family, syserr.ErrInvalidArgument
 		}
-		a.UnmarshalUnsafe(addr[:sockAddrLinkSize])
+		a.UnmarshalUnsafe(addr)
 		// TODO(https://gvisor.dev/issue/6530): Do not assume all interfaces have
 		// an ethernet address.
 		if a.Family != linux.AF_PACKET || a.HardwareAddrLen != header.EthernetAddressSize {

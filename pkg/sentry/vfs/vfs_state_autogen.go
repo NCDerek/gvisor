@@ -63,6 +63,7 @@ func (d *anonDentry) StateFields() []string {
 	return []string{
 		"vfsd",
 		"name",
+		"watches",
 	}
 }
 
@@ -73,6 +74,7 @@ func (d *anonDentry) StateSave(stateSinkObject state.Sink) {
 	d.beforeSave()
 	stateSinkObject.Save(0, &d.vfsd)
 	stateSinkObject.Save(1, &d.name)
+	stateSinkObject.Save(2, &d.watches)
 }
 
 func (d *anonDentry) afterLoad() {}
@@ -81,6 +83,7 @@ func (d *anonDentry) afterLoad() {}
 func (d *anonDentry) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &d.vfsd)
 	stateSourceObject.Load(1, &d.name)
+	stateSourceObject.Load(2, &d.watches)
 }
 
 func (d *Dentry) StateTypeName() string {
@@ -90,6 +93,7 @@ func (d *Dentry) StateTypeName() string {
 func (d *Dentry) StateFields() []string {
 	return []string{
 		"dead",
+		"evictable",
 		"mounts",
 		"impl",
 	}
@@ -101,8 +105,9 @@ func (d *Dentry) beforeSave() {}
 func (d *Dentry) StateSave(stateSinkObject state.Sink) {
 	d.beforeSave()
 	stateSinkObject.Save(0, &d.dead)
-	stateSinkObject.Save(1, &d.mounts)
-	stateSinkObject.Save(2, &d.impl)
+	stateSinkObject.Save(1, &d.evictable)
+	stateSinkObject.Save(2, &d.mounts)
+	stateSinkObject.Save(3, &d.impl)
 }
 
 func (d *Dentry) afterLoad() {}
@@ -110,8 +115,9 @@ func (d *Dentry) afterLoad() {}
 // +checklocksignore
 func (d *Dentry) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &d.dead)
-	stateSourceObject.Load(1, &d.mounts)
-	stateSourceObject.Load(2, &d.impl)
+	stateSourceObject.Load(1, &d.evictable)
+	stateSourceObject.Load(2, &d.mounts)
+	stateSourceObject.Load(3, &d.impl)
 }
 
 func (kind *DeviceKind) StateTypeName() string {
@@ -219,6 +225,7 @@ func (ep *EpollInstance) StateFields() []string {
 		"q",
 		"interest",
 		"ready",
+		"readySeq",
 	}
 }
 
@@ -234,6 +241,7 @@ func (ep *EpollInstance) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(4, &ep.q)
 	stateSinkObject.Save(5, &ep.interest)
 	stateSinkObject.Save(6, &ep.ready)
+	stateSinkObject.Save(7, &ep.readySeq)
 }
 
 func (ep *EpollInstance) afterLoad() {}
@@ -247,6 +255,7 @@ func (ep *EpollInstance) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(4, &ep.q)
 	stateSourceObject.Load(5, &ep.interest)
 	stateSourceObject.Load(6, &ep.ready)
+	stateSourceObject.Load(7, &ep.readySeq)
 }
 
 func (e *epollInterestKey) StateTypeName() string {
@@ -289,6 +298,7 @@ func (epi *epollInterest) StateFields() []string {
 		"mask",
 		"ready",
 		"epollInterestEntry",
+		"readySeq",
 		"userData",
 	}
 }
@@ -304,7 +314,8 @@ func (epi *epollInterest) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(3, &epi.mask)
 	stateSinkObject.Save(4, &epi.ready)
 	stateSinkObject.Save(5, &epi.epollInterestEntry)
-	stateSinkObject.Save(6, &epi.userData)
+	stateSinkObject.Save(6, &epi.readySeq)
+	stateSinkObject.Save(7, &epi.userData)
 }
 
 // +checklocksignore
@@ -315,7 +326,8 @@ func (epi *epollInterest) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(3, &epi.mask)
 	stateSourceObject.Load(4, &epi.ready)
 	stateSourceObject.Load(5, &epi.epollInterestEntry)
-	stateSourceObject.Load(6, &epi.userData)
+	stateSourceObject.Load(6, &epi.readySeq)
+	stateSourceObject.Load(7, &epi.userData)
 	stateSourceObject.AfterLoad(epi.afterLoad)
 }
 
@@ -450,6 +462,8 @@ func (fd *FileDescription) StateFields() []string {
 	}
 }
 
+func (fd *FileDescription) beforeSave() {}
+
 // +checklocksignore
 func (fd *FileDescription) StateSave(stateSinkObject state.Sink) {
 	fd.beforeSave()
@@ -465,6 +479,8 @@ func (fd *FileDescription) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(9, &fd.impl)
 }
 
+func (fd *FileDescription) afterLoad() {}
+
 // +checklocksignore
 func (fd *FileDescription) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &fd.FileDescriptionRefs)
@@ -477,7 +493,6 @@ func (fd *FileDescription) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(7, &fd.writable)
 	stateSourceObject.Load(8, &fd.usedLockBSD)
 	stateSourceObject.Load(9, &fd.impl)
-	stateSourceObject.AfterLoad(fd.afterLoad)
 }
 
 func (f *FileDescriptionOptions) StateTypeName() string {
@@ -490,6 +505,7 @@ func (f *FileDescriptionOptions) StateFields() []string {
 		"DenyPRead",
 		"DenyPWrite",
 		"UseDentryMetadata",
+		"DenySpliceIn",
 	}
 }
 
@@ -502,6 +518,7 @@ func (f *FileDescriptionOptions) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(1, &f.DenyPRead)
 	stateSinkObject.Save(2, &f.DenyPWrite)
 	stateSinkObject.Save(3, &f.UseDentryMetadata)
+	stateSinkObject.Save(4, &f.DenySpliceIn)
 }
 
 func (f *FileDescriptionOptions) afterLoad() {}
@@ -512,6 +529,7 @@ func (f *FileDescriptionOptions) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(1, &f.DenyPRead)
 	stateSourceObject.Load(2, &f.DenyPWrite)
 	stateSourceObject.Load(3, &f.UseDentryMetadata)
+	stateSourceObject.Load(4, &f.DenySpliceIn)
 }
 
 func (d *Dirent) StateTypeName() string {
@@ -642,6 +660,7 @@ func (fd *DynamicBytesFileDescriptionImpl) StateTypeName() string {
 
 func (fd *DynamicBytesFileDescriptionImpl) StateFields() []string {
 	return []string{
+		"vfsfd",
 		"data",
 		"buf",
 		"off",
@@ -656,20 +675,22 @@ func (fd *DynamicBytesFileDescriptionImpl) StateSave(stateSinkObject state.Sink)
 	fd.beforeSave()
 	var bufValue []byte
 	bufValue = fd.saveBuf()
-	stateSinkObject.SaveValue(1, bufValue)
-	stateSinkObject.Save(0, &fd.data)
-	stateSinkObject.Save(2, &fd.off)
-	stateSinkObject.Save(3, &fd.lastRead)
+	stateSinkObject.SaveValue(2, bufValue)
+	stateSinkObject.Save(0, &fd.vfsfd)
+	stateSinkObject.Save(1, &fd.data)
+	stateSinkObject.Save(3, &fd.off)
+	stateSinkObject.Save(4, &fd.lastRead)
 }
 
 func (fd *DynamicBytesFileDescriptionImpl) afterLoad() {}
 
 // +checklocksignore
 func (fd *DynamicBytesFileDescriptionImpl) StateLoad(stateSourceObject state.Source) {
-	stateSourceObject.Load(0, &fd.data)
-	stateSourceObject.Load(2, &fd.off)
-	stateSourceObject.Load(3, &fd.lastRead)
-	stateSourceObject.LoadValue(1, new([]byte), func(y interface{}) { fd.loadBuf(y.([]byte)) })
+	stateSourceObject.Load(0, &fd.vfsfd)
+	stateSourceObject.Load(1, &fd.data)
+	stateSourceObject.Load(3, &fd.off)
+	stateSourceObject.Load(4, &fd.lastRead)
+	stateSourceObject.LoadValue(2, new([]byte), func(y interface{}) { fd.loadBuf(y.([]byte)) })
 }
 
 func (fd *LockFD) StateTypeName() string {

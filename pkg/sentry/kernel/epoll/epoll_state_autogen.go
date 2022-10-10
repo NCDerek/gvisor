@@ -43,9 +43,11 @@ func (p *pollEntry) StateFields() []string {
 		"pollEntryEntry",
 		"id",
 		"userData",
+		"waiter",
 		"mask",
 		"flags",
 		"epoll",
+		"readySeq",
 	}
 }
 
@@ -57,9 +59,11 @@ func (p *pollEntry) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(0, &p.pollEntryEntry)
 	stateSinkObject.Save(1, &p.id)
 	stateSinkObject.Save(2, &p.userData)
-	stateSinkObject.Save(3, &p.mask)
-	stateSinkObject.Save(4, &p.flags)
-	stateSinkObject.Save(5, &p.epoll)
+	stateSinkObject.Save(3, &p.waiter)
+	stateSinkObject.Save(4, &p.mask)
+	stateSinkObject.Save(5, &p.flags)
+	stateSinkObject.Save(6, &p.epoll)
+	stateSinkObject.Save(7, &p.readySeq)
 }
 
 // +checklocksignore
@@ -67,9 +71,11 @@ func (p *pollEntry) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &p.pollEntryEntry)
 	stateSourceObject.LoadWait(1, &p.id)
 	stateSourceObject.Load(2, &p.userData)
-	stateSourceObject.Load(3, &p.mask)
-	stateSourceObject.Load(4, &p.flags)
-	stateSourceObject.Load(5, &p.epoll)
+	stateSourceObject.Load(3, &p.waiter)
+	stateSourceObject.Load(4, &p.mask)
+	stateSourceObject.Load(5, &p.flags)
+	stateSourceObject.Load(6, &p.epoll)
+	stateSourceObject.Load(7, &p.readySeq)
 	stateSourceObject.AfterLoad(p.afterLoad)
 }
 
@@ -79,10 +85,12 @@ func (e *EventPoll) StateTypeName() string {
 
 func (e *EventPoll) StateFields() []string {
 	return []string{
+		"Queue",
 		"files",
 		"readyList",
 		"waitingList",
 		"disabledList",
+		"readySeq",
 	}
 }
 
@@ -109,21 +117,22 @@ func (e *EventPoll) StateSave(stateSinkObject state.Sink) {
 	if !state.IsZeroValue(&e.FileNoMMap) {
 		state.Failf("FileNoMMap is %#v, expected zero", &e.FileNoMMap)
 	}
-	if !state.IsZeroValue(&e.Queue) {
-		state.Failf("Queue is %#v, expected zero", &e.Queue)
-	}
-	stateSinkObject.Save(0, &e.files)
-	stateSinkObject.Save(1, &e.readyList)
-	stateSinkObject.Save(2, &e.waitingList)
-	stateSinkObject.Save(3, &e.disabledList)
+	stateSinkObject.Save(0, &e.Queue)
+	stateSinkObject.Save(1, &e.files)
+	stateSinkObject.Save(2, &e.readyList)
+	stateSinkObject.Save(3, &e.waitingList)
+	stateSinkObject.Save(4, &e.disabledList)
+	stateSinkObject.Save(5, &e.readySeq)
 }
 
 // +checklocksignore
 func (e *EventPoll) StateLoad(stateSourceObject state.Source) {
-	stateSourceObject.Load(0, &e.files)
-	stateSourceObject.Load(1, &e.readyList)
-	stateSourceObject.Load(2, &e.waitingList)
-	stateSourceObject.Load(3, &e.disabledList)
+	stateSourceObject.Load(0, &e.Queue)
+	stateSourceObject.Load(1, &e.files)
+	stateSourceObject.Load(2, &e.readyList)
+	stateSourceObject.Load(3, &e.waitingList)
+	stateSourceObject.Load(4, &e.disabledList)
+	stateSourceObject.Load(5, &e.readySeq)
 	stateSourceObject.AfterLoad(e.afterLoad)
 }
 

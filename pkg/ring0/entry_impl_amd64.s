@@ -1,73 +1,3 @@
-// build +amd64
-
-// Automatically generated, do not edit.
-
-// CPU offsets.
-#define CPU_REGISTERS        0x28
-#define CPU_ERROR_CODE       0x10
-#define CPU_ERROR_TYPE       0x18
-#define CPU_ENTRY            0x20
-
-// CPU entry offsets.
-#define ENTRY_SCRATCH0       0x100
-#define ENTRY_STACK_TOP      0x108
-#define ENTRY_CPU_SELF       0x110
-#define ENTRY_KERNEL_CR3     0x118
-
-// Bits.
-#define _RFLAGS_IF           0x200
-#define _RFLAGS_IOPL0         0x1000
-#define _KERNEL_FLAGS        0x02
-
-// Vectors.
-#define DivideByZero               0x00
-#define Debug                      0x01
-#define NMI                        0x02
-#define Breakpoint                 0x03
-#define Overflow                   0x04
-#define BoundRangeExceeded         0x05
-#define InvalidOpcode              0x06
-#define DeviceNotAvailable         0x07
-#define DoubleFault                0x08
-#define CoprocessorSegmentOverrun  0x09
-#define InvalidTSS                 0x0a
-#define SegmentNotPresent          0x0b
-#define StackSegmentFault          0x0c
-#define GeneralProtectionFault     0x0d
-#define PageFault                  0x0e
-#define X87FloatingPointException  0x10
-#define AlignmentCheck             0x11
-#define MachineCheck               0x12
-#define SIMDFloatingPointException 0x13
-#define VirtualizationException    0x14
-#define SecurityException          0x1e
-#define SyscallInt80               0x80
-#define Syscall                    0x100
-
-// Ptrace registers.
-#define PTRACE_R15      0x00
-#define PTRACE_R14      0x08
-#define PTRACE_R13      0x10
-#define PTRACE_R12      0x18
-#define PTRACE_RBP      0x20
-#define PTRACE_RBX      0x28
-#define PTRACE_R11      0x30
-#define PTRACE_R10      0x38
-#define PTRACE_R9       0x40
-#define PTRACE_R8       0x48
-#define PTRACE_RAX      0x50
-#define PTRACE_RCX      0x58
-#define PTRACE_RDX      0x60
-#define PTRACE_RSI      0x68
-#define PTRACE_RDI      0x70
-#define PTRACE_ORIGRAX  0x78
-#define PTRACE_RIP      0x80
-#define PTRACE_CS       0x88
-#define PTRACE_FLAGS    0x90
-#define PTRACE_RSP      0x98
-#define PTRACE_SS       0xa0
-#define PTRACE_FS_BASE  0xa8
-#define PTRACE_GS_BASE  0xb0
 // Copyright 2018 The gVisor Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -85,9 +15,79 @@
 #include "funcdata.h"
 #include "textflag.h"
 
-// NB: Offsets are programmatically generated (see BUILD).
-//
-// This file is concatenated with the definitions.
+// CPU offsets.
+#define CPU_REGISTERS    64
+#define CPU_FPU_STATE    280
+#define CPU_ERROR_CODE   (16+0)
+#define CPU_ERROR_TYPE   (16+8)
+#define CPU_VECTOR       (16+16)
+#define CPU_FAULT_ADDR   (16+24)
+#define CPU_ENTRY        (16+32)
+#define CPU_HAS_XSAVE    (16+40)
+#define CPU_HAS_XSAVEOPT (16+41)
+
+
+#define ENTRY_SCRATCH0   256
+#define ENTRY_STACK_TOP  264
+#define ENTRY_CPU_SELF   272
+#define ENTRY_KERNEL_CR3 280
+
+
+// Bits.
+#define _RFLAGS_IF    512
+#define _RFLAGS_IOPL0 4096
+#define _KERNEL_FLAGS 2
+
+// Vectors.
+#define DivideByZero               0
+#define Debug                      1
+#define NMI                        2
+#define Breakpoint                 3
+#define Overflow                   4
+#define BoundRangeExceeded         5
+#define InvalidOpcode              6
+#define DeviceNotAvailable         7
+#define DoubleFault                8
+#define CoprocessorSegmentOverrun  9
+#define InvalidTSS                 10
+#define SegmentNotPresent          11
+#define StackSegmentFault          12
+#define GeneralProtectionFault     13
+#define PageFault                  14
+#define X87FloatingPointException  16
+#define AlignmentCheck             17
+#define MachineCheck               18
+#define SIMDFloatingPointException 19
+#define VirtualizationException    20
+#define SecurityException          30
+#define SyscallInt80               128
+#define Syscall                    256
+
+
+#define PTRACE_R15      0
+#define PTRACE_R14      8
+#define PTRACE_R13      16
+#define PTRACE_R12      24
+#define PTRACE_RBP      32
+#define PTRACE_RBX      40
+#define PTRACE_R11      48
+#define PTRACE_R10      56
+#define PTRACE_R9       64
+#define PTRACE_R8       72
+#define PTRACE_RAX      80
+#define PTRACE_RCX      88
+#define PTRACE_RDX      96
+#define PTRACE_RSI      104
+#define PTRACE_RDI      112
+#define PTRACE_ORIGRAX  120
+#define PTRACE_RIP      128
+#define PTRACE_CS       136
+#define PTRACE_FLAGS    144
+#define PTRACE_RSP      152
+#define PTRACE_SS       160
+#define PTRACE_FS_BASE  168
+#define PTRACE_GS_BASE  176
+
 
 // Saves a register set.
 //
@@ -212,8 +212,103 @@ TEXT ·jumpToUser(SB),NOSPLIT,$0
 	MOVQ AX, 0(SP)
 	RET
 
+// See kernel_amd64.go.
+//
+// The 16-byte frame size is for the saved values of MXCSR and the x87 control
+// word.
+TEXT ·doSwitchToUser(SB),NOSPLIT,$16-48
+	// We are passed pointers to heap objects, but do not store them in our
+	// local frame.
+	NO_LOCAL_POINTERS
+
+	// MXCSR and the x87 control word are the only floating point state
+	// that is callee-save and thus we must save.
+	STMXCSR mxcsr-0(SP)
+	FSTCW cw-8(SP)
+
+	// Restore application floating point state.
+	MOVQ cpu+0(FP), SI
+	MOVQ fpState+16(FP), DI
+	MOVB ·hasXSAVE(SB), BX
+	TESTB BX, BX
+	JZ no_xrstor
+	// Use xrstor to restore all available fp state. For now, we restore
+	// everything unconditionally by setting the implicit operand edx:eax
+	// (the "requested feature bitmap") to all 1's.
+	MOVL $0xffffffff, AX
+	MOVL $0xffffffff, DX
+	BYTE $0x48; BYTE $0x0f; BYTE $0xae; BYTE $0x2f // XRSTOR64 0(DI)
+	JMP fprestore_done
+no_xrstor:
+	// Fall back to fxrstor if xsave is not available.
+	FXRSTOR64 0(DI)
+fprestore_done:
+
+	// Set application GS.
+	MOVQ regs+8(FP), R8
+	SWAP_GS()
+	MOVQ PTRACE_GS_BASE(R8), AX
+	PUSHQ AX
+	CALL ·writeGS(SB)
+	POPQ AX
+
+	// Call sysret() or iret().
+	MOVQ userCR3+24(FP), CX
+	MOVQ needIRET+32(FP), R9
+	ADDQ $-32, SP
+	MOVQ SI, 0(SP)  // cpu
+	MOVQ R8, 8(SP)  // regs
+	MOVQ CX, 16(SP) // userCR3
+	TESTQ R9, R9
+	JNZ do_iret
+	CALL ·sysret(SB)
+	JMP done_sysret_or_iret
+do_iret:
+	CALL ·iret(SB)
+done_sysret_or_iret:
+	MOVQ 24(SP), AX // vector
+	ADDQ $32, SP
+	MOVQ AX, vector+40(FP)
+
+	// Save application floating point state.
+	MOVQ fpState+16(FP), DI
+	MOVB ·hasXSAVE(SB), BX
+	MOVB ·hasXSAVEOPT(SB), CX
+	TESTB BX, BX
+	JZ no_xsave
+	// Use xsave/xsaveopt to save all extended state.
+	// We save everything unconditionally by setting RFBM to all 1's.
+	MOVL $0xffffffff, AX
+	MOVL $0xffffffff, DX
+	TESTB CX, CX
+	JZ no_xsaveopt
+	BYTE $0x48; BYTE $0x0f; BYTE $0xae; BYTE $0x37; // XSAVEOPT64 0(DI)
+	JMP fpsave_done
+no_xsaveopt:
+	BYTE $0x48; BYTE $0x0f; BYTE $0xae; BYTE $0x27; // XSAVE64 0(DI)
+	JMP fpsave_done
+no_xsave:
+	FXSAVE64 0(DI)
+fpsave_done:
+
+	// Restore MXCSR and the x87 control word after one of the two floating
+	// point save cases above, to ensure the application versions are saved
+	// before being clobbered here.
+	LDMXCSR mxcsr-0(SP)
+
+	// FLDCW is a "waiting" x87 instruction, meaning it checks for pending
+	// unmasked exceptions before executing. Thus if userspace has unmasked
+	// an exception and has one pending, it can be raised by FLDCW even
+	// though the new control word will mask exceptions. To prevent this,
+	// we must first clear pending exceptions (which will be restored by
+	// XRSTOR, et al).
+	BYTE $0xDB; BYTE $0xE2; // FNCLEX
+	FLDCW cw-8(SP)
+
+	RET
+
 // See entry_amd64.go.
-TEXT ·sysret(SB),NOSPLIT,$0-24
+TEXT ·sysret(SB),NOSPLIT,$0-32
 	// Set application FS. We can't do this in Go because Go code needs FS.
 	MOVQ regs+8(FP), AX
 	MOVQ PTRACE_FS_BASE(AX), AX
@@ -252,9 +347,11 @@ TEXT ·sysret(SB),NOSPLIT,$0-24
 	POPQ AX                             // Restore AX.
 	POPQ SP                             // Restore SP.
 	SYSRET64()
+	// sysenter or exception will write our return value and return to our
+	// caller.
 
 // See entry_amd64.go.
-TEXT ·iret(SB),NOSPLIT,$0-24
+TEXT ·iret(SB),NOSPLIT,$0-32
 	// Set application FS. We can't do this in Go because Go code needs FS.
 	MOVQ regs+8(FP), AX
 	MOVQ PTRACE_FS_BASE(AX), AX
@@ -290,6 +387,8 @@ TEXT ·iret(SB),NOSPLIT,$0-24
 	WRITE_CR3()                         // Switch to userCR3.
 	POPQ AX                             // Restore AX.
 	IRET()
+	// sysenter or exception will write our return value and return to our
+	// caller.
 
 // See entry_amd64.go.
 TEXT ·resume(SB),NOSPLIT,$0
@@ -309,22 +408,20 @@ TEXT ·start(SB),NOSPLIT,$0
 	// N.B. This is the vCPU entrypoint. It is not called from Go code and
 	// thus pushes and pops values on the stack until calling into Go
 	// (startGo) because we aren't usually a typical Go assembly frame.
-
-	PUSHQ $0x0            // Previous frame pointer.
-	MOVQ SP, BP           // Set frame pointer.
-
-	PUSHQ AX              // Save CPU.
+	PUSHQ $0x0  // Previous frame pointer.
+	MOVQ SP, BP // Set frame pointer.
+	PUSHQ AX    // Save CPU.
 
 	// Set up environment required by Go before calling startGo: Go needs
 	// FS_BASE and floating point initialized.
 	MOVQ CPU_REGISTERS+PTRACE_FS_BASE(AX), BX
-	PUSHQ BX              // First argument (FS_BASE)
+	PUSHQ BX          // First argument (FS_BASE)
 	CALL ·writeFS(SB)
 	POPQ BX
 
 	// First argument (CPU) already at bottom of stack.
-	CALL ·startGo(SB)     // Call Go hook.
-	JMP ·resume(SB)       // Restore to registers.
+	CALL ·startGo(SB) // Call Go hook.
+	JMP ·resume(SB)   // Restore to registers.
 
 ADDR_OF_FUNC(·AddrOfStart(SB), ·start(SB));
 
@@ -393,12 +490,41 @@ kernel:
 	MOVQ BX,  CPU_REGISTERS+PTRACE_RAX(AX)
 	MOVQ $0,  CPU_ERROR_CODE(AX)                // Clear error code.
 	MOVQ $0,  CPU_ERROR_TYPE(AX)                // Set error type to kernel.
+	MOVQ $0xffffffffffffffff,  CPU_VECTOR(AX)                // Set error type to kernel.
+
+	// Save floating point state. CPU.floatingPointState is a slice, so the
+	// first word of CPU.floatingPointState is a pointer to the destination
+	// array.
+	MOVQ CPU_FPU_STATE(AX), DI
+	MOVB CPU_HAS_XSAVE(AX), BX
+	MOVB CPU_HAS_XSAVEOPT(AX), CX
+	TESTB BX, BX
+	JZ no_xsave
+	// Use xsave/xsaveopt to save all extended state.
+	// We save everything unconditionally by setting RFBM to all 1's.
+	MOVL $0xffffffff, AX
+	MOVL $0xffffffff, DX
+	TESTB CX, CX
+	JZ no_xsaveopt
+	BYTE $0x48; BYTE $0x0f; BYTE $0xae; BYTE $0x37; // XSAVEOPT64 0(DI)
+	JMP fpsave_done
+no_xsaveopt:
+	BYTE $0x48; BYTE $0x0f; BYTE $0xae; BYTE $0x27; // XSAVE64 0(DI)
+	JMP fpsave_done
+no_xsave:
+	FXSAVE64 0(DI)
+fpsave_done:
 
 	// Call the syscall trampoline.
 	LOAD_KERNEL_STACK(GS)
-	PUSHQ AX                // First argument (vCPU).
-	CALL ·kernelSyscall(SB) // Call the trampoline.
-	POPQ AX                 // Pop vCPU.
+	MOVQ ENTRY_CPU_SELF(GS), AX // AX contains the vCPU.
+	PUSHQ AX                    // First argument (vCPU).
+	CALL ·kernelSyscall(SB)     // Call the trampoline.
+	POPQ AX                     // Pop vCPU.
+
+	// We only trigger a bluepill entry in the bluepill function, and can
+	// therefore be guaranteed that there is no floating point state to be
+	// loaded on resuming from halt.
 	JMP ·resume(SB)
 
 ADDR_OF_FUNC(·addrOfSysenter(SB), ·sysenter(SB));
@@ -485,16 +611,48 @@ kernel:
 	// Set the error code and adjust the stack.
 	MOVQ 8(SP), BX              // Load the error code.
 	MOVQ BX, CPU_ERROR_CODE(AX) // Copy out to the CPU.
+	MOVQ 0(SP), BX              // Load the error code.
+	MOVQ BX, CPU_VECTOR(AX) // Copy out to the CPU.
+	BYTE $0x0f; BYTE $0x20; BYTE $0xd3; // MOV CR2, RBX
+	MOVQ BX, CPU_FAULT_ADDR(AX)
 	MOVQ $0, CPU_ERROR_TYPE(AX) // Set error type to kernel.
-	MOVQ 0(SP), BX              // BX contains the vector.
+
+	// Save floating point state. CPU.floatingPointState is a slice, so the
+	// first word of CPU.floatingPointState is a pointer to the destination
+	// array.
+	MOVQ CPU_FPU_STATE(AX), DI
+	MOVB CPU_HAS_XSAVE(AX), BX
+	MOVB CPU_HAS_XSAVEOPT(AX), CX
+	TESTB BX, BX
+	JZ no_xsave
+	// Use xsave/xsaveopt to save all extended state.
+	// We save everything unconditionally by setting RFBM to all 1's.
+	MOVL $0xffffffff, AX
+	MOVL $0xffffffff, DX
+	TESTB CX, CX
+	JZ no_xsaveopt
+	BYTE $0x48; BYTE $0x0f; BYTE $0xae; BYTE $0x37; // XSAVEOPT64 0(DI)
+	JMP fpsave_done
+no_xsaveopt:
+	BYTE $0x48; BYTE $0x0f; BYTE $0xae; BYTE $0x27; // XSAVE64 0(DI)
+	JMP fpsave_done
+no_xsave:
+	FXSAVE64 0(DI)
+fpsave_done:
 
 	// Call the exception trampoline.
+	MOVQ 0(SP), BX              // BX contains the vector.
 	LOAD_KERNEL_STACK(GS)
-	PUSHQ BX                  // Second argument (vector).
-	PUSHQ AX                  // First argument (vCPU).
-	CALL ·kernelException(SB) // Call the trampoline.
-	POPQ BX                   // Pop vector.
-	POPQ AX                   // Pop vCPU.
+	MOVQ ENTRY_CPU_SELF(GS), AX // AX contains the vCPU.
+	PUSHQ BX                    // Second argument (vector).
+	PUSHQ AX                    // First argument (vCPU).
+	CALL ·kernelException(SB)   // Call the trampoline.
+	POPQ BX                     // Pop vector.
+	POPQ AX                     // Pop vCPU.
+
+	// We only trigger a bluepill entry in the bluepill function, and can
+	// therefore be guaranteed that there is no floating point state to be
+	// loaded on resuming from halt.
 	JMP ·resume(SB)
 
 #define EXCEPTION_WITH_ERROR(value, symbol, addr) \

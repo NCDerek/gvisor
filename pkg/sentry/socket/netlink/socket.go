@@ -138,7 +138,7 @@ func NewSocket(t *kernel.Task, skType linux.SockType, protocol Protocol) (*Socke
 
 	// Bind the endpoint for good measure so we can connect to it. The
 	// bound address will never be exposed.
-	if err := ep.Bind(tcpip.FullAddress{Addr: "dummy"}, nil); err != nil {
+	if err := ep.Bind(tcpip.FullAddress{Addr: "dummy"}); err != nil {
 		ep.Close(t)
 		return nil, err
 	}
@@ -187,8 +187,8 @@ func (s *socketOpsCommon) Readiness(mask waiter.EventMask) waiter.EventMask {
 }
 
 // EventRegister implements waiter.Waitable.EventRegister.
-func (s *socketOpsCommon) EventRegister(e *waiter.Entry, mask waiter.EventMask) {
-	s.ep.EventRegister(e, mask)
+func (s *socketOpsCommon) EventRegister(e *waiter.Entry) error {
+	return s.ep.EventRegister(e)
 	// Writable readiness never changes, so no registration is needed.
 }
 
@@ -223,7 +223,7 @@ func ExtractSockAddr(b []byte) (*linux.SockAddrNetlink, *syserr.Error) {
 	}
 
 	var sa linux.SockAddrNetlink
-	sa.UnmarshalUnsafe(b[:sa.SizeBytes()])
+	sa.UnmarshalUnsafe(b)
 
 	if sa.Family != linux.AF_NETLINK {
 		return nil, syserr.ErrInvalidArgument
@@ -356,11 +356,7 @@ func (s *socketOpsCommon) GetSockOpt(t *kernel.Task, level int, name int, outPtr
 				passcred = 1
 			}
 			return &passcred, nil
-
-		default:
-			socket.GetSockOptEmitUnimplementedEvent(t, name)
 		}
-
 	case linux.SOL_NETLINK:
 		switch name {
 		case linux.NETLINK_BROADCAST_ERROR,
@@ -370,8 +366,7 @@ func (s *socketOpsCommon) GetSockOpt(t *kernel.Task, level int, name int, outPtr
 			linux.NETLINK_LIST_MEMBERSHIPS,
 			linux.NETLINK_NO_ENOBUFS,
 			linux.NETLINK_PKTINFO:
-
-			t.Kernel().EmitUnimplementedEvent(t)
+			// Not supported.
 		}
 	}
 	// TODO(b/68878065): other sockopts are not supported.
@@ -422,7 +417,6 @@ func (s *socketOpsCommon) SetSockOpt(t *kernel.Task, level int, name int, opt []
 			// advertise support. Otherwise, be conservative and
 			// return an error.
 			if s.protocol.CanSend() {
-				socket.SetSockOptEmitUnimplementedEvent(t, name)
 				return syserr.ErrProtocolNotAvailable
 			}
 
@@ -434,7 +428,6 @@ func (s *socketOpsCommon) SetSockOpt(t *kernel.Task, level int, name int, opt []
 		case linux.SO_DETACH_FILTER:
 			// TODO(gvisor.dev/issue/1119): See above.
 			if s.protocol.CanSend() {
-				socket.SetSockOptEmitUnimplementedEvent(t, name)
 				return syserr.ErrProtocolNotAvailable
 			}
 
@@ -448,11 +441,7 @@ func (s *socketOpsCommon) SetSockOpt(t *kernel.Task, level int, name int, opt []
 			}
 
 			return nil
-
-		default:
-			socket.SetSockOptEmitUnimplementedEvent(t, name)
 		}
-
 	case linux.SOL_NETLINK:
 		switch name {
 		case linux.NETLINK_ADD_MEMBERSHIP,
@@ -464,11 +453,10 @@ func (s *socketOpsCommon) SetSockOpt(t *kernel.Task, level int, name int, opt []
 			linux.NETLINK_LISTEN_ALL_NSID,
 			linux.NETLINK_NO_ENOBUFS,
 			linux.NETLINK_PKTINFO:
-
-			t.Kernel().EmitUnimplementedEvent(t)
+			// Not supported.
 		}
-
 	}
+
 	// TODO(b/68878065): other sockopts are not supported.
 	return syserr.ErrProtocolNotAvailable
 }
@@ -542,8 +530,10 @@ func (s *socketOpsCommon) RecvMsg(t *kernel.Task, dst usermem.IOSequence, flags 
 
 	// We'll have to block. Register for notification and keep trying to
 	// receive all the data.
-	e, ch := waiter.NewChannelEntry(nil)
-	s.EventRegister(&e, waiter.ReadableEvents)
+	e, ch := waiter.NewChannelEntry(waiter.ReadableEvents)
+	if err := s.EventRegister(&e); err != nil {
+		return 0, 0, from, fromLen, socket.ControlMessages{}, syserr.FromError(err)
+	}
 	defer s.EventUnregister(&e)
 
 	for {

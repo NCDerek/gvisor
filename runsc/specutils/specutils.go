@@ -37,6 +37,7 @@ import (
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/runsc/config"
+	"gvisor.dev/gvisor/runsc/flag"
 )
 
 // ExePath must point to runsc binary, which is normally the same binary. It's
@@ -200,7 +201,7 @@ func ReadSpecFromFile(bundleDir string, specFile *os.File, conf *config.Config) 
 		if strings.HasPrefix(annotation, flagPrefix) {
 			name := annotation[len(flagPrefix):]
 			log.Infof("Overriding flag: %s=%q", name, val)
-			if err := conf.Override(name, val); err != nil {
+			if err := conf.Override(flag.CommandLine, name, val); err != nil {
 				return nil, err
 			}
 		}
@@ -332,11 +333,11 @@ func capsFromNames(names []string, skipSet map[linux.Capability]struct{}) (auth.
 	return auth.CapabilitySetOfMany(caps), nil
 }
 
-// Is9PMount returns true if the given mount can be mounted as an external
+// IsGoferMount returns true if the given mount can be mounted as an external
 // gofer.
-func Is9PMount(m specs.Mount, vfs2Enabled bool) bool {
+func IsGoferMount(m specs.Mount) bool {
 	MaybeConvertToBindMount(&m)
-	return m.Type == "bind" && m.Source != "" && IsSupportedDevMount(m, vfs2Enabled)
+	return m.Type == "bind" && m.Source != ""
 }
 
 // MaybeConvertToBindMount converts mount type to "bind" in case any of the
@@ -354,29 +355,6 @@ func MaybeConvertToBindMount(m *specs.Mount) {
 			return
 		}
 	}
-}
-
-// IsSupportedDevMount returns true if m.Destination does not specify a
-// path that is hardcoded by VFS1's implementation of /dev.
-func IsSupportedDevMount(m specs.Mount, vfs2Enabled bool) bool {
-	// VFS2 has no hardcoded files under /dev, so everything is allowed.
-	if vfs2Enabled {
-		return true
-	}
-
-	// See pkg/sentry/fs/dev/dev.go.
-	var existingDevices = []string{
-		"/dev/fd", "/dev/stdin", "/dev/stdout", "/dev/stderr",
-		"/dev/null", "/dev/zero", "/dev/full", "/dev/random",
-		"/dev/urandom", "/dev/shm", "/dev/ptmx",
-	}
-	dst := filepath.Clean(m.Destination)
-	for _, dev := range existingDevices {
-		if dst == dev || strings.HasPrefix(dst, dev+"/") {
-			return false
-		}
-	}
-	return true
 }
 
 // WaitForReady waits for a process to become ready. The process is ready when
@@ -415,13 +393,13 @@ func WaitForReady(pid int, timeout time.Duration, ready func() (bool, error)) er
 // ends with '/', it's used as a directory with default file name.
 // 'logPattern' can contain variables that are substituted:
 //   - %TIMESTAMP%: is replaced with a timestamp using the following format:
-//			<yyyymmdd-hhmmss.uuuuuu>
-//	 - %COMMAND%: is replaced with 'command'
-//	 - %TEST%: is replaced with 'test' (omitted by default)
+//     <yyyymmdd-hhmmss.uuuuuu>
+//   - %COMMAND%: is replaced with 'command'
+//   - %TEST%: is replaced with 'test' (omitted by default)
 func DebugLogFile(logPattern, command, test string) (*os.File, error) {
 	if strings.HasSuffix(logPattern, "/") {
-		// Default format: <debug-log>/runsc.log.<yyyymmdd-hhmmss.uuuuuu>.<command>
-		logPattern += "runsc.log.%TIMESTAMP%.%COMMAND%"
+		// Default format: <debug-log>/runsc.log.<yyyymmdd-hhmmss.uuuuuu>.<command>.txt
+		logPattern += "runsc.log.%TIMESTAMP%.%COMMAND%.txt"
 	}
 	logPattern = strings.Replace(logPattern, "%TIMESTAMP%", time.Now().Format("20060102-150405.000000"), -1)
 	logPattern = strings.Replace(logPattern, "%COMMAND%", command, -1)

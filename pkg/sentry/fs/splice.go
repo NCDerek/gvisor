@@ -16,8 +16,8 @@ package fs
 
 import (
 	"io"
-	"sync/atomic"
 
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 )
@@ -25,6 +25,7 @@ import (
 // Splice moves data to this file, directly from another.
 //
 // Offsets are updated only if DstOffset and SrcOffset are set.
+// +checklocksignore
 func Splice(ctx context.Context, dst *File, src *File, opts SpliceOpts) (int64, error) {
 	// Verify basic file flag permissions.
 	if !dst.Flags().Write || !src.Flags().Read {
@@ -53,45 +54,29 @@ func Splice(ctx context.Context, dst *File, src *File, opts SpliceOpts) (int64, 
 		switch {
 		case dst.UniqueID < src.UniqueID:
 			// Acquire dst first.
-			if !dst.mu.Lock(ctx) {
-				return 0, linuxerr.ErrInterrupted
-			}
-			if !src.mu.Lock(ctx) {
-				dst.mu.Unlock()
-				return 0, linuxerr.ErrInterrupted
-			}
+			dst.mu.Lock()
+			src.mu.Lock()
 		case dst.UniqueID > src.UniqueID:
 			// Acquire src first.
-			if !src.mu.Lock(ctx) {
-				return 0, linuxerr.ErrInterrupted
-			}
-			if !dst.mu.Lock(ctx) {
-				src.mu.Unlock()
-				return 0, linuxerr.ErrInterrupted
-			}
+			src.mu.Lock()
+			dst.mu.Lock()
 		case dst.UniqueID == src.UniqueID:
 			// Acquire only one lock; it's the same file. This is a
 			// bit of a edge case, but presumably it's possible.
-			if !dst.mu.Lock(ctx) {
-				return 0, linuxerr.ErrInterrupted
-			}
-			srcLock = false // Only need one unlock.
+			dst.mu.Lock()
+			srcLock = false
 		}
 		// Use both offsets (locked).
-		opts.DstStart = dst.offset
-		opts.SrcStart = src.offset
+		opts.DstStart = dst.offset.RacyLoad()
+		opts.SrcStart = src.offset.RacyLoad()
 	case dstLock:
 		// Acquire only dst.
-		if !dst.mu.Lock(ctx) {
-			return 0, linuxerr.ErrInterrupted
-		}
-		opts.DstStart = dst.offset // Safe: locked.
+		dst.mu.Lock()
+		opts.DstStart = dst.offset.RacyLoad() // Safe: locked.
 	case srcLock:
 		// Acquire only src.
-		if !src.mu.Lock(ctx) {
-			return 0, linuxerr.ErrInterrupted
-		}
-		opts.SrcStart = src.offset // Safe: locked.
+		src.mu.Lock()
+		opts.SrcStart = src.offset.RacyLoad() // Safe: locked.
 	}
 
 	var err error
@@ -100,7 +85,10 @@ func Splice(ctx context.Context, dst *File, src *File, opts SpliceOpts) (int64, 
 		defer unlock()
 
 		// Figure out the appropriate offset to use.
-		err = dst.offsetForAppend(ctx, &opts.DstStart)
+
+		dstStart := atomicbitops.FromInt64(opts.DstStart)
+		err = dst.offsetForAppend(ctx, &dstStart)
+		opts.DstStart = dstStart.RacyLoad()
 	}
 	if err == nil && !dstPipe {
 		// Enforce file limits.
@@ -162,10 +150,10 @@ func Splice(ctx context.Context, dst *File, src *File, opts SpliceOpts) (int64, 
 	// Update offsets, if required.
 	if n > 0 {
 		if !dstPipe && !opts.DstOffset {
-			atomic.StoreInt64(&dst.offset, dst.offset+n)
+			dst.offset.Add(n)
 		}
 		if !srcPipe && !opts.SrcOffset {
-			atomic.StoreInt64(&src.offset, src.offset+n)
+			src.offset.Add(n)
 		}
 	}
 

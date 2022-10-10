@@ -111,7 +111,7 @@ func (s *socketOperations) Read(ctx context.Context, _ *fs.File, dst usermem.IOS
 		}
 		return readv(s.fd, safemem.IovecsFromBlockSeq(dsts))
 	}))
-	return int64(n), err
+	return n, err
 }
 
 // Write implements fs.FileOperations.Write.
@@ -134,7 +134,7 @@ func (s *socketOperations) Write(ctx context.Context, _ *fs.File, src usermem.IO
 		}
 		return writev(s.fd, safemem.IovecsFromBlockSeq(srcs))
 	}))
-	return int64(n), err
+	return n, err
 }
 
 // Socket implements socket.Provider.Socket.
@@ -180,7 +180,7 @@ func (p *socketProvider) Socket(t *kernel.Task, stypeflags linux.SockType, proto
 }
 
 // Pair implements socket.Provider.Pair.
-func (p *socketProvider) Pair(t *kernel.Task, stype linux.SockType, protocol int) (*fs.File, *fs.File, *syserr.Error) {
+func (p *socketProvider) Pair(*kernel.Task, linux.SockType, int) (*fs.File, *fs.File, *syserr.Error) {
 	// Not supported by AF_INET/AF_INET6.
 	return nil, nil, nil
 }
@@ -207,7 +207,7 @@ type socketOpsCommon struct {
 // Release implements fs.FileOperations.Release.
 func (s *socketOpsCommon) Release(context.Context) {
 	fdnotifier.RemoveFD(int32(s.fd))
-	unix.Close(s.fd)
+	_ = unix.Close(s.fd)
 }
 
 // Readiness implements waiter.Waitable.Readiness.
@@ -216,15 +216,21 @@ func (s *socketOpsCommon) Readiness(mask waiter.EventMask) waiter.EventMask {
 }
 
 // EventRegister implements waiter.Waitable.EventRegister.
-func (s *socketOpsCommon) EventRegister(e *waiter.Entry, mask waiter.EventMask) {
-	s.queue.EventRegister(e, mask)
-	fdnotifier.UpdateFD(int32(s.fd))
+func (s *socketOpsCommon) EventRegister(e *waiter.Entry) error {
+	s.queue.EventRegister(e)
+	if err := fdnotifier.UpdateFD(int32(s.fd)); err != nil {
+		s.queue.EventUnregister(e)
+		return err
+	}
+	return nil
 }
 
 // EventUnregister implements waiter.Waitable.EventUnregister.
 func (s *socketOpsCommon) EventUnregister(e *waiter.Entry) {
 	s.queue.EventUnregister(e)
-	fdnotifier.UpdateFD(int32(s.fd))
+	if err := fdnotifier.UpdateFD(int32(s.fd)); err != nil {
+		panic(err)
+	}
 }
 
 // Connect implements socket.Socket.Connect.
@@ -249,9 +255,9 @@ func (s *socketOpsCommon) Connect(t *kernel.Task, sockaddr []byte, blocking bool
 	// level SOL-SOCKET to determine whether connect() completed successfully
 	// (SO_ERROR is zero) or unsuccessfully (SO_ERROR is one of the usual error
 	// codes listed here, explaining the reason for the failure)." - connect(2)
-	e, ch := waiter.NewChannelEntry(nil)
 	writableMask := waiter.WritableEvents
-	s.EventRegister(&e, writableMask)
+	e, ch := waiter.NewChannelEntry(writableMask)
+	s.EventRegister(&e)
 	defer s.EventUnregister(&e)
 	if s.Readiness(writableMask)&writableMask == 0 {
 		if err := t.Block(ch); err != nil {
@@ -294,8 +300,8 @@ func (s *socketOpsCommon) Accept(t *kernel.Task, peerRequested bool, flags int, 
 				}
 			} else {
 				var e waiter.Entry
-				e, ch = waiter.NewChannelEntry(nil)
-				s.EventRegister(&e, waiter.ReadableEvents)
+				e, ch = waiter.NewChannelEntry(waiter.ReadableEvents)
+				s.EventRegister(&e)
 				defer s.EventUnregister(&e)
 			}
 			fd, syscallErr = accept4(s.fd, peerAddrPtr, peerAddrlenPtr, unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC)
@@ -316,7 +322,7 @@ func (s *socketOpsCommon) Accept(t *kernel.Task, peerRequested bool, flags int, 
 	if kernel.VFS2Enabled {
 		f, err := newVFS2Socket(t, s.family, s.stype, s.protocol, fd, uint32(flags&unix.SOCK_NONBLOCK))
 		if err != nil {
-			unix.Close(fd)
+			_ = unix.Close(fd)
 			return 0, nil, 0, err
 		}
 		defer f.DecRef(t)
@@ -328,7 +334,7 @@ func (s *socketOpsCommon) Accept(t *kernel.Task, peerRequested bool, flags int, 
 	} else {
 		f, err := newSocketFile(t, s.family, s.stype, s.protocol, fd, flags&unix.SOCK_NONBLOCK != 0)
 		if err != nil {
-			unix.Close(fd)
+			_ = unix.Close(fd)
 			return 0, nil, 0, err
 		}
 		defer f.DecRef(t)
@@ -343,7 +349,7 @@ func (s *socketOpsCommon) Accept(t *kernel.Task, peerRequested bool, flags int, 
 }
 
 // Bind implements socket.Socket.Bind.
-func (s *socketOpsCommon) Bind(t *kernel.Task, sockaddr []byte) *syserr.Error {
+func (s *socketOpsCommon) Bind(_ *kernel.Task, sockaddr []byte) *syserr.Error {
 	if len(sockaddr) > sizeofSockaddr {
 		sockaddr = sockaddr[:sizeofSockaddr]
 	}
@@ -356,12 +362,12 @@ func (s *socketOpsCommon) Bind(t *kernel.Task, sockaddr []byte) *syserr.Error {
 }
 
 // Listen implements socket.Socket.Listen.
-func (s *socketOpsCommon) Listen(t *kernel.Task, backlog int) *syserr.Error {
+func (s *socketOpsCommon) Listen(_ *kernel.Task, backlog int) *syserr.Error {
 	return syserr.FromError(unix.Listen(s.fd, backlog))
 }
 
 // Shutdown implements socket.Socket.Shutdown.
-func (s *socketOpsCommon) Shutdown(t *kernel.Task, how int) *syserr.Error {
+func (s *socketOpsCommon) Shutdown(_ *kernel.Task, how int) *syserr.Error {
 	switch how {
 	case unix.SHUT_RD, unix.SHUT_WR, unix.SHUT_RDWR:
 		return syserr.FromError(unix.Shutdown(s.fd, how))
@@ -371,22 +377,22 @@ func (s *socketOpsCommon) Shutdown(t *kernel.Task, how int) *syserr.Error {
 }
 
 // GetSockOpt implements socket.Socket.GetSockOpt.
-func (s *socketOpsCommon) GetSockOpt(t *kernel.Task, level int, name int, outPtr hostarch.Addr, outLen int) (marshal.Marshallable, *syserr.Error) {
+func (s *socketOpsCommon) GetSockOpt(t *kernel.Task, level int, name int, optValAddr hostarch.Addr, outLen int) (marshal.Marshallable, *syserr.Error) {
 	if outLen < 0 {
 		return nil, syserr.ErrInvalidArgument
 	}
 
 	// Only allow known and safe options.
-	optlen := getSockOptLen(t, level, name)
+	optlen, copyIn := getSockOptLen(t, level, name)
 	switch level {
 	case linux.SOL_IP:
 		switch name {
-		case linux.IP_TOS, linux.IP_RECVTOS, linux.IP_PKTINFO, linux.IP_RECVORIGDSTADDR, linux.IP_RECVERR:
+		case linux.IP_TOS, linux.IP_RECVTOS, linux.IP_TTL, linux.IP_RECVTTL, linux.IP_PKTINFO, linux.IP_RECVORIGDSTADDR, linux.IP_RECVERR:
 			optlen = sizeofInt32
 		}
 	case linux.SOL_IPV6:
 		switch name {
-		case linux.IPV6_TCLASS, linux.IPV6_RECVTCLASS, linux.IPV6_RECVERR, linux.IPV6_V6ONLY, linux.IPV6_RECVORIGDSTADDR:
+		case linux.IPV6_TCLASS, linux.IPV6_RECVTCLASS, linux.IPV6_RECVPKTINFO, linux.IPV6_UNICAST_HOPS, linux.IPV6_MULTICAST_HOPS, linux.IPV6_RECVHOPLIMIT, linux.IPV6_RECVERR, linux.IPV6_V6ONLY, linux.IPV6_RECVORIGDSTADDR:
 			optlen = sizeofInt32
 		}
 	case linux.SOL_SOCKET:
@@ -395,13 +401,21 @@ func (s *socketOpsCommon) GetSockOpt(t *kernel.Task, level int, name int, outPtr
 			optlen = sizeofInt32
 		case linux.SO_LINGER:
 			optlen = unix.SizeofLinger
+		case linux.SO_RCVTIMEO, linux.SO_SNDTIMEO:
+			optlen = linux.SizeOfTimeval
 		}
 	case linux.SOL_TCP:
 		switch name {
-		case linux.TCP_NODELAY:
+		case linux.TCP_NODELAY, linux.TCP_MAXSEG:
 			optlen = sizeofInt32
 		case linux.TCP_INFO:
-			optlen = int(linux.SizeOfTCPInfo)
+			optlen = linux.SizeOfTCPInfo
+			// Truncate the output buffer to outLen size.
+			if optlen > outLen {
+				optlen = outLen
+			}
+		case linux.TCP_CONGESTION:
+			optlen = outLen
 		}
 	}
 
@@ -412,10 +426,21 @@ func (s *socketOpsCommon) GetSockOpt(t *kernel.Task, level int, name int, outPtr
 		return nil, syserr.ErrInvalidArgument
 	}
 
-	opt, err := getsockopt(s.fd, level, name, optlen)
+	opt := make([]byte, optlen)
+	if copyIn {
+		// This is non-intuitive as normally in getsockopt one assumes that the
+		// parameter is purely an out parameter. But some custom options do require
+		// copying in the optVal so we do it here only for those custom options.
+		if _, err := t.CopyInBytes(optValAddr, opt); err != nil {
+			return nil, syserr.FromError(err)
+		}
+	}
+	var err error
+	opt, err = getsockopt(s.fd, level, name, opt)
 	if err != nil {
 		return nil, syserr.FromError(err)
 	}
+	opt = postGetSockOpt(t, level, name, opt)
 	optP := primitive.ByteSlice(opt)
 	return &optP, nil
 }
@@ -427,12 +452,12 @@ func (s *socketOpsCommon) SetSockOpt(t *kernel.Task, level int, name int, opt []
 	switch level {
 	case linux.SOL_IP:
 		switch name {
-		case linux.IP_TOS, linux.IP_RECVTOS, linux.IP_PKTINFO, linux.IP_RECVORIGDSTADDR, linux.IP_RECVERR:
+		case linux.IP_TOS, linux.IP_RECVTOS, linux.IP_TTL, linux.IP_RECVTTL, linux.IP_PKTINFO, linux.IP_RECVORIGDSTADDR, linux.IP_RECVERR:
 			optlen = sizeofInt32
 		}
 	case linux.SOL_IPV6:
 		switch name {
-		case linux.IPV6_TCLASS, linux.IPV6_RECVTCLASS, linux.IPV6_RECVERR, linux.IPV6_V6ONLY, linux.IPV6_RECVORIGDSTADDR:
+		case linux.IPV6_TCLASS, linux.IPV6_RECVTCLASS, linux.IPV6_RECVPKTINFO, linux.IPV6_UNICAST_HOPS, linux.IPV6_MULTICAST_HOPS, linux.IPV6_RECVHOPLIMIT, linux.IPV6_RECVERR, linux.IPV6_V6ONLY, linux.IPV6_RECVORIGDSTADDR:
 			optlen = sizeofInt32
 		}
 	case linux.SOL_SOCKET:
@@ -442,8 +467,10 @@ func (s *socketOpsCommon) SetSockOpt(t *kernel.Task, level int, name int, opt []
 		}
 	case linux.SOL_TCP:
 		switch name {
-		case linux.TCP_NODELAY, linux.TCP_INQ:
+		case linux.TCP_NODELAY, linux.TCP_INQ, linux.TCP_MAXSEG:
 			optlen = sizeofInt32
+		case linux.TCP_CONGESTION:
+			optlen = len(opt)
 		}
 	}
 
@@ -546,8 +573,8 @@ func (s *socketOpsCommon) RecvMsg(t *kernel.Task, dst usermem.IOSequence, flags 
 				}
 			} else {
 				var e waiter.Entry
-				e, ch = waiter.NewChannelEntry(nil)
-				s.EventRegister(&e, waiter.ReadableEvents)
+				e, ch = waiter.NewChannelEntry(waiter.ReadableEvents)
+				s.EventRegister(&e)
 				defer s.EventUnregister(&e)
 			}
 			n, err = copyToDst()
@@ -578,8 +605,8 @@ func parseUnixControlMessages(unixControlMessages []unix.SocketControlMessage) s
 			case linux.SO_TIMESTAMP:
 				controlMessages.IP.HasTimestamp = true
 				ts := linux.Timeval{}
-				ts.UnmarshalUnsafe(unixCmsg.Data[:linux.SizeOfTimeval])
-				controlMessages.IP.Timestamp = ts.ToNsecCapped()
+				ts.UnmarshalUnsafe(unixCmsg.Data)
+				controlMessages.IP.Timestamp = ts.ToTime()
 			}
 
 		case linux.SOL_IP:
@@ -587,18 +614,24 @@ func parseUnixControlMessages(unixControlMessages []unix.SocketControlMessage) s
 			case linux.IP_TOS:
 				controlMessages.IP.HasTOS = true
 				var tos primitive.Uint8
-				tos.UnmarshalUnsafe(unixCmsg.Data[:tos.SizeBytes()])
+				tos.UnmarshalUnsafe(unixCmsg.Data)
 				controlMessages.IP.TOS = uint8(tos)
+
+			case linux.IP_TTL:
+				controlMessages.IP.HasTTL = true
+				var ttl primitive.Uint32
+				ttl.UnmarshalUnsafe(unixCmsg.Data)
+				controlMessages.IP.TTL = uint32(ttl)
 
 			case linux.IP_PKTINFO:
 				controlMessages.IP.HasIPPacketInfo = true
 				var packetInfo linux.ControlMessageIPPacketInfo
-				packetInfo.UnmarshalUnsafe(unixCmsg.Data[:packetInfo.SizeBytes()])
+				packetInfo.UnmarshalUnsafe(unixCmsg.Data)
 				controlMessages.IP.PacketInfo = packetInfo
 
 			case linux.IP_RECVORIGDSTADDR:
 				var addr linux.SockAddrInet
-				addr.UnmarshalUnsafe(unixCmsg.Data[:addr.SizeBytes()])
+				addr.UnmarshalUnsafe(unixCmsg.Data)
 				controlMessages.IP.OriginalDstAddress = &addr
 
 			case unix.IP_RECVERR:
@@ -612,12 +645,24 @@ func parseUnixControlMessages(unixControlMessages []unix.SocketControlMessage) s
 			case linux.IPV6_TCLASS:
 				controlMessages.IP.HasTClass = true
 				var tclass primitive.Uint32
-				tclass.UnmarshalUnsafe(unixCmsg.Data[:tclass.SizeBytes()])
+				tclass.UnmarshalUnsafe(unixCmsg.Data)
 				controlMessages.IP.TClass = uint32(tclass)
+
+			case linux.IPV6_PKTINFO:
+				controlMessages.IP.HasIPv6PacketInfo = true
+				var packetInfo linux.ControlMessageIPv6PacketInfo
+				packetInfo.UnmarshalUnsafe(unixCmsg.Data)
+				controlMessages.IP.IPv6PacketInfo = packetInfo
+
+			case linux.IPV6_HOPLIMIT:
+				controlMessages.IP.HasHopLimit = true
+				var hoplimit primitive.Uint32
+				hoplimit.UnmarshalUnsafe(unixCmsg.Data)
+				controlMessages.IP.HopLimit = uint32(hoplimit)
 
 			case linux.IPV6_RECVORIGDSTADDR:
 				var addr linux.SockAddrInet6
-				addr.UnmarshalUnsafe(unixCmsg.Data[:addr.SizeBytes()])
+				addr.UnmarshalUnsafe(unixCmsg.Data)
 				controlMessages.IP.OriginalDstAddress = &addr
 
 			case unix.IPV6_RECVERR:
@@ -631,7 +676,7 @@ func parseUnixControlMessages(unixControlMessages []unix.SocketControlMessage) s
 			case linux.TCP_INQ:
 				controlMessages.IP.HasInq = true
 				var inq primitive.Int32
-				inq.UnmarshalUnsafe(unixCmsg.Data[:linux.SizeOfControlMessageInq])
+				inq.UnmarshalUnsafe(unixCmsg.Data)
 				controlMessages.IP.Inq = int32(inq)
 			}
 		}
@@ -721,8 +766,8 @@ func (s *socketOpsCommon) SendMsg(t *kernel.Task, src usermem.IOSequence, to []b
 				}
 			} else {
 				var e waiter.Entry
-				e, ch = waiter.NewChannelEntry(nil)
-				s.EventRegister(&e, waiter.WritableEvents)
+				e, ch = waiter.NewChannelEntry(waiter.WritableEvents)
+				s.EventRegister(&e)
 				defer s.EventUnregister(&e)
 			}
 			n, err = src.CopyInTo(t, sendmsgFromBlocks)
@@ -742,7 +787,9 @@ func translateIOSyscallError(err error) error {
 // State implements socket.Socket.State.
 func (s *socketOpsCommon) State() uint32 {
 	info := linux.TCPInfo{}
-	buf, err := getsockopt(s.fd, unix.SOL_TCP, unix.TCP_INFO, linux.SizeOfTCPInfo)
+	buf := make([]byte, linux.SizeOfTCPInfo)
+	var err error
+	buf, err = getsockopt(s.fd, unix.SOL_TCP, unix.TCP_INFO, buf)
 	if err != nil {
 		if err != unix.ENOPROTOOPT {
 			log.Warningf("Failed to get TCP socket info from %+v: %v", s, err)

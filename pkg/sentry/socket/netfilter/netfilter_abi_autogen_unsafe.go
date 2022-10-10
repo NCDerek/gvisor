@@ -26,19 +26,17 @@ func (n *nfNATTarget) SizeBytes() int {
 }
 
 // MarshalBytes implements marshal.Marshallable.MarshalBytes.
-func (n *nfNATTarget) MarshalBytes(dst []byte) {
-    n.Target.MarshalBytes(dst[:n.Target.SizeBytes()])
-    dst = dst[n.Target.SizeBytes():]
-    n.Range.MarshalBytes(dst[:n.Range.SizeBytes()])
-    dst = dst[n.Range.SizeBytes():]
+func (n *nfNATTarget) MarshalBytes(dst []byte) []byte {
+    dst = n.Target.MarshalUnsafe(dst)
+    dst = n.Range.MarshalUnsafe(dst)
+    return dst
 }
 
 // UnmarshalBytes implements marshal.Marshallable.UnmarshalBytes.
-func (n *nfNATTarget) UnmarshalBytes(src []byte) {
-    n.Target.UnmarshalBytes(src[:n.Target.SizeBytes()])
-    src = src[n.Target.SizeBytes():]
-    n.Range.UnmarshalBytes(src[:n.Range.SizeBytes()])
-    src = src[n.Range.SizeBytes():]
+func (n *nfNATTarget) UnmarshalBytes(src []byte) []byte {
+    src = n.Target.UnmarshalUnsafe(src)
+    src = n.Range.UnmarshalUnsafe(src)
+    return src
 }
 
 // Packed implements marshal.Marshallable.Packed.
@@ -48,27 +46,28 @@ func (n *nfNATTarget) Packed() bool {
 }
 
 // MarshalUnsafe implements marshal.Marshallable.MarshalUnsafe.
-func (n *nfNATTarget) MarshalUnsafe(dst []byte) {
+func (n *nfNATTarget) MarshalUnsafe(dst []byte) []byte {
     if n.Range.Packed() && n.Target.Packed() {
-        gohacks.Memmove(unsafe.Pointer(&dst[0]), unsafe.Pointer(n),  uintptr(n.SizeBytes()))
-    } else {
-        // Type nfNATTarget doesn't have a packed layout in memory, fallback to MarshalBytes.
-        n.MarshalBytes(dst)
+        size := n.SizeBytes()
+        gohacks.Memmove(unsafe.Pointer(&dst[0]), unsafe.Pointer(n), uintptr(size))
+        return dst[size:]
     }
+    // Type nfNATTarget doesn't have a packed layout in memory, fallback to MarshalBytes.
+    return n.MarshalBytes(dst)
 }
 
 // UnmarshalUnsafe implements marshal.Marshallable.UnmarshalUnsafe.
-func (n *nfNATTarget) UnmarshalUnsafe(src []byte) {
+func (n *nfNATTarget) UnmarshalUnsafe(src []byte) []byte {
     if n.Range.Packed() && n.Target.Packed() {
-        gohacks.Memmove(unsafe.Pointer(n), unsafe.Pointer(&src[0]), uintptr(n.SizeBytes()))
-    } else {
-        // Type nfNATTarget doesn't have a packed layout in memory, fallback to UnmarshalBytes.
-        n.UnmarshalBytes(src)
+        size := n.SizeBytes()
+        gohacks.Memmove(unsafe.Pointer(n), unsafe.Pointer(&src[0]), uintptr(size))
+        return src[size:]
     }
+    // Type nfNATTarget doesn't have a packed layout in memory, fallback to UnmarshalBytes.
+    return n.UnmarshalBytes(src)
 }
 
 // CopyOutN implements marshal.Marshallable.CopyOutN.
-//go:nosplit
 func (n *nfNATTarget) CopyOutN(cc marshal.CopyContext, addr hostarch.Addr, limit int) (int, error) {
     if !n.Range.Packed() && n.Target.Packed() {
         // Type nfNATTarget doesn't have a packed layout in memory, fall back to MarshalBytes.
@@ -92,13 +91,11 @@ func (n *nfNATTarget) CopyOutN(cc marshal.CopyContext, addr hostarch.Addr, limit
 }
 
 // CopyOut implements marshal.Marshallable.CopyOut.
-//go:nosplit
 func (n *nfNATTarget) CopyOut(cc marshal.CopyContext, addr hostarch.Addr) (int, error) {
     return n.CopyOutN(cc, addr, n.SizeBytes())
 }
 
 // CopyIn implements marshal.Marshallable.CopyIn.
-//go:nosplit
 func (n *nfNATTarget) CopyIn(cc marshal.CopyContext, addr hostarch.Addr) (int, error) {
     if !n.Range.Packed() && n.Target.Packed() {
         // Type nfNATTarget doesn't have a packed layout in memory, fall back to UnmarshalBytes.
