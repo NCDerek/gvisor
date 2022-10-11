@@ -15,6 +15,8 @@
 package linux
 
 import (
+	"math"
+
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
@@ -30,7 +32,6 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel/fasync"
 	ktime "gvisor.dev/gvisor/pkg/sentry/kernel/time"
 	"gvisor.dev/gvisor/pkg/sentry/limits"
-	"gvisor.dev/gvisor/pkg/syserr"
 )
 
 // fileOpAt performs an operation on the second last component in the path.
@@ -177,7 +178,7 @@ func openAt(t *kernel.Task, dirFD int32, addr hostarch.Addr, flags uint) (fd uin
 
 		file, err := d.Inode.GetFile(t, d, fileFlags)
 		if err != nil {
-			return syserr.ConvertIntr(err, linuxerr.ERESTARTSYS)
+			return linuxerr.ConvertIntr(err, linuxerr.ERESTARTSYS)
 		}
 		defer file.DecRef(t)
 
@@ -416,7 +417,7 @@ func createAt(t *kernel.Task, dirFD int32, addr hostarch.Addr, flags uint, mode 
 			// Create a new fs.File.
 			newFile, err = found.Inode.GetFile(t, found, fileFlags)
 			if err != nil {
-				return syserr.ConvertIntr(err, linuxerr.ERESTARTSYS)
+				return linuxerr.ConvertIntr(err, linuxerr.ERESTARTSYS)
 			}
 			defer newFile.DecRef(t)
 		case linuxerr.Equals(linuxerr.ENOENT, err):
@@ -650,7 +651,11 @@ func Ioctl(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscall
 		return 0, nil, nil
 
 	case linux.FIOGETOWN, linux.SIOCGPGRP:
-		_, err := primitive.CopyInt32Out(t, args[2].Pointer(), fGetOwn(t, file))
+		owner, err := fGetOwn(t, file)
+		if err != nil {
+			return 0, nil, err
+		}
+		_, err = primitive.CopyInt32Out(t, args[2].Pointer(), owner)
 		return 0, nil, err
 
 	default:
@@ -798,6 +803,60 @@ func Close(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscall
 	return 0, nil, handleIOError(t, false /* partial */, err, linuxerr.EINTR, "close", file)
 }
 
+// CloseRange implements linux syscall close_range(2).
+func CloseRange(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+	first := args[0].Uint()
+	last := args[1].Uint()
+	flags := args[2].Uint()
+
+	if (first > last) || (last > math.MaxInt32) {
+		return 0, nil, linuxerr.EINVAL
+	}
+
+	if (flags & ^(linux.CLOSE_RANGE_CLOEXEC | linux.CLOSE_RANGE_UNSHARE)) != 0 {
+		return 0, nil, linuxerr.EINVAL
+	}
+
+	cloexec := flags & linux.CLOSE_RANGE_CLOEXEC
+	unshare := flags & linux.CLOSE_RANGE_UNSHARE
+
+	if unshare != 0 {
+		// If possible, we don't want to copy FDs to the new unshared table, because those FDs will
+		// be promptly closed and no longer used. So in the case where we know the range extends all
+		// the way to the end of the FdTable, we can simply copy the FdTable only up to the start of
+		// the range that we are closing.
+		if cloexec == 0 && int32(last) >= t.FDTable().GetLastFd() {
+			t.UnshareFdTable(int32(first))
+		} else {
+			t.UnshareFdTable(math.MaxInt32)
+		}
+	}
+
+	if cloexec != 0 {
+		flagToApply := kernel.FDFlags{
+			CloseOnExec: true,
+		}
+		t.FDTable().SetFlagsForRange(t.AsyncContext(), int32(first), int32(last), flagToApply)
+		return 0, nil, nil
+	}
+
+	fdTable := t.FDTable()
+	fd := int32(first)
+	for {
+		fd, file, _ := fdTable.RemoveNextInRange(t, fd, int32(last))
+		if file == nil {
+			break
+		}
+
+		fd++
+		// Per the close_range(2) documentation, errors upon closing file descriptors are ignored.
+		_ = file.Flush(t)
+		file.DecRef(t)
+	}
+
+	return 0, nil, nil
+}
+
 // Dup implements linux syscall dup(2).
 func Dup(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
 	fd := args[0].Int()
@@ -861,10 +920,13 @@ func Dup3(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallC
 	return uintptr(newfd), nil, nil
 }
 
-func fGetOwnEx(t *kernel.Task, file *fs.File) linux.FOwnerEx {
-	ma := file.Async(nil)
+func fGetOwnEx(t *kernel.Task, file *fs.File) (linux.FOwnerEx, error) {
+	ma, err := file.Async(nil)
+	if err != nil {
+		return linux.FOwnerEx{}, err
+	}
 	if ma == nil {
-		return linux.FOwnerEx{}
+		return linux.FOwnerEx{}, nil
 	}
 	a := ma.(*fasync.FileAsync)
 	ot, otg, opg := a.Owner()
@@ -873,28 +935,31 @@ func fGetOwnEx(t *kernel.Task, file *fs.File) linux.FOwnerEx {
 		return linux.FOwnerEx{
 			Type: linux.F_OWNER_TID,
 			PID:  int32(t.PIDNamespace().IDOfTask(ot)),
-		}
+		}, nil
 	case otg != nil:
 		return linux.FOwnerEx{
 			Type: linux.F_OWNER_PID,
 			PID:  int32(t.PIDNamespace().IDOfThreadGroup(otg)),
-		}
+		}, nil
 	case opg != nil:
 		return linux.FOwnerEx{
 			Type: linux.F_OWNER_PGRP,
 			PID:  int32(t.PIDNamespace().IDOfProcessGroup(opg)),
-		}
+		}, nil
 	default:
-		return linux.FOwnerEx{}
+		return linux.FOwnerEx{}, nil
 	}
 }
 
-func fGetOwn(t *kernel.Task, file *fs.File) int32 {
-	owner := fGetOwnEx(t, file)
-	if owner.Type == linux.F_OWNER_PGRP {
-		return -owner.PID
+func fGetOwn(t *kernel.Task, file *fs.File) (int32, error) {
+	owner, err := fGetOwnEx(t, file)
+	if err != nil {
+		return 0, err
 	}
-	return owner.PID
+	if owner.Type == linux.F_OWNER_PGRP {
+		return -owner.PID, nil
+	}
+	return owner.PID, nil
 }
 
 // fSetOwn sets the file's owner with the semantics of F_SETOWN in Linux.
@@ -902,17 +967,21 @@ func fGetOwn(t *kernel.Task, file *fs.File) int32 {
 // If who is positive, it represents a PID. If negative, it represents a PGID.
 // If the PID or PGID is invalid, the owner is silently unset.
 func fSetOwn(t *kernel.Task, fd int, file *fs.File, who int32) error {
-	a := file.Async(fasync.New(fd)).(*fasync.FileAsync)
+	a, err := file.Async(fasync.New(fd))
+	if err != nil {
+		return err
+	}
+	async := a.(*fasync.FileAsync)
 	if who < 0 {
 		// Check for overflow before flipping the sign.
 		if who-1 > who {
 			return linuxerr.EINVAL
 		}
 		pg := t.PIDNamespace().ProcessGroupWithID(kernel.ProcessGroupID(-who))
-		a.SetOwnerProcessGroup(t, pg)
+		async.SetOwnerProcessGroup(t, pg)
 	} else {
 		tg := t.PIDNamespace().ThreadGroupWithID(kernel.ThreadID(who))
-		a.SetOwnerThreadGroup(t, tg)
+		async.SetOwnerThreadGroup(t, tg)
 	}
 	return nil
 }
@@ -1012,32 +1081,18 @@ func Fcntl(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscall
 			if !file.Flags().Read {
 				return 0, nil, linuxerr.EBADF
 			}
-			if cmd == linux.F_SETLK {
-				// Non-blocking lock, provide a nil lock.Blocker.
-				if !file.Dirent.Inode.LockCtx.Posix.LockRegionVFS1(t.FDTable(), lock.ReadLock, rng, nil) {
-					return 0, nil, linuxerr.EAGAIN
-				}
-			} else {
-				// Blocking lock, pass in the task to satisfy the lock.Blocker interface.
-				if !file.Dirent.Inode.LockCtx.Posix.LockRegionVFS1(t.FDTable(), lock.ReadLock, rng, t) {
-					return 0, nil, linuxerr.EINTR
-				}
+			// Lock the given region.
+			if err := file.Dirent.Inode.LockCtx.Posix.LockRegionVFS1(t, t.FDTable(), lock.ReadLock, rng, cmd != linux.F_SETLK /* block */); err != nil {
+				return 0, nil, err
 			}
 			return 0, nil, nil
 		case linux.F_WRLCK:
 			if !file.Flags().Write {
 				return 0, nil, linuxerr.EBADF
 			}
-			if cmd == linux.F_SETLK {
-				// Non-blocking lock, provide a nil lock.Blocker.
-				if !file.Dirent.Inode.LockCtx.Posix.LockRegionVFS1(t.FDTable(), lock.WriteLock, rng, nil) {
-					return 0, nil, linuxerr.EAGAIN
-				}
-			} else {
-				// Blocking lock, pass in the task to satisfy the lock.Blocker interface.
-				if !file.Dirent.Inode.LockCtx.Posix.LockRegionVFS1(t.FDTable(), lock.WriteLock, rng, t) {
-					return 0, nil, linuxerr.EINTR
-				}
+			// Lock the given region.
+			if err := file.Dirent.Inode.LockCtx.Posix.LockRegionVFS1(t, t.FDTable(), lock.WriteLock, rng, cmd != linux.F_SETLK /* block */); err != nil {
+				return 0, nil, err
 			}
 			return 0, nil, nil
 		case linux.F_UNLCK:
@@ -1047,13 +1102,20 @@ func Fcntl(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscall
 			return 0, nil, linuxerr.EINVAL
 		}
 	case linux.F_GETOWN:
-		return uintptr(fGetOwn(t, file)), nil, nil
+		owner, err := fGetOwn(t, file)
+		if err != nil {
+			return 0, nil, err
+		}
+		return uintptr(owner), nil, nil
 	case linux.F_SETOWN:
 		return 0, nil, fSetOwn(t, int(fd), file, args[2].Int())
 	case linux.F_GETOWN_EX:
 		addr := args[2].Pointer()
-		owner := fGetOwnEx(t, file)
-		_, err := owner.CopyOut(t, addr)
+		owner, err := fGetOwnEx(t, file)
+		if err != nil {
+			return 0, nil, err
+		}
+		_, err = owner.CopyOut(t, addr)
 		return 0, nil, err
 	case linux.F_SETOWN_EX:
 		addr := args[2].Pointer()
@@ -1062,28 +1124,32 @@ func Fcntl(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscall
 		if err != nil {
 			return 0, nil, err
 		}
-		a := file.Async(fasync.New(int(fd))).(*fasync.FileAsync)
+		a, err := file.Async(fasync.New(int(fd)))
+		if err != nil {
+			return 0, nil, err
+		}
+		async := a.(*fasync.FileAsync)
 		switch owner.Type {
 		case linux.F_OWNER_TID:
 			task := t.PIDNamespace().TaskWithID(kernel.ThreadID(owner.PID))
 			if task == nil {
 				return 0, nil, linuxerr.ESRCH
 			}
-			a.SetOwnerTask(t, task)
+			async.SetOwnerTask(t, task)
 			return 0, nil, nil
 		case linux.F_OWNER_PID:
 			tg := t.PIDNamespace().ThreadGroupWithID(kernel.ThreadID(owner.PID))
 			if tg == nil {
 				return 0, nil, linuxerr.ESRCH
 			}
-			a.SetOwnerThreadGroup(t, tg)
+			async.SetOwnerThreadGroup(t, tg)
 			return 0, nil, nil
 		case linux.F_OWNER_PGRP:
 			pg := t.PIDNamespace().ProcessGroupWithID(kernel.ProcessGroupID(owner.PID))
 			if pg == nil {
 				return 0, nil, linuxerr.ESRCH
 			}
-			a.SetOwnerProcessGroup(t, pg)
+			async.SetOwnerProcessGroup(t, pg)
 			return 0, nil, nil
 		default:
 			return 0, nil, linuxerr.EINVAL
@@ -1112,11 +1178,19 @@ func Fcntl(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscall
 		n, err := sz.SetFifoSize(int64(args[2].Int()))
 		return uintptr(n), nil, err
 	case linux.F_GETSIG:
-		a := file.Async(fasync.New(int(fd))).(*fasync.FileAsync)
-		return uintptr(a.Signal()), nil, nil
+		a, err := file.Async(fasync.New(int(fd)))
+		if err != nil {
+			return 0, nil, err
+		}
+		async := a.(*fasync.FileAsync)
+		return uintptr(async.Signal()), nil, nil
 	case linux.F_SETSIG:
-		a := file.Async(fasync.New(int(fd))).(*fasync.FileAsync)
-		return 0, nil, a.SetSignal(linux.Signal(args[2].Int()))
+		a, err := file.Async(fasync.New(int(fd)))
+		if err != nil {
+			return 0, nil, err
+		}
+		async := a.(*fasync.FileAsync)
+		return 0, nil, async.SetSignal(linux.Signal(args[2].Int()))
 	default:
 		// Everything else is not yet supported.
 		return 0, nil, linuxerr.EINVAL
@@ -2181,28 +2255,14 @@ func Flock(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscall
 
 	switch operation {
 	case linux.LOCK_EX:
-		if nonblocking {
-			// Since we're nonblocking we pass a nil lock.Blocker implementation.
-			if !file.Dirent.Inode.LockCtx.BSD.LockRegionVFS1(file, lock.WriteLock, rng, nil) {
-				return 0, nil, linuxerr.EWOULDBLOCK
-			}
-		} else {
-			// Because we're blocking we will pass the task to satisfy the lock.Blocker interface.
-			if !file.Dirent.Inode.LockCtx.BSD.LockRegionVFS1(file, lock.WriteLock, rng, t) {
-				return 0, nil, linuxerr.EINTR
-			}
+		// Lock the given region.
+		if err := file.Dirent.Inode.LockCtx.BSD.LockRegionVFS1(t, file, lock.WriteLock, rng, !nonblocking /* block */); err != nil {
+			return 0, nil, err
 		}
 	case linux.LOCK_SH:
-		if nonblocking {
-			// Since we're nonblocking we pass a nil lock.Blocker implementation.
-			if !file.Dirent.Inode.LockCtx.BSD.LockRegionVFS1(file, lock.ReadLock, rng, nil) {
-				return 0, nil, linuxerr.EWOULDBLOCK
-			}
-		} else {
-			// Because we're blocking we will pass the task to satisfy the lock.Blocker interface.
-			if !file.Dirent.Inode.LockCtx.BSD.LockRegionVFS1(file, lock.ReadLock, rng, t) {
-				return 0, nil, linuxerr.EINTR
-			}
+		// Lock the given region.
+		if err := file.Dirent.Inode.LockCtx.BSD.LockRegionVFS1(t, file, lock.ReadLock, rng, !nonblocking /* block */); err != nil {
+			return 0, nil, err
 		}
 	case linux.LOCK_UN:
 		file.Dirent.Inode.LockCtx.BSD.UnlockRegion(file, rng)

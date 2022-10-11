@@ -23,8 +23,9 @@ import (
 	"time"
 
 	"github.com/google/go-cmp/cmp"
+	"gvisor.dev/gvisor/pkg/bufferv2"
 	"gvisor.dev/gvisor/pkg/tcpip"
-	"gvisor.dev/gvisor/pkg/tcpip/buffer"
+	"gvisor.dev/gvisor/pkg/tcpip/checksum"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/seqnum"
 )
@@ -36,20 +37,20 @@ type NetworkChecker func(*testing.T, []header.Network)
 type TransportChecker func(*testing.T, header.Transport)
 
 // ControlMessagesChecker is a function to check a property of ancillary data.
-type ControlMessagesChecker func(*testing.T, tcpip.ControlMessages)
+type ControlMessagesChecker func(*testing.T, tcpip.ReceivableControlMessages)
 
 // IPv4 checks the validity and properties of the given IPv4 packet. It is
 // expected to be used in conjunction with other network checkers for specific
 // properties. For example, to check the source and destination address, one
 // would call:
 //
-// checker.IPv4(t, b, checker.SrcAddr(x), checker.DstAddr(y))
-func IPv4(t *testing.T, b []byte, checkers ...NetworkChecker) {
+// checker.IPv4(t, v, checker.SrcAddr(x), checker.DstAddr(y))
+func IPv4(t *testing.T, v *bufferv2.View, checkers ...NetworkChecker) {
 	t.Helper()
 
-	ipv4 := header.IPv4(b)
+	ipv4 := header.IPv4(v.AsSlice())
 
-	if !ipv4.IsValid(len(b)) {
+	if !ipv4.IsValid(len(v.AsSlice())) {
 		t.Fatalf("Not a valid IPv4 packet: %x", ipv4)
 	}
 
@@ -67,11 +68,11 @@ func IPv4(t *testing.T, b []byte, checkers ...NetworkChecker) {
 
 // IPv6 checks the validity and properties of the given IPv6 packet. The usage
 // is similar to IPv4.
-func IPv6(t *testing.T, b []byte, checkers ...NetworkChecker) {
+func IPv6(t *testing.T, v *bufferv2.View, checkers ...NetworkChecker) {
 	t.Helper()
 
-	ipv6 := header.IPv6(b)
-	if !ipv6.IsValid(len(b)) {
+	ipv6 := header.IPv6(v.AsSlice())
+	if !ipv6.IsValid(len(v.AsSlice())) {
 		t.Fatalf("Not a valid IPv6 packet: %x", ipv6)
 	}
 
@@ -289,24 +290,94 @@ func FragmentFlags(flags uint8) NetworkChecker {
 // ReceiveTClass creates a checker that checks the TCLASS field in
 // ControlMessages.
 func ReceiveTClass(want uint32) ControlMessagesChecker {
-	return func(t *testing.T, cm tcpip.ControlMessages) {
+	return func(t *testing.T, cm tcpip.ReceivableControlMessages) {
 		t.Helper()
 		if !cm.HasTClass {
-			t.Errorf("got cm.HasTClass = %t, want = true", cm.HasTClass)
+			t.Error("got cm.HasTClass = false, want = true")
 		} else if got := cm.TClass; got != want {
 			t.Errorf("got cm.TClass = %d, want %d", got, want)
 		}
 	}
 }
 
+// NoTClassReceived creates a checker that checks the absence of the TCLASS
+// field in ControlMessages.
+func NoTClassReceived() ControlMessagesChecker {
+	return func(t *testing.T, cm tcpip.ReceivableControlMessages) {
+		t.Helper()
+		if cm.HasTClass {
+			t.Error("got cm.HasTClass = true, want = false")
+		}
+	}
+}
+
 // ReceiveTOS creates a checker that checks the TOS field in ControlMessages.
 func ReceiveTOS(want uint8) ControlMessagesChecker {
-	return func(t *testing.T, cm tcpip.ControlMessages) {
+	return func(t *testing.T, cm tcpip.ReceivableControlMessages) {
 		t.Helper()
 		if !cm.HasTOS {
-			t.Errorf("got cm.HasTOS = %t, want = true", cm.HasTOS)
+			t.Error("got cm.HasTOS = false, want = true")
 		} else if got := cm.TOS; got != want {
 			t.Errorf("got cm.TOS = %d, want %d", got, want)
+		}
+	}
+}
+
+// NoTOSReceived creates a checker that checks the absence of the TOS field in
+// ControlMessages.
+func NoTOSReceived() ControlMessagesChecker {
+	return func(t *testing.T, cm tcpip.ReceivableControlMessages) {
+		t.Helper()
+		if cm.HasTOS {
+			t.Error("got cm.HasTOS = true, want = false")
+		}
+	}
+}
+
+// ReceiveTTL creates a checker that checks the TTL field in
+// ControlMessages.
+func ReceiveTTL(want uint8) ControlMessagesChecker {
+	return func(t *testing.T, cm tcpip.ReceivableControlMessages) {
+		t.Helper()
+		if !cm.HasTTL {
+			t.Errorf("got cm.HasTTL = %t, want = true", cm.HasTTL)
+		} else if got := cm.TTL; got != want {
+			t.Errorf("got cm.TTL = %d, want = %d", got, want)
+		}
+	}
+}
+
+// NoTTLReceived creates a checker that checks the absence of the TTL field in
+// ControlMessages.
+func NoTTLReceived() ControlMessagesChecker {
+	return func(t *testing.T, cm tcpip.ReceivableControlMessages) {
+		t.Helper()
+		if cm.HasTTL {
+			t.Error("got cm.HasTTL = true, want = false")
+		}
+	}
+}
+
+// ReceiveHopLimit creates a checker that checks the HopLimit field in
+// ControlMessages.
+func ReceiveHopLimit(want uint8) ControlMessagesChecker {
+	return func(t *testing.T, cm tcpip.ReceivableControlMessages) {
+		t.Helper()
+		if !cm.HasHopLimit {
+			t.Errorf("got cm.HasHopLimit = %t, want = true", cm.HasHopLimit)
+		} else if got := cm.HopLimit; got != want {
+			t.Errorf("got cm.HopLimit = %d, want = %d", got, want)
+		}
+	}
+}
+
+// NoHopLimitReceived creates a checker that checks the absence of the HopLimit
+// field in ControlMessages.
+func NoHopLimitReceived() ControlMessagesChecker {
+	return func(t *testing.T, cm tcpip.ReceivableControlMessages) {
+		t.Helper()
+		if cm.HasHopLimit {
+			t.Error("got cm.HasHopLimit = true, want = false")
 		}
 	}
 }
@@ -314,12 +385,47 @@ func ReceiveTOS(want uint8) ControlMessagesChecker {
 // ReceiveIPPacketInfo creates a checker that checks the PacketInfo field in
 // ControlMessages.
 func ReceiveIPPacketInfo(want tcpip.IPPacketInfo) ControlMessagesChecker {
-	return func(t *testing.T, cm tcpip.ControlMessages) {
+	return func(t *testing.T, cm tcpip.ReceivableControlMessages) {
 		t.Helper()
 		if !cm.HasIPPacketInfo {
-			t.Errorf("got cm.HasIPPacketInfo = %t, want = true", cm.HasIPPacketInfo)
+			t.Error("got cm.HasIPPacketInfo = false, want = true")
 		} else if diff := cmp.Diff(want, cm.PacketInfo); diff != "" {
 			t.Errorf("IPPacketInfo mismatch (-want +got):\n%s", diff)
+		}
+	}
+}
+
+// NoIPPacketInfoReceived creates a checker that checks the PacketInfo field in
+// ControlMessages.
+func NoIPPacketInfoReceived() ControlMessagesChecker {
+	return func(t *testing.T, cm tcpip.ReceivableControlMessages) {
+		t.Helper()
+		if cm.HasIPPacketInfo {
+			t.Error("got cm.HasIPPacketInfo = true, want = false")
+		}
+	}
+}
+
+// ReceiveIPv6PacketInfo creates a checker that checks the IPv6PacketInfo field
+// in ControlMessages.
+func ReceiveIPv6PacketInfo(want tcpip.IPv6PacketInfo) ControlMessagesChecker {
+	return func(t *testing.T, cm tcpip.ReceivableControlMessages) {
+		t.Helper()
+		if !cm.HasIPv6PacketInfo {
+			t.Error("got cm.HasIPv6PacketInfo = false, want = true")
+		} else if diff := cmp.Diff(want, cm.IPv6PacketInfo); diff != "" {
+			t.Errorf("IPv6PacketInfo mismatch (-want +got):\n%s", diff)
+		}
+	}
+}
+
+// NoIPv6PacketInfoReceived creates a checker that checks the PacketInfo field
+// in ControlMessages.
+func NoIPv6PacketInfoReceived() ControlMessagesChecker {
+	return func(t *testing.T, cm tcpip.ReceivableControlMessages) {
+		t.Helper()
+		if cm.HasIPv6PacketInfo {
+			t.Error("got cm.HasIPv6PacketInfo = true, want = false")
 		}
 	}
 }
@@ -327,10 +433,10 @@ func ReceiveIPPacketInfo(want tcpip.IPPacketInfo) ControlMessagesChecker {
 // ReceiveOriginalDstAddr creates a checker that checks the OriginalDstAddress
 // field in ControlMessages.
 func ReceiveOriginalDstAddr(want tcpip.FullAddress) ControlMessagesChecker {
-	return func(t *testing.T, cm tcpip.ControlMessages) {
+	return func(t *testing.T, cm tcpip.ReceivableControlMessages) {
 		t.Helper()
 		if !cm.HasOriginalDstAddress {
-			t.Errorf("got cm.HasOriginalDstAddress = %t, want = true", cm.HasOriginalDstAddress)
+			t.Error("got cm.HasOriginalDstAddress = false, want = true")
 		} else if diff := cmp.Diff(want, cm.OriginalDstAddress); diff != "" {
 			t.Errorf("OriginalDstAddress mismatch (-want +got):\n%s", diff)
 		}
@@ -401,7 +507,7 @@ func TCP(checkers ...TransportChecker) NetworkChecker {
 
 		tcp := header.TCP(last.Payload())
 		payload := tcp.Payload()
-		payloadChecksum := header.Checksum(payload, 0)
+		payloadChecksum := checksum.Checksum(payload, 0)
 		if !tcp.IsChecksumValid(first.SourceAddress(), first.DestinationAddress(), payloadChecksum, uint16(len(payload))) {
 			t.Errorf("Bad checksum, got = %d", tcp.Checksum())
 		}
@@ -456,6 +562,17 @@ func DstPort(port uint16) TransportChecker {
 
 		if p := h.DestinationPort(); p != port {
 			t.Errorf("Bad destination port, got = %d, want = %d", p, port)
+		}
+	}
+}
+
+// TransportChecksum creates a checker that checks the checksum value.
+func TransportChecksum(want uint16) TransportChecker {
+	return func(t *testing.T, transportHdr header.Transport) {
+		t.Helper()
+
+		if got := transportHdr.Checksum(); got != want {
+			t.Errorf("got transportHdr.Checksum() = %d, want = %d", got, want)
 		}
 	}
 }
@@ -926,7 +1043,7 @@ func ICMPv4Checksum() TransportChecker {
 		}
 		heldChecksum := icmpv4.Checksum()
 		icmpv4.SetChecksum(0)
-		newChecksum := ^header.Checksum(icmpv4, 0)
+		newChecksum := ^checksum.Checksum(icmpv4, 0)
 		icmpv4.SetChecksum(heldChecksum)
 		if heldChecksum != newChecksum {
 			t.Errorf("unexpected ICMP checksum, got = %d, want = %d", heldChecksum, newChecksum)
@@ -1419,19 +1536,20 @@ func IGMPGroupAddress(want tcpip.Address) TransportChecker {
 type IPv6ExtHdrChecker func(*testing.T, header.IPv6PayloadHeader)
 
 // IPv6WithExtHdr is like IPv6 but allows IPv6 packets with extension headers.
-func IPv6WithExtHdr(t *testing.T, b []byte, checkers ...NetworkChecker) {
+func IPv6WithExtHdr(t *testing.T, v *bufferv2.View, checkers ...NetworkChecker) {
 	t.Helper()
 
-	ipv6 := header.IPv6(b)
-	if !ipv6.IsValid(len(b)) {
+	ipv6 := header.IPv6(v.AsSlice())
+	if !ipv6.IsValid(len(v.AsSlice())) {
 		t.Error("not a valid IPv6 packet")
 		return
 	}
 
 	payloadIterator := header.MakeIPv6PayloadIterator(
 		header.IPv6ExtensionHeaderIdentifier(ipv6.NextHeader()),
-		buffer.View(ipv6.Payload()).ToVectorisedView(),
+		bufferv2.MakeWithData(ipv6.Payload()),
 	)
+	defer payloadIterator.Release()
 
 	var rawPayloadHeader header.IPv6RawPayloadHeader
 	for {
@@ -1444,6 +1562,7 @@ func IPv6WithExtHdr(t *testing.T, b []byte, checkers ...NetworkChecker) {
 			t.Errorf("got payloadIterator.Next() = (%T, %t, _), want = (_, true, _)", h, done)
 			return
 		}
+		defer h.Release()
 		r, ok := h.(header.IPv6RawPayloadHeader)
 		if ok {
 			rawPayloadHeader = r
@@ -1454,7 +1573,7 @@ func IPv6WithExtHdr(t *testing.T, b []byte, checkers ...NetworkChecker) {
 	networkHeader := ipv6HeaderWithExtHdr{
 		IPv6:      ipv6,
 		transport: tcpip.TransportProtocolNumber(rawPayloadHeader.Identifier),
-		payload:   rawPayloadHeader.Buf.ToView(),
+		payload:   rawPayloadHeader.Buf.Flatten(),
 	}
 
 	for _, checker := range checkers {
@@ -1478,8 +1597,9 @@ func IPv6ExtHdr(headers ...IPv6ExtHdrChecker) NetworkChecker {
 
 		payloadIterator := header.MakeIPv6PayloadIterator(
 			header.IPv6ExtensionHeaderIdentifier(extHdrs.IPv6.NextHeader()),
-			buffer.View(extHdrs.IPv6.Payload()).ToVectorisedView(),
+			bufferv2.MakeWithData(extHdrs.IPv6.Payload()),
 		)
+		defer payloadIterator.Release()
 
 		for _, check := range headers {
 			h, done, err := payloadIterator.Next()
@@ -1492,6 +1612,7 @@ func IPv6ExtHdr(headers ...IPv6ExtHdrChecker) NetworkChecker {
 				return
 			}
 			check(t, h)
+			h.Release()
 		}
 		// Validate we consumed all headers.
 		//
@@ -1514,6 +1635,8 @@ func IPv6ExtHdr(headers ...IPv6ExtHdrChecker) NetworkChecker {
 			if _, ok := h.(header.IPv6RawPayloadHeader); !ok {
 				t.Errorf("got payloadIterator.Next() = (%T, _, _), want = (header.IPv6RawPayloadHeader, _, _)", h)
 				continue
+			} else {
+				h.Release()
 			}
 			wantDone = true
 		}
@@ -1568,6 +1691,9 @@ func IPv6HopByHopExtensionHeader(checkers ...IPv6ExtHdrOptionChecker) IPv6ExtHdr
 				t.Errorf("got optionsIterator.Next() = (%T, %t, _), want = (_, false, _)", opt, done)
 			}
 			f(t, opt)
+			if uo, ok := opt.(*header.IPv6UnknownExtHdrOption); ok {
+				uo.Data.Release()
+			}
 		}
 		// Validate all options were consumed.
 		for {
@@ -1581,6 +1707,9 @@ func IPv6HopByHopExtensionHeader(checkers ...IPv6ExtHdrOptionChecker) IPv6ExtHdr
 			}
 			if done {
 				break
+			}
+			if uo, ok := opt.(*header.IPv6UnknownExtHdrOption); ok {
+				uo.Data.Release()
 			}
 		}
 	}

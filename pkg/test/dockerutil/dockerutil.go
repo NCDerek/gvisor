@@ -22,24 +22,22 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
+	"os"
 	"os/exec"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
 	"gvisor.dev/gvisor/pkg/test/testutil"
+	"gvisor.dev/gvisor/runsc/cgroup"
 )
 
 var (
 	// runtime is the runtime to use for tests. This will be applied to all
 	// containers. Note that the default here ("runsc") corresponds to the
-	// default used by the installations. This is important, because the
-	// default installer for vm_tests (in tools/installers:head, invoked
-	// via tools/vm:defs.bzl) will install with this name. So without
-	// changing anything, tests should have a runsc runtime available to
-	// them. Otherwise installers should update the existing runtime
-	// instead of installing a new one.
-	runtime = flag.String("runtime", "runsc", "specify which runtime to use")
+	// default used by the installations.
+	runtime = flag.String("runtime", os.Getenv("RUNTIME"), "specify which runtime to use")
 
 	// config is the default Docker daemon configuration path.
 	config = flag.String("config_path", "/etc/docker/daemon.json", "configuration file for reading paths")
@@ -58,7 +56,21 @@ var (
 	pprofCPU   = flag.Bool("pprof-cpu", false, "enables CPU profiling with runsc debug")
 	pprofHeap  = flag.Bool("pprof-heap", false, "enables heap profiling with runsc debug")
 	pprofMutex = flag.Bool("pprof-mutex", false, "enables mutex profiling with runsc debug")
+
+	// This matches the string "native.cgroupdriver=systemd" (including optional
+	// whitespace), which can be found in a docker daemon configuration file's
+	// exec-opts field.
+	useSystemdRgx = regexp.MustCompile("\\s*(native\\.cgroupdriver)\\s*=\\s*(systemd)\\s*")
 )
+
+// PrintDockerConfig prints the whole Docker configuration file to the log.
+func PrintDockerConfig() {
+	configBytes, err := ioutil.ReadFile(*config)
+	if err != nil {
+		log.Fatalf("Cannot read Docker config at %v: %v", *config, err)
+	}
+	log.Printf("Docker config (from %v):\n--------\n%v\n--------\n", *config, string(configBytes))
+}
 
 // EnsureSupportedDockerVersion checks if correct docker is installed.
 //
@@ -81,6 +93,19 @@ func EnsureSupportedDockerVersion() {
 	}
 }
 
+// EnsureDockerExperimentalEnabled ensures that Docker has experimental features enabled.
+func EnsureDockerExperimentalEnabled() {
+	cmd := exec.Command("docker", "version", "--format={{.Server.Experimental}}")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		log.Fatalf("error running %s: %v", "docker version --format='{{.Server.Experimental}}'", err)
+	}
+	if strings.TrimSpace(string(out)) != "true" {
+		PrintDockerConfig()
+		log.Fatalf("Docker is running without experimental features enabled.")
+	}
+}
+
 // RuntimePath returns the binary path for the current runtime.
 func RuntimePath() (string, error) {
 	rs, err := runtimeMap()
@@ -96,21 +121,33 @@ func RuntimePath() (string, error) {
 	return p, nil
 }
 
-// UsingVFS2 returns true if the 'runtime' has the vfs2 flag set.
-// TODO(gvisor.dev/issue/1624): Remove.
-func UsingVFS2() (bool, error) {
-	rMap, err := runtimeMap()
+// UsingSystemdCgroup returns true if the docker configuration has the
+// native.cgroupdriver=systemd option set in "exec-opts", or if the
+// system is using cgroupv2, in which case systemd is the default driver.
+func UsingSystemdCgroup() (bool, error) {
+	// Read the configuration data; the file must exist.
+	configBytes, err := ioutil.ReadFile(*config)
 	if err != nil {
 		return false, err
 	}
-
-	list, ok := rMap["runtimeArgs"].([]interface{})
-	if !ok {
-		return false, fmt.Errorf("unexpected format: %v", rMap)
+	// Unmarshal the configuration.
+	c := make(map[string]interface{})
+	if err := json.Unmarshal(configBytes, &c); err != nil {
+		return false, err
 	}
-
-	for _, element := range list {
-		if element == "--vfs2" {
+	// Decode the expected configuration.
+	e, ok := c["exec-opts"]
+	if !ok {
+		// No exec-opts. Default is true on cgroupv2, false otherwise.
+		return cgroup.IsOnlyV2(), nil
+	}
+	eos, ok := e.([]interface{})
+	if !ok {
+		// The exec opts are not an array.
+		return false, fmt.Errorf("unexpected format: %+v", eos)
+	}
+	for _, opt := range eos {
+		if optStr, ok := opt.(string); ok && useSystemdRgx.MatchString(optStr) {
 			return true, nil
 		}
 	}

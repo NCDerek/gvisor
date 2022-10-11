@@ -17,11 +17,14 @@ package ipv6_test
 import (
 	"bytes"
 	"math/rand"
+	"os"
 	"testing"
 	"time"
 
+	"gvisor.dev/gvisor/pkg/bufferv2"
+	"gvisor.dev/gvisor/pkg/refs"
+	"gvisor.dev/gvisor/pkg/refsvfs2"
 	"gvisor.dev/gvisor/pkg/tcpip"
-	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/checker"
 	"gvisor.dev/gvisor/pkg/tcpip/faketime"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
@@ -40,10 +43,11 @@ var (
 	globalAddrSNMC    = header.SolicitedNodeAddr(globalAddr)
 )
 
-func validateMLDPacket(t *testing.T, p buffer.View, localAddress, remoteAddress tcpip.Address, mldType header.ICMPv6Type, groupAddress tcpip.Address) {
+func validateMLDPacket(t *testing.T, v *bufferv2.View, localAddress, remoteAddress tcpip.Address, mldType header.ICMPv6Type, groupAddress tcpip.Address) {
 	t.Helper()
 
-	checker.IPv6WithExtHdr(t, p,
+	defer v.Release()
+	checker.IPv6WithExtHdr(t, v,
 		checker.IPv6ExtHdr(
 			checker.IPv6HopByHopExtensionHeader(checker.IPv6RouterAlert(header.IPv6RouterAlertMLD)),
 		),
@@ -57,9 +61,16 @@ func validateMLDPacket(t *testing.T, p buffer.View, localAddress, remoteAddress 
 	)
 }
 
-func TestIPv6JoinLeaveSolicitedNodeAddressPerformsMLD(t *testing.T) {
-	const nicID = 1
+type mldTestContext struct {
+	s *stack.Stack
+}
 
+func (c *mldTestContext) cleanup() {
+	c.s.Close()
+	c.s.Wait()
+}
+
+func newMLDTestContext() mldTestContext {
 	s := stack.New(stack.Options{
 		NetworkProtocols: []stack.NetworkProtocolFactory{ipv6.NewProtocolWithOptions(ipv6.Options{
 			MLD: ipv6.MLDOptions{
@@ -67,7 +78,18 @@ func TestIPv6JoinLeaveSolicitedNodeAddressPerformsMLD(t *testing.T) {
 			},
 		})},
 	})
+	return mldTestContext{s: s}
+}
+
+func TestIPv6JoinLeaveSolicitedNodeAddressPerformsMLD(t *testing.T) {
+	const nicID = 1
+
+	c := newMLDTestContext()
+	defer c.cleanup()
+	s := c.s
+
 	e := channel.New(1, header.IPv6MinimumMTU, "")
+	defer e.Close()
 	if err := s.CreateNIC(nicID, e); err != nil {
 		t.Fatalf("CreateNIC(%d, _): %s", nicID, err)
 	}
@@ -75,13 +97,18 @@ func TestIPv6JoinLeaveSolicitedNodeAddressPerformsMLD(t *testing.T) {
 	// The stack will join an address's solicited node multicast address when
 	// an address is added. An MLD report message should be sent for the
 	// solicited-node group.
-	if err := s.AddAddress(nicID, ipv6.ProtocolNumber, linkLocalAddr); err != nil {
-		t.Fatalf("AddAddress(%d, %d, %s) = %s", nicID, ipv6.ProtocolNumber, linkLocalAddr, err)
+	protocolAddr := tcpip.ProtocolAddress{
+		Protocol:          ipv6.ProtocolNumber,
+		AddressWithPrefix: linkLocalAddr.WithPrefix(),
 	}
-	if p, ok := e.Read(); !ok {
+	if err := s.AddProtocolAddress(nicID, protocolAddr, stack.AddressProperties{}); err != nil {
+		t.Fatalf("AddProtocolAddress(%d, %+v, {}): %s", nicID, protocolAddr, err)
+	}
+	if p := e.Read(); p.IsNil() {
 		t.Fatal("expected a report message to be sent")
 	} else {
-		validateMLDPacket(t, stack.PayloadSince(p.Pkt.NetworkHeader()), linkLocalAddr, linkLocalAddrSNMC, header.ICMPv6MulticastListenerReport, linkLocalAddrSNMC)
+		validateMLDPacket(t, stack.PayloadSince(p.NetworkHeader()), linkLocalAddr, linkLocalAddrSNMC, header.ICMPv6MulticastListenerReport, linkLocalAddrSNMC)
+		p.DecRef()
 	}
 
 	// The stack will leave an address's solicited node multicast address when
@@ -90,10 +117,11 @@ func TestIPv6JoinLeaveSolicitedNodeAddressPerformsMLD(t *testing.T) {
 	if err := s.RemoveAddress(nicID, linkLocalAddr); err != nil {
 		t.Fatalf("RemoveAddress(%d, %s) = %s", nicID, linkLocalAddr, err)
 	}
-	if p, ok := e.Read(); !ok {
+	if p := e.Read(); p.IsNil() {
 		t.Fatal("expected a done message to be sent")
 	} else {
-		validateMLDPacket(t, stack.PayloadSince(p.Pkt.NetworkHeader()), header.IPv6Any, header.IPv6AllRoutersLinkLocalMulticastAddress, header.ICMPv6MulticastListenerDone, linkLocalAddrSNMC)
+		validateMLDPacket(t, stack.PayloadSince(p.NetworkHeader()), header.IPv6Any, header.IPv6AllRoutersLinkLocalMulticastAddress, header.ICMPv6MulticastListenerDone, linkLocalAddrSNMC)
+		p.DecRef()
 	}
 }
 
@@ -160,12 +188,20 @@ func TestSendQueuedMLDReports(t *testing.T) {
 				t.Fatalf("CreateNIC(%d, _): %s", nicID, err)
 			}
 
+			defer func() {
+				s.Close()
+				s.Wait()
+				e.Close()
+			}()
+
 			resolveDAD := func(addr, snmc tcpip.Address) {
 				clock.Advance(dadResolutionTime)
-				if p, ok := e.Read(); !ok {
+				if p := e.Read(); p.IsNil() {
 					t.Fatal("expected DAD packet")
 				} else {
-					checker.IPv6(t, stack.PayloadSince(p.Pkt.NetworkHeader()),
+					payload := stack.PayloadSince(p.NetworkHeader())
+					defer payload.Release()
+					checker.IPv6(t, payload,
 						checker.SrcAddr(header.IPv6Any),
 						checker.DstAddr(snmc),
 						checker.TTL(header.NDPHopLimit),
@@ -173,6 +209,7 @@ func TestSendQueuedMLDReports(t *testing.T) {
 							checker.NDPNSTargetAddress(addr),
 							checker.NDPNSOptions([]header.NDPOption{header.NDPNonceOption(nonce[:])}),
 						))
+					p.DecRef()
 				}
 			}
 
@@ -196,14 +233,16 @@ func TestSendQueuedMLDReports(t *testing.T) {
 			if got := reportStat.Value(); got != reportCounter {
 				t.Errorf("got reportStat.Value() = %d, want = %d", got, reportCounter)
 			}
-			if p, ok := e.Read(); !ok {
+			if p := e.Read(); p.IsNil() {
 				t.Errorf("expected MLD report for %s", globalMulticastAddr)
 			} else {
-				validateMLDPacket(t, stack.PayloadSince(p.Pkt.NetworkHeader()), header.IPv6Any, globalMulticastAddr, header.ICMPv6MulticastListenerReport, globalMulticastAddr)
+				validateMLDPacket(t, stack.PayloadSince(p.NetworkHeader()), header.IPv6Any, globalMulticastAddr, header.ICMPv6MulticastListenerReport, globalMulticastAddr)
+				p.DecRef()
 			}
 			clock.Advance(time.Hour)
-			if p, ok := e.Read(); ok {
+			if p := e.Read(); !p.IsNil() {
 				t.Errorf("got unexpected packet = %#v", p)
+				p.DecRef()
 			}
 			if t.Failed() {
 				t.FailNow()
@@ -216,17 +255,23 @@ func TestSendQueuedMLDReports(t *testing.T) {
 			// Note, we will still expect to send a report for the global address's
 			// solicited node address from the unspecified address as per  RFC 3590
 			// section 4.
-			if err := s.AddAddressWithOptions(nicID, ipv6.ProtocolNumber, globalAddr, stack.FirstPrimaryEndpoint); err != nil {
-				t.Fatalf("AddAddressWithOptions(%d, %d, %s, %d): %s", nicID, ipv6.ProtocolNumber, globalAddr, stack.FirstPrimaryEndpoint, err)
+			properties := stack.AddressProperties{PEB: stack.FirstPrimaryEndpoint}
+			globalProtocolAddr := tcpip.ProtocolAddress{
+				Protocol:          ipv6.ProtocolNumber,
+				AddressWithPrefix: globalAddr.WithPrefix(),
+			}
+			if err := s.AddProtocolAddress(nicID, globalProtocolAddr, properties); err != nil {
+				t.Fatalf("AddProtocolAddress(%d, %+v, %+v): %s", nicID, globalProtocolAddr, properties, err)
 			}
 			reportCounter++
 			if got := reportStat.Value(); got != reportCounter {
 				t.Errorf("got reportStat.Value() = %d, want = %d", got, reportCounter)
 			}
-			if p, ok := e.Read(); !ok {
+			if p := e.Read(); p.IsNil() {
 				t.Errorf("expected MLD report for %s", globalAddrSNMC)
 			} else {
-				validateMLDPacket(t, stack.PayloadSince(p.Pkt.NetworkHeader()), header.IPv6Any, globalAddrSNMC, header.ICMPv6MulticastListenerReport, globalAddrSNMC)
+				validateMLDPacket(t, stack.PayloadSince(p.NetworkHeader()), header.IPv6Any, globalAddrSNMC, header.ICMPv6MulticastListenerReport, globalAddrSNMC)
+				p.DecRef()
 			}
 			if dadResolutionTime != 0 {
 				// Reports should not be sent when the address resolves.
@@ -243,8 +288,9 @@ func TestSendQueuedMLDReports(t *testing.T) {
 			if got := doneStat.Value(); got != doneCounter {
 				t.Errorf("got doneStat.Value() = %d, want = %d", got, doneCounter)
 			}
-			if p, ok := e.Read(); ok {
+			if p := e.Read(); !p.IsNil() {
 				t.Errorf("got unexpected packet = %#v", p)
+				p.DecRef()
 			}
 			if t.Failed() {
 				t.FailNow()
@@ -252,18 +298,23 @@ func TestSendQueuedMLDReports(t *testing.T) {
 
 			// Adding a link-local address should send a report for its solicited node
 			// address and globalMulticastAddr.
-			if err := s.AddAddressWithOptions(nicID, ipv6.ProtocolNumber, linkLocalAddr, stack.CanBePrimaryEndpoint); err != nil {
-				t.Fatalf("AddAddressWithOptions(%d, %d, %s, %d): %s", nicID, ipv6.ProtocolNumber, linkLocalAddr, stack.CanBePrimaryEndpoint, err)
+			linkLocalProtocolAddr := tcpip.ProtocolAddress{
+				Protocol:          ipv6.ProtocolNumber,
+				AddressWithPrefix: linkLocalAddr.WithPrefix(),
+			}
+			if err := s.AddProtocolAddress(nicID, linkLocalProtocolAddr, stack.AddressProperties{}); err != nil {
+				t.Fatalf("AddProtocolAddress(%d, %+v, {}): %s", nicID, linkLocalProtocolAddr, err)
 			}
 			if dadResolutionTime != 0 {
 				reportCounter++
 				if got := reportStat.Value(); got != reportCounter {
 					t.Errorf("got reportStat.Value() = %d, want = %d", got, reportCounter)
 				}
-				if p, ok := e.Read(); !ok {
+				if p := e.Read(); p.IsNil() {
 					t.Errorf("expected MLD report for %s", linkLocalAddrSNMC)
 				} else {
-					validateMLDPacket(t, stack.PayloadSince(p.Pkt.NetworkHeader()), header.IPv6Any, linkLocalAddrSNMC, header.ICMPv6MulticastListenerReport, linkLocalAddrSNMC)
+					validateMLDPacket(t, stack.PayloadSince(p.NetworkHeader()), header.IPv6Any, linkLocalAddrSNMC, header.ICMPv6MulticastListenerReport, linkLocalAddrSNMC)
+					p.DecRef()
 				}
 				resolveDAD(linkLocalAddr, linkLocalAddrSNMC)
 			}
@@ -284,12 +335,14 @@ func TestSendQueuedMLDReports(t *testing.T) {
 					linkLocalAddrSNMC:   false,
 				}
 				for range addrs {
-					p, ok := e.Read()
-					if !ok {
+					p := e.Read()
+					if p.IsNil() {
 						t.Fatalf("expected MLD report for %s and %s; addrs = %#v", globalMulticastAddr, linkLocalAddrSNMC, addrs)
 					}
 
-					addr := header.IPv6(stack.PayloadSince(p.Pkt.NetworkHeader())).DestinationAddress()
+					v := stack.PayloadSince(p.NetworkHeader())
+					defer v.Release()
+					addr := header.IPv6(v.AsSlice()).DestinationAddress()
 					if seen, ok := addrs[addr]; !ok {
 						t.Fatalf("got unexpected packet destined to %s", addr)
 					} else if seen {
@@ -297,7 +350,8 @@ func TestSendQueuedMLDReports(t *testing.T) {
 					}
 
 					addrs[addr] = true
-					validateMLDPacket(t, stack.PayloadSince(p.Pkt.NetworkHeader()), linkLocalAddr, addr, header.ICMPv6MulticastListenerReport, addr)
+					validateMLDPacket(t, v.Clone(), linkLocalAddr, addr, header.ICMPv6MulticastListenerReport, addr)
+					p.DecRef()
 
 					clock.Advance(ipv6.UnsolicitedReportIntervalMax)
 				}
@@ -305,8 +359,9 @@ func TestSendQueuedMLDReports(t *testing.T) {
 
 			// Should not send any more reports.
 			clock.Advance(time.Hour)
-			if p, ok := e.Read(); ok {
+			if p := e.Read(); !p.IsNil() {
 				t.Errorf("got unexpected packet = %#v", p)
+				p.DecRef()
 			}
 		})
 	}
@@ -326,7 +381,7 @@ func createAndInjectMLDPacket(e *channel.Endpoint, mldType header.ICMPv6Type, ho
 
 	extensionHeadersLength := extensionHeaders.Length()
 	payloadLength := extensionHeadersLength + header.ICMPv6HeaderSize + header.MLDMinimumSize
-	buf := buffer.NewView(header.IPv6MinimumSize + payloadLength)
+	buf := make([]byte, header.IPv6MinimumSize+payloadLength)
 
 	ip := header.IPv6(buf)
 	ip.Encode(&header.IPv6Fields{
@@ -349,9 +404,11 @@ func createAndInjectMLDPacket(e *channel.Endpoint, mldType header.ICMPv6Type, ho
 		Dst:    header.IPv6AllNodesMulticastAddress,
 	}))
 
-	e.InjectInbound(ipv6.ProtocolNumber, stack.NewPacketBuffer(stack.PacketBufferOptions{
-		Data: buf.ToVectorisedView(),
-	}))
+	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
+		Payload: bufferv2.MakeWithData(buf),
+	})
+	e.InjectInbound(ipv6.ProtocolNumber, pkt)
+	pkt.DecRef()
 }
 
 func TestMLDPacketValidation(t *testing.T) {
@@ -421,14 +478,12 @@ func TestMLDPacketValidation(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			s := stack.New(stack.Options{
-				NetworkProtocols: []stack.NetworkProtocolFactory{ipv6.NewProtocolWithOptions(ipv6.Options{
-					MLD: ipv6.MLDOptions{
-						Enabled: true,
-					},
-				})},
-			})
-			e := channel.New(nicID, header.IPv6MinimumMTU, "")
+			c := newMLDTestContext()
+			defer c.cleanup()
+			s := c.s
+
+			e := channel.New(1, header.IPv6MinimumMTU, "")
+			defer e.Close()
 			if err := s.CreateNIC(nicID, e); err != nil {
 				t.Fatalf("CreateNIC(%d, _): %s", nicID, err)
 			}
@@ -473,7 +528,7 @@ func TestMLDSkipProtocol(t *testing.T) {
 		expectReport bool
 	}{
 		{
-			name:         "Reserverd0",
+			name:         "Reserved0",
 			group:        "\xff\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x11",
 			expectReport: false,
 		},
@@ -556,24 +611,29 @@ func TestMLDSkipProtocol(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			s := stack.New(stack.Options{
-				NetworkProtocols: []stack.NetworkProtocolFactory{ipv6.NewProtocolWithOptions(ipv6.Options{
-					MLD: ipv6.MLDOptions{
-						Enabled: true,
-					},
-				})},
-			})
+			c := newMLDTestContext()
+			s := c.s
+
 			e := channel.New(1, header.IPv6MinimumMTU, "")
 			if err := s.CreateNIC(nicID, e); err != nil {
 				t.Fatalf("CreateNIC(%d, _): %s", nicID, err)
 			}
-			if err := s.AddAddress(nicID, ipv6.ProtocolNumber, linkLocalAddr); err != nil {
-				t.Fatalf("AddAddress(%d, %d, %s) = %s", nicID, ipv6.ProtocolNumber, linkLocalAddr, err)
+
+			defer e.Close()
+			defer c.cleanup()
+
+			protocolAddr := tcpip.ProtocolAddress{
+				Protocol:          ipv6.ProtocolNumber,
+				AddressWithPrefix: linkLocalAddr.WithPrefix(),
 			}
-			if p, ok := e.Read(); !ok {
+			if err := s.AddProtocolAddress(nicID, protocolAddr, stack.AddressProperties{}); err != nil {
+				t.Fatalf("AddProtocolAddress(%d, %+v, {}): %s", nicID, protocolAddr, err)
+			}
+			if p := e.Read(); p.IsNil() {
 				t.Fatal("expected a report message to be sent")
 			} else {
-				validateMLDPacket(t, stack.PayloadSince(p.Pkt.NetworkHeader()), linkLocalAddr, linkLocalAddrSNMC, header.ICMPv6MulticastListenerReport, linkLocalAddrSNMC)
+				validateMLDPacket(t, stack.PayloadSince(p.NetworkHeader()), linkLocalAddr, linkLocalAddrSNMC, header.ICMPv6MulticastListenerReport, linkLocalAddrSNMC)
+				p.DecRef()
 			}
 
 			if err := s.JoinGroup(ipv6.ProtocolNumber, nicID, test.group); err != nil {
@@ -586,18 +646,26 @@ func TestMLDSkipProtocol(t *testing.T) {
 			}
 
 			if !test.expectReport {
-				if p, ok := e.Read(); ok {
+				if p := e.Read(); !p.IsNil() {
 					t.Fatalf("got e.Read() = (%#v, true), want = (_, false)", p)
 				}
 
 				return
 			}
 
-			if p, ok := e.Read(); !ok {
+			if p := e.Read(); p.IsNil() {
 				t.Fatal("expected a report message to be sent")
 			} else {
-				validateMLDPacket(t, stack.PayloadSince(p.Pkt.NetworkHeader()), linkLocalAddr, test.group, header.ICMPv6MulticastListenerReport, test.group)
+				validateMLDPacket(t, stack.PayloadSince(p.NetworkHeader()), linkLocalAddr, test.group, header.ICMPv6MulticastListenerReport, test.group)
+				p.DecRef()
 			}
 		})
 	}
+}
+
+func TestMain(m *testing.M) {
+	refs.SetLeakMode(refs.LeaksPanic)
+	code := m.Run()
+	refsvfs2.DoLeakCheck()
+	os.Exit(code)
 }

@@ -40,7 +40,7 @@ type TaskImage struct {
 	Name string
 
 	// Arch is the architecture-specific context (registers, etc.)
-	Arch arch.Context
+	Arch *arch.Context64
 
 	// MemoryManager is the task's address space.
 	MemoryManager *mm.MemoryManager
@@ -65,7 +65,7 @@ func (image *TaskImage) release() {
 }
 
 // Fork returns a duplicate of image. The copied TaskImage always has an
-// independent arch.Context. If shareAddressSpace is true, the copied
+// independent arch.Context64. If shareAddressSpace is true, the copied
 // TaskImage shares an address space with the original; otherwise, the copied
 // TaskImage has an independent address space that is initially a duplicate
 // of the original's.
@@ -96,11 +96,11 @@ func (image *TaskImage) Fork(ctx context.Context, k *Kernel, shareAddressSpace b
 	return newImage, nil
 }
 
-// Arch returns t's arch.Context.
+// Arch returns t's arch.Context64.
 //
 // Preconditions: The caller must be running on the task goroutine, or t.mu
 // must be locked.
-func (t *Task) Arch() arch.Context {
+func (t *Task) Arch() *arch.Context64 {
 	return t.image.Arch
 }
 
@@ -137,11 +137,6 @@ func (t *Task) Stack() *arch.Stack {
 //
 // args.MemoryManager does not need to be set by the caller.
 func (k *Kernel) LoadTaskImage(ctx context.Context, args loader.LoadArgs) (*TaskImage, *syserr.Error) {
-	// If File is not nil, we should load that instead of resolving Filename.
-	if args.File != nil {
-		args.Filename = args.File.PathnameWithDeleted(ctx)
-	}
-
 	// Prepare a new user address space to load into.
 	m := mm.NewMemoryManager(k, k, k.SleepForAddressSpaceActivation)
 	defer m.DecUsers(ctx)

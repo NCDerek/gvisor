@@ -1,6 +1,15 @@
 """Defines a rule for syscall test targets."""
 
-load("//tools:defs.bzl", "default_platform", "platforms")
+load("//tools:defs.bzl", "default_platform", "platform_capabilities", "platforms")
+
+# Maps platform names to a GVISOR_PLATFORM_SUPPORT environment variable consumed by platform_util.cc
+_platform_support_env_vars = {
+    platform: ",".join(sorted([
+        ("%s:%s" % (capability, "TRUE" if supported else "FALSE"))
+        for capability, supported in support.items()
+    ]))
+    for platform, support in platform_capabilities.items()
+}
 
 def _runner_test_impl(ctx):
     # Generate a runner binary.
@@ -60,8 +69,9 @@ def _syscall_test(
         file_access = "exclusive",
         overlay = False,
         add_uds_tree = False,
-        vfs2 = False,
+        lisafs = True,
         fuse = False,
+        container = None,
         **kwargs):
     # Prepend "runsc" to non-native platform names.
     full_platform = platform if platform == "native" else "runsc_" + platform
@@ -72,10 +82,10 @@ def _syscall_test(
         name += "_shared"
     if overlay:
         name += "_overlay"
-    if vfs2:
-        name += "_vfs2"
-        if fuse:
-            name += "_fuse"
+    if fuse:
+        name += "_fuse"
+    if not lisafs:
+        name += "_p9"
     if network != "none":
         name += "_" + network + "net"
 
@@ -84,7 +94,7 @@ def _syscall_test(
         tags = []
 
     # Add the full_platform and file access in a tag to make it easier to run
-    # all the tests on a specific flavor. Use --test_tag_filters=ptrace,file_shared.
+    # all the tests on a specific flavor. Use --test_tag_filters=runsc_ptrace,file_shared.
     tags = list(tags)
     tags += [full_platform, "file_" + file_access]
 
@@ -103,22 +113,41 @@ def _syscall_test(
     if platform == "native":
         tags.append("nogotsan")
 
-    container = "container" in tags
+    if container == None:
+        # Containerize in the following cases:
+        #  - "container" is explicitly specified as a tag
+        #  - Running tests natively
+        #  - Running tests with host networking
+        container = "container" in tags or network == "host"
+
+    if platform == "native":
+        # The "native" platform supports everything.
+        platform_support = ",".join(sorted([
+            ("%s:TRUE" % key)
+            for key in platform_capabilities[default_platform].keys()
+        ]))
+    else:
+        platform_support = _platform_support_env_vars.get(platform, "")
 
     runner_args = [
         # Arguments are passed directly to runner binary.
         "--platform=" + platform,
+        "--platform-support=" + platform_support,
         "--network=" + network,
         "--use-tmpfs=" + str(use_tmpfs),
         "--file-access=" + file_access,
         "--overlay=" + str(overlay),
         "--add-uds-tree=" + str(add_uds_tree),
-        "--vfs2=" + str(vfs2),
+        "--lisafs=" + str(lisafs),
         "--fuse=" + str(fuse),
         "--strace=" + str(debug),
         "--debug=" + str(debug),
         "--container=" + str(container),
     ]
+
+    # Trace points are platform agnostic, so enable them for ptrace only.
+    if platform == "ptrace":
+        runner_args.append("--trace")
 
     # Call the rule above.
     _runner_test(
@@ -129,16 +158,22 @@ def _syscall_test(
         **kwargs
     )
 
+def all_platforms():
+    """All platforms returns a list of all platforms."""
+    available = dict(platforms.items())
+    available[default_platform] = platforms.get(default_platform, [])
+    return available.items()
+
 def syscall_test(
         test,
         use_tmpfs = False,
         add_overlay = False,
         add_uds_tree = False,
         add_hostinet = False,
-        vfs1 = True,
-        vfs2 = True,
         fuse = False,
+        allow_native = True,
         debug = True,
+        container = None,
         tags = None,
         **kwargs):
     """syscall_test is a macro that will create targets for all platforms.
@@ -149,32 +184,18 @@ def syscall_test(
       add_overlay: add an overlay test.
       add_uds_tree: add a UDS test.
       add_hostinet: add a hostinet test.
-      vfs1: enable VFS1 tests. Could be false only if vfs2 is true.
-      vfs2: enable VFS2 support.
       fuse: enable FUSE support.
+      allow_native: generate a native test variant.
       debug: enable debug output.
+      container: Run the test in a container. If None, determined from other information.
       tags: starting test tags.
       **kwargs: additional test arguments.
     """
     if not tags:
         tags = []
 
-    if vfs2 and vfs1 and not fuse:
-        # Generate a vfs1 plain test. Most testing will now be
-        # biased towards vfs2, with only a single vfs1 case.
-        _syscall_test(
-            test = test,
-            platform = default_platform,
-            use_tmpfs = use_tmpfs,
-            add_uds_tree = add_uds_tree,
-            tags = tags + platforms[default_platform],
-            debug = debug,
-            vfs2 = False,
-            **kwargs
-        )
-
-    if vfs1 and not fuse:
-        # Generate a native test if fuse is not required.
+    if not fuse and allow_native:
+        # Generate a native test if fuse is not required and if it is allowed.
         _syscall_test(
             test = test,
             platform = "native",
@@ -182,10 +203,11 @@ def syscall_test(
             add_uds_tree = add_uds_tree,
             tags = tags,
             debug = debug,
+            container = container,
             **kwargs
         )
 
-    for (platform, platform_tags) in platforms.items():
+    for platform, platform_tags in all_platforms():
         _syscall_test(
             test = test,
             platform = platform,
@@ -193,21 +215,34 @@ def syscall_test(
             add_uds_tree = add_uds_tree,
             tags = platform_tags + tags,
             fuse = fuse,
-            vfs2 = vfs2,
             debug = debug,
+            container = container,
             **kwargs
         )
 
+    # Generate a P9 variant with the default platform.
+    _syscall_test(
+        test = test,
+        platform = default_platform,
+        use_tmpfs = use_tmpfs,
+        add_uds_tree = add_uds_tree,
+        tags = platforms[default_platform] + tags,
+        debug = debug,
+        fuse = fuse,
+        container = container,
+        lisafs = False,
+        **kwargs
+    )
     if add_overlay:
         _syscall_test(
             test = test,
             platform = default_platform,
             use_tmpfs = use_tmpfs,
             add_uds_tree = add_uds_tree,
-            tags = platforms[default_platform] + tags,
+            tags = platforms.get(default_platform, []) + tags,
             debug = debug,
             fuse = fuse,
-            vfs2 = vfs2,
+            container = container,
             overlay = True,
             **kwargs
         )
@@ -218,10 +253,10 @@ def syscall_test(
             use_tmpfs = use_tmpfs,
             network = "host",
             add_uds_tree = add_uds_tree,
-            tags = platforms[default_platform] + tags,
+            tags = platforms.get(default_platform, []) + tags,
             debug = debug,
             fuse = fuse,
-            vfs2 = vfs2,
+            container = container,
             **kwargs
         )
     if not use_tmpfs:
@@ -231,10 +266,10 @@ def syscall_test(
             platform = default_platform,
             use_tmpfs = use_tmpfs,
             add_uds_tree = add_uds_tree,
-            tags = platforms[default_platform] + tags,
+            tags = platforms.get(default_platform, []) + tags,
             debug = debug,
+            container = container,
             file_access = "shared",
             fuse = fuse,
-            vfs2 = vfs2,
             **kwargs
         )

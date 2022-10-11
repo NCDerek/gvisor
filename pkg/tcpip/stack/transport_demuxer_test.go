@@ -21,8 +21,9 @@ import (
 	"strconv"
 	"testing"
 
+	"gvisor.dev/gvisor/pkg/bufferv2"
 	"gvisor.dev/gvisor/pkg/tcpip"
-	"gvisor.dev/gvisor/pkg/tcpip/buffer"
+	"gvisor.dev/gvisor/pkg/tcpip/checksum"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/link/channel"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
@@ -35,7 +36,7 @@ import (
 
 const (
 	testSrcAddrV6 = "\x0a\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01"
-	testDstAddrV6 = "\x0a\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02"
+	testDstAddrV6 = tcpip.Address("\x0a\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02")
 
 	testSrcAddrV4 = "\x0a\x00\x00\x01"
 	testDstAddrV4 = "\x0a\x00\x00\x02"
@@ -64,12 +65,20 @@ func newDualTestContextMultiNIC(t *testing.T, mtu uint32, linkEpIDs []tcpip.NICI
 		}
 		linkEps[linkEpID] = channelEp
 
-		if err := s.AddAddress(linkEpID, ipv4.ProtocolNumber, testDstAddrV4); err != nil {
-			t.Fatalf("AddAddress IPv4 failed: %s", err)
+		protocolAddrV4 := tcpip.ProtocolAddress{
+			Protocol:          ipv4.ProtocolNumber,
+			AddressWithPrefix: tcpip.Address(testDstAddrV4).WithPrefix(),
+		}
+		if err := s.AddProtocolAddress(linkEpID, protocolAddrV4, stack.AddressProperties{}); err != nil {
+			t.Fatalf("AddProtocolAddress(%d, %+v, {}): %s", linkEpID, protocolAddrV4, err)
 		}
 
-		if err := s.AddAddress(linkEpID, ipv6.ProtocolNumber, testDstAddrV6); err != nil {
-			t.Fatalf("AddAddress IPv6 failed: %s", err)
+		protocolAddrV6 := tcpip.ProtocolAddress{
+			Protocol:          ipv6.ProtocolNumber,
+			AddressWithPrefix: testDstAddrV6.WithPrefix(),
+		}
+		if err := s.AddProtocolAddress(linkEpID, protocolAddrV6, stack.AddressProperties{}); err != nil {
+			t.Fatalf("AddProtocolAddress(%d, %+v, {}): %s", linkEpID, protocolAddrV6, err)
 		}
 	}
 
@@ -98,7 +107,7 @@ func newPayload() []byte {
 }
 
 func (c *testContext) sendV4Packet(payload []byte, h *headers, linkEpID tcpip.NICID) {
-	buf := buffer.NewView(header.UDPMinimumSize + header.IPv4MinimumSize + len(payload))
+	buf := make([]byte, header.UDPMinimumSize+header.IPv4MinimumSize+len(payload))
 	payloadStart := len(buf) - len(payload)
 	copy(buf[payloadStart:], payload)
 
@@ -126,19 +135,19 @@ func (c *testContext) sendV4Packet(payload []byte, h *headers, linkEpID tcpip.NI
 	xsum := header.PseudoHeaderChecksum(udp.ProtocolNumber, testSrcAddrV4, testDstAddrV4, uint16(len(u)))
 
 	// Calculate the UDP checksum and set it.
-	xsum = header.Checksum(payload, xsum)
+	xsum = checksum.Checksum(payload, xsum)
 	u.SetChecksum(^u.CalculateChecksum(xsum))
 
 	// Inject packet.
 	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
-		Data: buf.ToVectorisedView(),
+		Payload: bufferv2.MakeWithData(buf),
 	})
 	c.linkEps[linkEpID].InjectInbound(ipv4.ProtocolNumber, pkt)
 }
 
 func (c *testContext) sendV6Packet(payload []byte, h *headers, linkEpID tcpip.NICID) {
 	// Allocate a buffer for data and headers.
-	buf := buffer.NewView(header.UDPMinimumSize + header.IPv6MinimumSize + len(payload))
+	buf := make([]byte, header.UDPMinimumSize+header.IPv6MinimumSize+len(payload))
 	copy(buf[len(buf)-len(payload):], payload)
 
 	// Initialize the IP header.
@@ -163,12 +172,12 @@ func (c *testContext) sendV6Packet(payload []byte, h *headers, linkEpID tcpip.NI
 	xsum := header.PseudoHeaderChecksum(udp.ProtocolNumber, testSrcAddrV6, testDstAddrV6, uint16(len(u)))
 
 	// Calculate the UDP checksum and set it.
-	xsum = header.Checksum(payload, xsum)
+	xsum = checksum.Checksum(payload, xsum)
 	u.SetChecksum(^u.CalculateChecksum(xsum))
 
 	// Inject packet.
 	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
-		Data: buf.ToVectorisedView(),
+		Payload: bufferv2.MakeWithData(buf),
 	})
 	c.linkEps[linkEpID].InjectInbound(ipv6.ProtocolNumber, pkt)
 }
@@ -345,8 +354,8 @@ func TestBindToDeviceDistribution(t *testing.T) {
 					for i, endpoint := range test.endpoints {
 						// Try to receive the data.
 						wq := waiter.Queue{}
-						we, ch := waiter.NewChannelEntry(nil)
-						wq.EventRegister(&we, waiter.ReadableEvents)
+						we, ch := waiter.NewChannelEntry(waiter.ReadableEvents)
+						wq.EventRegister(&we)
 						t.Cleanup(func() {
 							wq.EventUnregister(&we)
 							close(ch)

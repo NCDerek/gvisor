@@ -19,139 +19,245 @@ import (
 	"testing"
 
 	"gvisor.dev/gvisor/pkg/context"
+	pb "gvisor.dev/gvisor/pkg/sentry/seccheck/points/points_go_proto"
 )
 
-type testChecker struct {
-	CheckerDefaults
+type testSink struct {
+	SinkDefaults
 
-	onClone func(ctx context.Context, mask CloneFieldSet, info CloneInfo) error
+	onClone func(ctx context.Context, fields FieldSet, info *pb.CloneInfo) error
 }
 
-// Clone implements Checker.Clone.
-func (c *testChecker) Clone(ctx context.Context, mask CloneFieldSet, info CloneInfo) error {
+// Name implements Sink.Name.
+func (c *testSink) Name() string {
+	return "test-sink"
+}
+
+// Clone implements Sink.Clone.
+func (c *testSink) Clone(ctx context.Context, fields FieldSet, info *pb.CloneInfo) error {
 	if c.onClone == nil {
 		return nil
 	}
-	return c.onClone(ctx, mask, info)
+	return c.onClone(ctx, fields, info)
 }
 
-func TestNoChecker(t *testing.T) {
-	var s state
+func TestNoSink(t *testing.T) {
+	var s State
 	if s.Enabled(PointClone) {
 		t.Errorf("Enabled(PointClone): got true, wanted false")
 	}
 }
 
-func TestCheckerNotRegisteredForPoint(t *testing.T) {
-	var s state
-	s.AppendChecker(&testChecker{}, &CheckerReq{})
+func TestSinkNotRegisteredForPoint(t *testing.T) {
+	var s State
+	s.AppendSink(&testSink{}, nil)
 	if s.Enabled(PointClone) {
 		t.Errorf("Enabled(PointClone): got true, wanted false")
 	}
 }
 
-func TestCheckerRegistered(t *testing.T) {
-	var s state
-	checkerCalled := false
-	s.AppendChecker(&testChecker{onClone: func(ctx context.Context, mask CloneFieldSet, info CloneInfo) error {
-		checkerCalled = true
-		return nil
-	}}, &CheckerReq{
-		Points: []Point{PointClone},
-		Clone: CloneFields{
-			Credentials: true,
+func TestSinkRegistered(t *testing.T) {
+	var s State
+	sinkCalled := false
+	sink := &testSink{
+		onClone: func(context.Context, FieldSet, *pb.CloneInfo) error {
+			sinkCalled = true
+			return nil
 		},
-	})
+	}
+	req := []PointReq{
+		{
+			Pt:     PointClone,
+			Fields: FieldSet{Context: MakeFieldMask(FieldCtxtCredentials)},
+		},
+	}
+	s.AppendSink(sink, req)
 
 	if !s.Enabled(PointClone) {
 		t.Errorf("Enabled(PointClone): got false, wanted true")
 	}
-	if !s.CloneReq().Contains(CloneFieldCredentials) {
-		t.Errorf("CloneReq().Contains(CloneFieldCredentials): got false, wanted true")
+	fields := s.GetFieldSet(PointClone)
+	if !fields.Context.Contains(FieldCtxtCredentials) {
+		t.Errorf("fields.Context.Contains(PointContextCredentials): got false, wanted true")
 	}
-	if err := s.Clone(context.Background(), CloneFieldSet{}, &CloneInfo{}); err != nil {
+	if err := s.SentToSinks(func(c Sink) error {
+		return c.Clone(context.Background(), fields, &pb.CloneInfo{})
+	}); err != nil {
 		t.Errorf("Clone(): got %v, wanted nil", err)
 	}
-	if !checkerCalled {
-		t.Errorf("Clone() did not call Checker.Clone()")
+	if !sinkCalled {
+		t.Errorf("Clone() did not call Sink.Clone()")
 	}
 }
 
-func TestMultipleCheckersRegistered(t *testing.T) {
-	var s state
-	checkersCalled := [2]bool{}
-	s.AppendChecker(&testChecker{onClone: func(ctx context.Context, mask CloneFieldSet, info CloneInfo) error {
-		checkersCalled[0] = true
-		return nil
-	}}, &CheckerReq{
-		Points: []Point{PointClone},
-		Clone: CloneFields{
-			Args: true,
+func TestMultipleSinksRegistered(t *testing.T) {
+	var s State
+	sinkCalled := [2]bool{}
+	sink := &testSink{
+		onClone: func(context.Context, FieldSet, *pb.CloneInfo) error {
+			sinkCalled[0] = true
+			return nil
 		},
-	})
-	s.AppendChecker(&testChecker{onClone: func(ctx context.Context, mask CloneFieldSet, info CloneInfo) error {
-		checkersCalled[1] = true
+	}
+	reqs := []PointReq{
+		{Pt: PointClone},
+	}
+	s.AppendSink(sink, reqs)
+
+	sink = &testSink{onClone: func(context.Context, FieldSet, *pb.CloneInfo) error {
+		sinkCalled[1] = true
 		return nil
-	}}, &CheckerReq{
-		Points: []Point{PointClone},
-		Clone: CloneFields{
-			Created: TaskFields{
-				ThreadID: true,
-			},
-		},
-	})
+	}}
+	reqs = []PointReq{
+		{Pt: PointClone},
+	}
+	s.AppendSink(sink, reqs)
 
 	if !s.Enabled(PointClone) {
 		t.Errorf("Enabled(PointClone): got false, wanted true")
 	}
 	// CloneReq() should return the union of requested fields from all calls to
-	// AppendChecker.
-	req := s.CloneReq()
-	if !req.Contains(CloneFieldArgs) {
-		t.Errorf("req.Contains(CloneFieldArgs): got false, wanted true")
-	}
-	if !req.Created.Contains(TaskFieldThreadID) {
-		t.Errorf("req.Created.Contains(TaskFieldThreadID): got false, wanted true")
-	}
-	if err := s.Clone(context.Background(), CloneFieldSet{}, &CloneInfo{}); err != nil {
+	// AppendSink.
+	fields := s.GetFieldSet(PointClone)
+	if err := s.SentToSinks(func(c Sink) error {
+		return c.Clone(context.Background(), fields, &pb.CloneInfo{})
+	}); err != nil {
 		t.Errorf("Clone(): got %v, wanted nil", err)
 	}
-	for i := range checkersCalled {
-		if !checkersCalled[i] {
-			t.Errorf("Clone() did not call Checker.Clone() index %d", i)
+	for i := range sinkCalled {
+		if !sinkCalled[i] {
+			t.Errorf("Clone() did not call Sink.Clone() index %d", i)
 		}
 	}
 }
 
-func TestCheckpointReturnsFirstCheckerError(t *testing.T) {
-	errFirstChecker := errors.New("first Checker error")
-	errSecondChecker := errors.New("second Checker error")
+func TestCheckpointReturnsFirstSinkError(t *testing.T) {
+	errFirstSink := errors.New("first Sink error")
+	errSecondSink := errors.New("second Sink error")
 
-	var s state
-	checkersCalled := [2]bool{}
-	s.AppendChecker(&testChecker{onClone: func(ctx context.Context, mask CloneFieldSet, info CloneInfo) error {
-		checkersCalled[0] = true
-		return errFirstChecker
-	}}, &CheckerReq{
-		Points: []Point{PointClone},
-	})
-	s.AppendChecker(&testChecker{onClone: func(ctx context.Context, mask CloneFieldSet, info CloneInfo) error {
-		checkersCalled[1] = true
-		return errSecondChecker
-	}}, &CheckerReq{
-		Points: []Point{PointClone},
-	})
+	var s State
+	sinkCalled := [2]bool{}
+	sink := &testSink{
+		onClone: func(context.Context, FieldSet, *pb.CloneInfo) error {
+			sinkCalled[0] = true
+			return errFirstSink
+		},
+	}
+	reqs := []PointReq{
+		{Pt: PointClone},
+	}
+
+	s.AppendSink(sink, reqs)
+
+	sink = &testSink{
+		onClone: func(context.Context, FieldSet, *pb.CloneInfo) error {
+			sinkCalled[1] = true
+			return errSecondSink
+		},
+	}
+	s.AppendSink(sink, reqs)
 
 	if !s.Enabled(PointClone) {
 		t.Errorf("Enabled(PointClone): got false, wanted true")
 	}
-	if err := s.Clone(context.Background(), CloneFieldSet{}, &CloneInfo{}); err != errFirstChecker {
-		t.Errorf("Clone(): got %v, wanted %v", err, errFirstChecker)
+	if err := s.SentToSinks(func(c Sink) error {
+		return c.Clone(context.Background(), FieldSet{}, &pb.CloneInfo{})
+	}); err != errFirstSink {
+		t.Errorf("Clone(): got %v, wanted %v", err, errFirstSink)
 	}
-	if !checkersCalled[0] {
-		t.Errorf("Clone() did not call first Checker")
+	if !sinkCalled[0] {
+		t.Errorf("Clone() did not call first Sink")
 	}
-	if checkersCalled[1] {
-		t.Errorf("Clone() called second Checker")
+	if sinkCalled[1] {
+		t.Errorf("Clone() called second Sink")
+	}
+}
+
+func TestFieldMaskEmpty(t *testing.T) {
+	fd := FieldMask{}
+	if !fd.Empty() {
+		t.Errorf("new FieldMask must be empty: %+v", fd)
+	}
+}
+
+func TestFieldMaskMake(t *testing.T) {
+	zero := Field(0)
+	one := Field(1)
+	two := Field(2)
+	fd := MakeFieldMask(zero, two)
+	if fd.Empty() {
+		t.Errorf("FieldMask must not be empty: %+v", fd)
+	}
+	if want := zero; !fd.Contains(want) {
+		t.Errorf("FieldMask must contain %v: %+v", want, fd)
+	}
+	if want := two; !fd.Contains(want) {
+		t.Errorf("FieldMask must contain %v: %+v", want, fd)
+	}
+	if want := one; fd.Contains(want) {
+		t.Errorf("FieldMask must not contain %v: %+v", want, fd)
+	}
+}
+
+func TestFieldMask(t *testing.T) {
+	zero := Field(0)
+	one := Field(1)
+	two := Field(2)
+	fd := FieldMask{}
+
+	fd.Add(zero)
+	if fd.Empty() {
+		t.Errorf("FieldMask must not be empty: %+v", fd)
+	}
+	if want := zero; !fd.Contains(want) {
+		t.Errorf("FieldMask must contain %v: %+v", want, fd)
+	}
+	if want := one; fd.Contains(want) {
+		t.Errorf("FieldMask must not contain %v: %+v", want, fd)
+	}
+	if want := two; fd.Contains(want) {
+		t.Errorf("FieldMask must not contain %v: %+v", want, fd)
+	}
+
+	fd.Add(two)
+	if fd.Empty() {
+		t.Errorf("FieldMask must not be empty: %+v", fd)
+	}
+	if want := zero; !fd.Contains(want) {
+		t.Errorf("FieldMask must contain %v: %+v", want, fd)
+	}
+	if want := one; fd.Contains(want) {
+		t.Errorf("FieldMask must not contain %v: %+v", want, fd)
+	}
+	if want := two; !fd.Contains(want) {
+		t.Errorf("FieldMask must contain %v: %+v", want, fd)
+	}
+
+	fd.Remove(zero)
+	if fd.Empty() {
+		t.Errorf("FieldMask must not be empty: %+v", fd)
+	}
+	if want := zero; fd.Contains(want) {
+		t.Errorf("FieldMask must not contain %v: %+v", want, fd)
+	}
+	if want := one; fd.Contains(want) {
+		t.Errorf("FieldMask must not contain %v: %+v", want, fd)
+	}
+	if want := two; !fd.Contains(want) {
+		t.Errorf("FieldMask must contain %v: %+v", want, fd)
+	}
+
+	fd.Remove(two)
+	if !fd.Empty() {
+		t.Errorf("FieldMask must be empty: %+v", fd)
+	}
+	if want := zero; fd.Contains(want) {
+		t.Errorf("FieldMask must not contain %v: %+v", want, fd)
+	}
+	if want := one; fd.Contains(want) {
+		t.Errorf("FieldMask must not contain %v: %+v", want, fd)
+	}
+	if want := two; fd.Contains(want) {
+		t.Errorf("FieldMask must not contain %v: %+v", want, fd)
 	}
 }

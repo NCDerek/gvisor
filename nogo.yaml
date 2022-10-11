@@ -48,8 +48,23 @@ global:
       - "duplicate import"
       # These will never be annotated.
       - "unexpected call to atomic function"
+      - "may require checklocks annotation for"
       # Generated proto code creates declarations like 'var start int = iNdEx'
       - "should omit type .* from declaration; it will be inferred from the right-hand side"
+  external:
+    suppress:
+      # buildssa can't handle certain packages (cmd/...).
+      - "panic recovered: interface conversion: types.Type is nil"
+      - "panic recovered: runtime error: invalid memory address or nil"
+      - "panic recovered: no type for \\*ast.CallExpr"
+      - "panic recovered: interface conversion: types.Type is \\*types.Basic"
+      - "panic recovered: no type for \\*ast.BinaryExpr"
+      - "panic recovered: no type for \\*ast.SelectorExpr"
+      - "panic recovered: no types.Object for ast.Ident SetTypeErrors"
+      - "panic recovered: unexpected CompositeLit type: invalid type"
+    exclude:
+      - ".*/vet/testdata/.*"
+      - ".*/runtime/testdata/.*"
   internal:
     suppress:
       # We use ALL_CAPS for system definitions,
@@ -63,9 +78,11 @@ global:
       - "unexpected call to atomic function.*"
       - "return with unexpected locks held.*"
       - "incompatible return states.*"
+      - "may require checklocks annotation for.*"
     exclude:
       # Generated: exempt all.
       - pkg/shim/runtimeoptions/runtimeoptions_cri.go
+      - pkg/shim/runtimeoptions/v14/runtimeoptions_cri.go
 analyzers:
   asmdecl:
     external: # Enabled.
@@ -97,6 +114,9 @@ analyzers:
       exclude: [".*"]
   errorsas:
     external: # Enabled.
+      exclude:
+        # Specific broken case.
+        - ".*/cmd/go/internal/modload/list.go"
   httpresponse:
     external: # Enabled.
   loopclosure:
@@ -108,8 +128,11 @@ analyzers:
       exclude:
         - pkg/sentry/platform/kvm/kvm_test.go # Intentional.
         - tools/bigquery/bigquery.go          # False positive.
+        - "-"                                 # No filename.
   printf:
     external: # Enabled.
+      suppress:
+        - "fmt.Fprintln arg list ends with redundant newline"
   shift:
     generated: # Disabled for generated code; these shifts are well-defined.
       exclude: [".*"]
@@ -152,6 +175,10 @@ analyzers:
     external: # Enabled.
   checkescape:
     external: # Enabled.
+      suppress:
+        # External libraries may not have binaries (e.g. stdlib testdata, etc.),
+        # so these cases can be safely ignored.
+        - "no such file or directory"
   checklinkname:
     external: # Enabled.
       suppress:
@@ -163,6 +190,8 @@ analyzers:
         # targets in the standard library, so we still need to run
         # checklinkname on stdlib generally.
         - "linkname to unknown symbol"
+      exclude:
+        - ".*/containerd/sys/subprocess_unsafe_linux.go"
   SA1019: # Use of deprecated identifier.
     # disable for now due to misattribution from golang.org/issue/44195.
     generated:
@@ -179,12 +208,6 @@ analyzers:
     internal:
       exclude:
         - pkg/gohacks/gohacks_unsafe.go # x ^ 0 always equals x.
-  SA5011: # Possible nil pointer dereference.
-    internal:
-      exclude:
-        # https://github.com/dominikh/go-tools/issues/924
-        - pkg/sentry/fs/fdpipe/pipe_opener_test.go
-        - pkg/tcpip/tests/integration/link_resolution_test.go
   ST1019: # Multiple imports of the same package.
     generated:
       exclude:
@@ -195,3 +218,7 @@ analyzers:
       suppress:
         - "comment on exported type Translation" # Intentional.
         - "comment on exported type PinnedRange" # Intentional.
+  ST1016: # CheckReceiverNamesIdentical
+    internal:
+      exclude:
+        - pkg/tcpip/stack/packet_buffer.go # TODO(b/233086175): Remove.

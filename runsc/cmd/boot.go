@@ -16,6 +16,7 @@ package cmd
 
 import (
 	"context"
+	"io/ioutil"
 	"os"
 	"runtime/debug"
 	"strings"
@@ -23,11 +24,14 @@ import (
 	"github.com/google/subcommands"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/coretag"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 	"gvisor.dev/gvisor/runsc/boot"
+	"gvisor.dev/gvisor/runsc/cmd/util"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/flag"
+	"gvisor.dev/gvisor/runsc/profile"
 	"gvisor.dev/gvisor/runsc/specutils"
 )
 
@@ -79,6 +83,10 @@ type Boot struct {
 	// sandbox (e.g. gofer) and sent through this FD.
 	mountsFD int
 
+	podInitConfigFD int
+
+	sinkFDs intFlags
+
 	// pidns is set if the sandbox is in its own pid namespace.
 	pidns bool
 
@@ -86,6 +94,13 @@ type Boot struct {
 	// terminates. This flag is set when the command execve's itself because
 	// parent death signal doesn't propagate through execve when uid/gid changes.
 	attached bool
+
+	// productName is the value to show in
+	// /sys/devices/virtual/dmi/id/product_name.
+	productName string
+
+	// FDs for profile data.
+	profileFDs profile.FDArgs
 }
 
 // Name implements subcommands.Command.Name.
@@ -95,7 +110,7 @@ func (*Boot) Name() string {
 
 // Synopsis implements subcommands.Command.Synopsis.
 func (*Boot) Synopsis() string {
-	return "launch a sandbox process (internal use only)"
+	return "launch a sandbox process"
 }
 
 // Usage implements subcommands.Command.Usage.
@@ -106,20 +121,28 @@ func (*Boot) Usage() string {
 // SetFlags implements subcommands.Command.SetFlags.
 func (b *Boot) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&b.bundleDir, "bundle", "", "required path to the root of the bundle directory")
-	f.IntVar(&b.specFD, "spec-fd", -1, "required fd with the container spec")
-	f.IntVar(&b.controllerFD, "controller-fd", -1, "required FD of a stream socket for the control server that must be donated to this process")
-	f.IntVar(&b.deviceFD, "device-fd", -1, "FD for the platform device file")
-	f.Var(&b.ioFDs, "io-fds", "list of FDs to connect 9P clients. They must follow this order: root first, then mounts as defined in the spec")
-	f.Var(&b.stdioFDs, "stdio-fds", "list of FDs containing sandbox stdin, stdout, and stderr in that order")
 	f.BoolVar(&b.applyCaps, "apply-caps", false, "if true, apply capabilities defined in the spec to the process")
 	f.BoolVar(&b.setUpRoot, "setup-root", false, "if true, set up an empty root for the process")
 	f.BoolVar(&b.pidns, "pidns", false, "if true, the sandbox is in its own PID namespace")
 	f.IntVar(&b.cpuNum, "cpu-num", 0, "number of CPUs to create inside the sandbox")
 	f.Uint64Var(&b.totalMem, "total-memory", 0, "sets the initial amount of total memory to report back to the container")
+	f.BoolVar(&b.attached, "attached", false, "if attached is true, kills the sandbox process when the parent process terminates")
+	f.StringVar(&b.productName, "product-name", "", "value to show in /sys/devices/virtual/dmi/id/product_name")
+
+	// Open FDs that are donated to the sandbox.
+	f.IntVar(&b.specFD, "spec-fd", -1, "required fd with the container spec")
+	f.IntVar(&b.controllerFD, "controller-fd", -1, "required FD of a stream socket for the control server that must be donated to this process")
+	f.IntVar(&b.deviceFD, "device-fd", -1, "FD for the platform device file")
+	f.Var(&b.ioFDs, "io-fds", "list of FDs to connect 9P clients. They must follow this order: root first, then mounts as defined in the spec")
+	f.Var(&b.stdioFDs, "stdio-fds", "list of FDs containing sandbox stdin, stdout, and stderr in that order")
 	f.IntVar(&b.userLogFD, "user-log-fd", 0, "file descriptor to write user logs to. 0 means no logging.")
 	f.IntVar(&b.startSyncFD, "start-sync-fd", -1, "required FD to used to synchronize sandbox startup")
 	f.IntVar(&b.mountsFD, "mounts-fd", -1, "mountsFD is the file descriptor to read list of mounts after they have been resolved (direct paths, no symlinks).")
-	f.BoolVar(&b.attached, "attached", false, "if attached is true, kills the sandbox process when the parent process terminates")
+	f.IntVar(&b.podInitConfigFD, "pod-init-config-fd", -1, "file descriptor to the pod init configuration file.")
+	f.Var(&b.sinkFDs, "sink-fds", "ordered list of file descriptors to be used by the sinks defined in --pod-init-config.")
+
+	// Profiling flags.
+	b.profileFDs.SetFromFlags(f)
 }
 
 // Execute implements subcommands.Command.Execute.  It starts a sandbox in a
@@ -135,29 +158,39 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...interface{}) 
 	// Set traceback level
 	debug.SetTraceback(conf.Traceback)
 
+	if len(b.productName) == 0 {
+		// Do this before chroot takes effect, otherwise we can't read /sys.
+		if product, err := ioutil.ReadFile("/sys/devices/virtual/dmi/id/product_name"); err != nil {
+			log.Warningf("Not setting product_name: %v", err)
+		} else {
+			b.productName = strings.TrimSpace(string(product))
+			log.Infof("Setting product_name: %q", b.productName)
+		}
+	}
+
 	if b.attached {
 		// Ensure this process is killed after parent process terminates when
 		// attached mode is enabled. In the unfortunate event that the parent
 		// terminates before this point, this process leaks.
 		if err := unix.Prctl(unix.PR_SET_PDEATHSIG, uintptr(unix.SIGKILL), 0, 0, 0); err != nil {
-			Fatalf("error setting parent death signal: %v", err)
+			util.Fatalf("error setting parent death signal: %v", err)
 		}
 	}
 
 	if b.setUpRoot {
 		if err := setUpChroot(b.pidns); err != nil {
-			Fatalf("error setting up chroot: %v", err)
+			util.Fatalf("error setting up chroot: %v", err)
 		}
 
 		if !b.applyCaps && !conf.Rootless {
 			// Remove --apply-caps arg to call myself. It has already been done.
-			args := prepareArgs(b.attached, "setup-root")
+			args := b.prepareArgs("setup-root")
 
 			// Note that we've already read the spec from the spec FD, and
 			// we will read it again after the exec call. This works
 			// because the ReadSpecFromFile function seeks to the beginning
 			// of the file before reading.
-			Fatalf("callSelfAsNobody(%v): %v", args, callSelfAsNobody(args))
+			util.Fatalf("callSelfAsNobody(%v): %v", args, callSelfAsNobody(args))
 			panic("unreachable")
 		}
 	}
@@ -167,7 +200,7 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...interface{}) 
 	defer specFile.Close()
 	spec, err := specutils.ReadSpecFromFile(b.bundleDir, specFile, conf)
 	if err != nil {
-		Fatalf("reading spec: %v", err)
+		util.Fatalf("reading spec: %v", err)
 	}
 	specutils.LogSpec(spec)
 
@@ -179,7 +212,7 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...interface{}) 
 
 		gPlatform, err := platform.Lookup(conf.Platform)
 		if err != nil {
-			Fatalf("loading platform: %v", err)
+			util.Fatalf("loading platform: %v", err)
 		}
 		if gPlatform.Requirements().RequiresCapSysPtrace {
 			// Ptrace platform requires extra capabilities.
@@ -191,14 +224,31 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...interface{}) 
 
 		// Remove --apply-caps and --setup-root arg to call myself. Both have
 		// already been done.
-		args := prepareArgs(b.attached, "setup-root", "apply-caps")
+		args := b.prepareArgs("setup-root", "apply-caps")
 
 		// Note that we've already read the spec from the spec FD, and
 		// we will read it again after the exec call. This works
 		// because the ReadSpecFromFile function seeks to the beginning
 		// of the file before reading.
-		Fatalf("setCapsAndCallSelf(%v, %v): %v", args, caps, setCapsAndCallSelf(args, caps))
+		util.Fatalf("setCapsAndCallSelf(%v, %v): %v", args, caps, setCapsAndCallSelf(args, caps))
 		panic("unreachable")
+	}
+
+	// At this point we won't re-execute, so it's safe to limit via rlimits. Any
+	// limit >= 0 works. If the limit is lower than the current number of open
+	// files, then Setrlimit will succeed, and the next open will fail.
+	if conf.FDLimit > -1 {
+		rlimit := unix.Rlimit{
+			Cur: uint64(conf.FDLimit),
+			Max: uint64(conf.FDLimit),
+		}
+		switch err := unix.Setrlimit(unix.RLIMIT_NOFILE, &rlimit); err {
+		case nil:
+		case unix.EPERM:
+			log.Warningf("FD limit %d is higher than the current hard limit or system-wide maximum", conf.FDLimit)
+		default:
+			util.Fatalf("Failed to set RLIMIT_NOFILE: %v", err)
+		}
 	}
 
 	// Read resolved mount list and replace the original one from the spec.
@@ -206,27 +256,48 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...interface{}) 
 	cleanMounts, err := specutils.ReadMounts(mountsFile)
 	if err != nil {
 		mountsFile.Close()
-		Fatalf("Error reading mounts file: %v", err)
+		util.Fatalf("Error reading mounts file: %v", err)
 	}
 	mountsFile.Close()
 	spec.Mounts = cleanMounts
 
+	if conf.EnableCoreTags {
+		if err := coretag.Enable(); err != nil {
+			util.Fatalf("Failed to core tag sentry: %v", err)
+		}
+
+		// Verify that all sentry threads are properly core tagged, and log
+		// current core tag.
+		coreTags, err := coretag.GetAllCoreTags(os.Getpid())
+		if err != nil {
+			util.Fatalf("Failed read current core tags: %v", err)
+		}
+		if len(coreTags) != 1 {
+			util.Fatalf("Not all child threads were core tagged the same. Tags=%v", coreTags)
+		}
+		log.Infof("Core tag enabled (core tag=%d)", coreTags[0])
+	}
+
 	// Create the loader.
 	bootArgs := boot.Args{
-		ID:           f.Arg(0),
-		Spec:         spec,
-		Conf:         conf,
-		ControllerFD: b.controllerFD,
-		Device:       os.NewFile(uintptr(b.deviceFD), "platform device"),
-		GoferFDs:     b.ioFDs.GetArray(),
-		StdioFDs:     b.stdioFDs.GetArray(),
-		NumCPU:       b.cpuNum,
-		TotalMem:     b.totalMem,
-		UserLogFD:    b.userLogFD,
+		ID:              f.Arg(0),
+		Spec:            spec,
+		Conf:            conf,
+		ControllerFD:    b.controllerFD,
+		Device:          os.NewFile(uintptr(b.deviceFD), "platform device"),
+		GoferFDs:        b.ioFDs.GetArray(),
+		StdioFDs:        b.stdioFDs.GetArray(),
+		NumCPU:          b.cpuNum,
+		TotalMem:        b.totalMem,
+		UserLogFD:       b.userLogFD,
+		ProductName:     b.productName,
+		PodInitConfigFD: b.podInitConfigFD,
+		SinkFDs:         b.sinkFDs.GetArray(),
+		ProfileOpts:     b.profileFDs.ToOpts(),
 	}
 	l, err := boot.New(bootArgs)
 	if err != nil {
-		Fatalf("creating loader: %v", err)
+		util.Fatalf("creating loader: %v", err)
 	}
 
 	// Fatalf exits the process and doesn't run defers.
@@ -238,7 +309,7 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...interface{}) 
 	buf := make([]byte, 1)
 	if w, err := startSyncFile.Write(buf); err != nil || w != 1 {
 		l.Destroy()
-		Fatalf("unable to write into the start-sync descriptor: %v", err)
+		util.Fatalf("unable to write into the start-sync descriptor: %v", err)
 	}
 	// Closes startSyncFile because 'l.Run()' only returns when the sandbox exits.
 	startSyncFile.Close()
@@ -249,7 +320,7 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...interface{}) 
 	// Run the application and wait for it to finish.
 	if err := l.Run(); err != nil {
 		l.Destroy()
-		Fatalf("running sandbox: %v", err)
+		util.Fatalf("running sandbox: %v", err)
 	}
 
 	ws := l.WaitExit()
@@ -260,7 +331,7 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...interface{}) 
 	return subcommands.ExitSuccess
 }
 
-func prepareArgs(attached bool, exclude ...string) []string {
+func (b *Boot) prepareArgs(exclude ...string) []string {
 	var args []string
 	for _, arg := range os.Args {
 		for _, excl := range exclude {
@@ -269,10 +340,17 @@ func prepareArgs(attached bool, exclude ...string) []string {
 			}
 		}
 		args = append(args, arg)
-		if attached && arg == "boot" {
-			// Strategicaly place "--attached" after the command. This is needed
-			// to ensure the new process is killed when the parent process terminates.
-			args = append(args, "--attached")
+		// Strategically add parameters after the command and before the container
+		// ID at the end.
+		if arg == "boot" {
+			if b.attached {
+				// This is needed to ensure the new process is killed when the parent
+				// process terminates.
+				args = append(args, "--attached")
+			}
+			if len(b.productName) > 0 {
+				args = append(args, "--product-name", b.productName)
+			}
 		}
 	skip:
 	}

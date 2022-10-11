@@ -17,7 +17,6 @@ package kvm
 import (
 	"math/rand"
 	"reflect"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -42,7 +41,7 @@ type testHarness interface {
 
 func kvmTest(t testHarness, setup func(*KVM), fn func(*vCPU) bool) {
 	// Create the machine.
-	deviceFile, err := OpenDevice()
+	deviceFile, err := OpenDevice("")
 	if err != nil {
 		t.Fatalf("error opening device file: %v", err)
 	}
@@ -88,7 +87,7 @@ func bluepillTest(t testHarness, fn func(*vCPU)) {
 func TestKernelSyscall(t *testing.T) {
 	bluepillTest(t, func(c *vCPU) {
 		redpill() // Leave guest mode.
-		if got := atomic.LoadUint32(&c.state); got != vCPUUser {
+		if got := c.state.Load(); got != vCPUUser {
 			t.Errorf("vCPU not in ready state: got %v", got)
 		}
 	})
@@ -106,7 +105,7 @@ func TestKernelFault(t *testing.T) {
 	hostFault() // Ensure recovery works.
 	bluepillTest(t, func(c *vCPU) {
 		hostFault()
-		if got := atomic.LoadUint32(&c.state); got != vCPUUser {
+		if got := c.state.Load(); got != vCPUUser {
 			t.Errorf("vCPU not in ready state: got %v", got)
 		}
 	})
@@ -414,7 +413,7 @@ func TestWrongVCPU(t *testing.T) {
 			// Basic test, one then the other.
 			bluepill(c1)
 			bluepill(c2)
-			if c1.guestExits == 0 {
+			if c1.guestExits.Load() == 0 {
 				// Check: vCPU1 will exit due to redpill() in bluepill(c2).
 				// Don't allow the test to proceed if this fails.
 				t.Fatalf("wrong vCPU#1 exits: vCPU1=%+v,vCPU2=%+v", c1, c2)
@@ -426,10 +425,10 @@ func TestWrongVCPU(t *testing.T) {
 				bluepill(c1)
 				bluepill(c2)
 			}
-			if count := c1.guestExits; count < 90 {
+			if count := c1.guestExits.Load(); count < 90 {
 				t.Errorf("wrong vCPU#1 exits: vCPU1=%+v,vCPU2=%+v", c1, c2)
 			}
-			if count := c2.guestExits; count < 90 {
+			if count := c2.guestExits.Load(); count < 90 {
 				t.Errorf("wrong vCPU#2 exits: vCPU1=%+v,vCPU2=%+v", c1, c2)
 			}
 			return false
@@ -459,6 +458,22 @@ func TestRdtsc(t *testing.T) {
 		}
 		i++
 		return i < 100
+	})
+}
+
+func TestKernelVDSO(t *testing.T) {
+	// Note that the target passed here is irrelevant, we never execute SwitchToUser.
+	applicationTest(t, true, testutil.AddrOfGetpid(), func(c *vCPU, regs *arch.Registers, pt *pagetables.PageTables) bool {
+		// iteration does not include machine.Get() / machine.Put().
+		const n = 100
+		for i := 0; i < n; i++ {
+			bluepill(c)
+			time.Now()
+		}
+		if c.guestExits.Load() >= n {
+			t.Errorf("vdso calls trigger vmexit")
+		}
+		return false
 	})
 }
 
@@ -493,6 +508,18 @@ func BenchmarkKernelSyscall(b *testing.B) {
 		// iteration does not include machine.Get() / machine.Put().
 		for i := 0; i < b.N; i++ {
 			testutil.Getpid()
+		}
+		return false
+	})
+}
+
+func BenchmarkKernelVDSO(b *testing.B) {
+	// Note that the target passed here is irrelevant, we never execute SwitchToUser.
+	applicationTest(b, true, testutil.AddrOfGetpid(), func(c *vCPU, regs *arch.Registers, pt *pagetables.PageTables) bool {
+		// iteration does not include machine.Get() / machine.Put().
+		for i := 0; i < b.N; i++ {
+			bluepill(c)
+			time.Now()
 		}
 		return false
 	})

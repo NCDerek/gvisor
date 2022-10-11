@@ -18,9 +18,9 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"sync/atomic"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
@@ -89,17 +89,17 @@ type regularFile struct {
 	// either mutex, while writing requires holding both AND using atomics.
 	// Readers that do not require consistency (like Stat) may read the
 	// value atomically without holding either lock.
-	size uint64
+	size atomicbitops.Uint64
 }
 
 func (fs *filesystem) newRegularFile(kuid auth.KUID, kgid auth.KGID, mode linux.FileMode, parentDir *directory) *inode {
 	file := &regularFile{
 		memFile:         fs.mfp.MemoryFile(),
-		memoryUsageKind: usage.Tmpfs,
+		memoryUsageKind: fs.usage,
 		seals:           linux.F_SEAL_SEAL,
 	}
 	file.inode.init(file, fs, kuid, kgid, linux.S_IFREG|mode, parentDir)
-	file.inode.nlink = 1 // from parent directory
+	file.inode.nlink = atomicbitops.FromUint32(1) // from parent directory
 	return &file.inode
 }
 
@@ -144,7 +144,7 @@ func NewZeroFile(ctx context.Context, creds *auth.Credentials, mount *vfs.Mount,
 	}
 	rf := fd.inode().impl.(*regularFile)
 	rf.memoryUsageKind = usage.Anonymous
-	rf.size = size
+	rf.size.Store(size)
 	return &fd.vfsfd, err
 }
 
@@ -171,9 +171,22 @@ func (rf *regularFile) truncate(newSize uint64) (bool, error) {
 	return rf.truncateLocked(newSize)
 }
 
+// Preconditions:
+//   - rf.inode.mu must be held.
+//   - rf.dataMu must be locked for writing.
+//   - newSize > rf.size.
+func (rf *regularFile) growLocked(newSize uint64) error {
+	// Can we grow the file?
+	if rf.seals&linux.F_SEAL_GROW != 0 {
+		return linuxerr.EPERM
+	}
+	rf.size.Store(newSize)
+	return nil
+}
+
 // Preconditions: rf.inode.mu must be held.
 func (rf *regularFile) truncateLocked(newSize uint64) (bool, error) {
-	oldSize := rf.size
+	oldSize := rf.size.RacyLoad()
 	if newSize == oldSize {
 		// Nothing to do.
 		return false, nil
@@ -182,15 +195,9 @@ func (rf *regularFile) truncateLocked(newSize uint64) (bool, error) {
 	// Need to hold inode.mu and dataMu while modifying size.
 	rf.dataMu.Lock()
 	if newSize > oldSize {
-		// Can we grow the file?
-		if rf.seals&linux.F_SEAL_GROW != 0 {
-			rf.dataMu.Unlock()
-			return false, linuxerr.EPERM
-		}
-		// We only need to update the file size.
-		atomic.StoreUint64(&rf.size, newSize)
+		err := rf.growLocked(newSize)
 		rf.dataMu.Unlock()
-		return true, nil
+		return err == nil, err
 	}
 
 	// We are shrinking the file. First check if this is allowed.
@@ -199,8 +206,7 @@ func (rf *regularFile) truncateLocked(newSize uint64) (bool, error) {
 		return false, linuxerr.EPERM
 	}
 
-	// Update the file size.
-	atomic.StoreUint64(&rf.size, newSize)
+	rf.size.Store(newSize)
 	rf.dataMu.Unlock()
 
 	// Invalidate past translations of truncated pages.
@@ -219,8 +225,9 @@ func (rf *regularFile) truncateLocked(newSize uint64) (bool, error) {
 	// We are now guaranteed that there are no translations of truncated pages,
 	// and can remove them.
 	rf.dataMu.Lock()
-	rf.data.Truncate(newSize, rf.memFile)
+	decPages := rf.data.Truncate(newSize, rf.memFile)
 	rf.dataMu.Unlock()
+	rf.inode.fs.unaccountPages(decPages)
 	return true, nil
 }
 
@@ -282,7 +289,7 @@ func (rf *regularFile) Translate(ctx context.Context, required, optional memmap.
 
 	// Constrain translations to f.attr.Size (rounded up) to prevent
 	// translation to pages that may be concurrently truncated.
-	pgend := fs.OffsetPageEnd(int64(rf.size))
+	pgend := fs.OffsetPageEnd(int64(rf.size.RacyLoad()))
 	var beyondEOF bool
 	if required.End > pgend {
 		if required.Start >= pgend {
@@ -294,11 +301,28 @@ func (rf *regularFile) Translate(ctx context.Context, required, optional memmap.
 	if optional.End > pgend {
 		optional.End = pgend
 	}
-
-	cerr := rf.data.Fill(ctx, required, optional, rf.size, rf.memFile, rf.memoryUsageKind, func(_ context.Context, dsts safemem.BlockSeq, _ uint64) (uint64, error) {
+	var pagesReqd uint64
+	if rf.inode.fs.maxSizeInPages > 0 {
+		pagesReqd = rf.data.PagesToFill(required, optional)
+		if !rf.inode.fs.accountPages(pagesReqd) {
+			// If we can not accommodate pagesReqd pages, then retry with just
+			// the required range. Because optional may be larger than required.
+			// Only error out if even the required range can not be allocated for.
+			pagesReqd = rf.data.PagesToFill(required, required)
+			if !rf.inode.fs.accountPages(pagesReqd) {
+				return nil, &memmap.BusError{linuxerr.ENOSPC}
+			}
+			optional = required
+		}
+	}
+	pagesAlloced, cerr := rf.data.Fill(ctx, required, optional, rf.size.RacyLoad(), rf.memFile, rf.memoryUsageKind, false /* populate */, func(_ context.Context, dsts safemem.BlockSeq, _ uint64) (uint64, error) {
 		// Newly-allocated pages are zeroed, so we don't need to do anything.
 		return dsts.NumBytes(), nil
 	})
+
+	if rf.inode.fs.maxSizeInPages > 0 {
+		rf.inode.fs.checkFillAllocation(pagesReqd, pagesAlloced)
+	}
 
 	var ts []memmap.Translation
 	var translatedEnd uint64
@@ -350,13 +374,52 @@ func (fd *regularFileFD) Allocate(ctx context.Context, mode, offset, length uint
 
 	f.inode.mu.Lock()
 	defer f.inode.mu.Unlock()
-	oldSize := f.size
-	size := offset + length
-	if oldSize >= size {
+	f.dataMu.Lock()
+	defer f.dataMu.Unlock()
+
+	// We must allocate pages in the range specified by offset and length.
+	// Even if newSize <= oldSize, there might not be actual memory backing this
+	// range, so any gaps must be filled by calling f.data.Fill().
+	// "After a successful call, subsequent writes into the range
+	// specified by offset and len are guaranteed not to fail because of
+	// lack of disk space."  - fallocate(2)
+	newSize := offset + length
+	pgstartaddr := hostarch.Addr(offset).RoundDown()
+	pgendaddr, ok := hostarch.Addr(newSize).RoundUp()
+	if !ok {
+		return linuxerr.EFBIG
+	}
+	required := memmap.MappableRange{Start: uint64(pgstartaddr), End: uint64(pgendaddr)}
+	var pagesReqd uint64
+	if f.inode.fs.maxSizeInPages > 0 {
+		pagesReqd = f.data.PagesToFill(required, required)
+		if !f.inode.fs.accountPages(pagesReqd) {
+			return linuxerr.ENOSPC
+		}
+	}
+	// Pass populate = true here despite the fact that we don't touch these pages
+	// both for consistency with the expected behavior of fallocate(2) and in
+	// expectation of a future write to them.
+	pagesAlloced, err := f.data.Fill(ctx, required, required, newSize, f.memFile, f.memoryUsageKind, true /* populate */, func(_ context.Context, dsts safemem.BlockSeq, _ uint64) (uint64, error) {
+		// Newly-allocated pages are zeroed, so we don't need to do anything.
+		return dsts.NumBytes(), nil
+	})
+	if err != nil && err != io.EOF {
+		if f.inode.fs.maxSizeInPages > 0 {
+			f.inode.fs.unaccountPages(pagesReqd)
+		}
+		return err
+	}
+
+	if f.inode.fs.maxSizeInPages > 0 {
+		f.inode.fs.checkFillAllocation(pagesReqd, pagesAlloced)
+	}
+
+	oldSize := f.size.Load()
+	if oldSize >= newSize {
 		return nil
 	}
-	_, err := f.truncateLocked(size)
-	return err
+	return f.growLocked(newSize)
 }
 
 // PRead implements vfs.FileDescriptionImpl.PRead.
@@ -428,9 +491,10 @@ func (fd *regularFileFD) pwrite(ctx context.Context, src usermem.IOSequence, off
 	// If the file is opened with O_APPEND, update offset to file size.
 	if fd.vfsfd.StatusFlags()&linux.O_APPEND != 0 {
 		// Locking f.inode.mu is sufficient for reading f.size.
-		offset = int64(f.size)
+		offset = int64(f.size.RacyLoad())
 	}
-	if end := offset + srclen; end < offset {
+	end := offset + srclen
+	if end < offset {
 		// Overflow.
 		return 0, offset, linuxerr.EINVAL
 	}
@@ -441,13 +505,15 @@ func (fd *regularFileFD) pwrite(ctx context.Context, src usermem.IOSequence, off
 	}
 	src = src.TakeFirst64(srclen)
 
+	// Perform the write.
 	rw := getRegularFileReadWriter(f, offset)
 	n, err := src.CopyInTo(ctx, rw)
+
 	f.inode.touchCMtimeLocked()
 	for {
-		old := atomic.LoadUint32(&f.inode.mode)
+		old := f.inode.mode.Load()
 		new := vfs.ClearSUIDAndSGID(old)
-		if swapped := atomic.CompareAndSwapUint32(&f.inode.mode, old, new); swapped {
+		if swapped := f.inode.mode.CompareAndSwap(old, new); swapped {
 			break
 		}
 	}
@@ -474,7 +540,7 @@ func (fd *regularFileFD) Seek(ctx context.Context, offset int64, whence int32) (
 	case linux.SEEK_CUR:
 		offset += fd.off
 	case linux.SEEK_END:
-		offset += int64(atomic.LoadUint64(&fd.inode().impl.(*regularFile).size))
+		offset += int64(fd.inode().impl.(*regularFile).size.Load())
 	default:
 		return 0, linuxerr.EINVAL
 	}
@@ -523,7 +589,7 @@ func putRegularFileReadWriter(rw *regularFileReadWriter) {
 func (rw *regularFileReadWriter) ReadToBlocks(dsts safemem.BlockSeq) (uint64, error) {
 	rw.file.dataMu.RLock()
 	defer rw.file.dataMu.RUnlock()
-	size := rw.file.size
+	size := rw.file.size.RacyLoad()
 
 	// Compute the range to read (limited by file size and overflow-checked).
 	if rw.off >= size {
@@ -595,7 +661,7 @@ func (rw *regularFileReadWriter) WriteFromBlocks(srcs safemem.BlockSeq) (uint64,
 	switch {
 	case rw.file.seals&linux.F_SEAL_WRITE != 0: // Write sealed
 		return 0, linuxerr.EPERM
-	case end > rw.file.size && rw.file.seals&linux.F_SEAL_GROW != 0: // Grow sealed
+	case end > rw.file.size.RacyLoad() && rw.file.seals&linux.F_SEAL_GROW != 0: // Grow sealed
 		// When growth is sealed, Linux effectively allows writes which would
 		// normally grow the file to partially succeed up to the current EOF,
 		// rounded down to the page boundary before the EOF.
@@ -610,7 +676,7 @@ func (rw *regularFileReadWriter) WriteFromBlocks(srcs safemem.BlockSeq) (uint64,
 		//
 		// See Linux, mm/filemap.c:generic_perform_write() and
 		// mm/shmem.c:shmem_write_begin().
-		if pgstart := uint64(hostarch.Addr(rw.file.size).RoundDown()); end > pgstart {
+		if pgstart := uint64(hostarch.Addr(rw.file.size.RacyLoad()).RoundDown()); end > pgstart {
 			end = pgstart
 		}
 		if end <= rw.off {
@@ -657,15 +723,26 @@ func (rw *regularFileReadWriter) WriteFromBlocks(srcs safemem.BlockSeq) (uint64,
 		case gap.Ok():
 			// Allocate memory for the write.
 			gapMR := gap.Range().Intersect(pgMR)
-			fr, err := rw.file.memFile.Allocate(gapMR.Length(), rw.file.memoryUsageKind)
+			pagesReqd := gapMR.Length() / hostarch.PageSize
+			pagesAlloced := rw.file.inode.fs.accountPagesPartial(pagesReqd)
+			if pagesAlloced == 0 {
+				if done == 0 {
+					retErr = linuxerr.ENOSPC
+					goto exitLoop
+				}
+				retErr = nil
+				goto exitLoop
+			}
+			gapMR.End = gapMR.Start + (hostarch.PageSize * pagesAlloced)
+			fr, err := rw.file.memFile.Allocate(gapMR.Length(), pgalloc.AllocOpts{Kind: rw.file.memoryUsageKind})
 			if err != nil {
 				retErr = err
+				rw.file.inode.fs.unaccountPages(pagesAlloced)
 				goto exitLoop
 			}
 
 			// Write to that memory as usual.
 			seg, gap = rw.file.data.Insert(gap, gapMR, fr.Start), fsutil.FileRangeGapIterator{}
-
 		default:
 			panic("unreachable")
 		}
@@ -673,8 +750,8 @@ func (rw *regularFileReadWriter) WriteFromBlocks(srcs safemem.BlockSeq) (uint64,
 exitLoop:
 	// If the write ends beyond the file's previous size, it causes the
 	// file to grow.
-	if rw.off > rw.file.size {
-		atomic.StoreUint64(&rw.file.size, rw.off)
+	if rw.off > rw.file.size.RacyLoad() {
+		rw.file.size.Store(rw.off)
 	}
 
 	return done, retErr

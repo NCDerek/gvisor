@@ -54,13 +54,19 @@ doc(
 yaml_test(
     name = "nogo_config_test",
     srcs = glob(["nogo*.yaml"]),
-    schema = "//tools/nogo:config-schema.json",
+    schema = "//tools/nogo/config:schema.json",
 )
 
 yaml_test(
     name = "github_workflows_test",
     srcs = glob([".github/workflows/*.yml"]),
     schema = "@github_workflow_schema//file",
+)
+
+filegroup(
+    name = "buildkite_pipelines",
+    srcs = glob([".buildkite/*.yaml"]),
+    visibility = ["//:sandbox"],
 )
 
 yaml_test(
@@ -118,6 +124,7 @@ go_path(
         "//runsc/cli",
         "//shim/cli",
         "//webhook/pkg/cli",
+        "//tools/checklocks",
 
         # Packages that are not dependencies of the above.
         "//pkg/sentry/kernel/memevent",

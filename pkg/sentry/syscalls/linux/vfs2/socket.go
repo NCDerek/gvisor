@@ -15,15 +15,20 @@
 package vfs2
 
 import (
+	"fmt"
 	"time"
 
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/marshal"
 	"gvisor.dev/gvisor/pkg/marshal/primitive"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
+	"gvisor.dev/gvisor/pkg/sentry/fsimpl/host"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
+	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	ktime "gvisor.dev/gvisor/pkg/sentry/kernel/time"
 	"gvisor.dev/gvisor/pkg/sentry/socket"
 	"gvisor.dev/gvisor/pkg/sentry/socket/control"
@@ -272,7 +277,7 @@ func Connect(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Sysca
 	}
 
 	blocking := (file.StatusFlags() & linux.SOCK_NONBLOCK) == 0
-	return 0, nil, syserr.ConvertIntr(s.Connect(t, a, blocking).ToError(), linuxerr.ERESTARTSYS)
+	return 0, nil, linuxerr.ConvertIntr(s.Connect(t, a, blocking).ToError(), linuxerr.ERESTARTSYS)
 }
 
 // accept is the implementation of the accept syscall. It is called by accept
@@ -303,7 +308,7 @@ func accept(t *kernel.Task, fd int32, addr hostarch.Addr, addrLen hostarch.Addr,
 	peerRequested := addrLen != 0
 	nfd, peer, peerLen, e := s.Accept(t, peerRequested, flags, blocking)
 	if e != nil {
-		return 0, syserr.ConvertIntr(e.ToError(), linuxerr.ERESTARTSYS)
+		return 0, linuxerr.ConvertIntr(e.ToError(), linuxerr.ERESTARTSYS)
 	}
 	if peerRequested {
 		// NOTE(magi): Linux does not give you an error if it can't
@@ -744,6 +749,48 @@ func RecvMMsg(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Sysc
 	return uintptr(count), nil, nil
 }
 
+func getSCMRightsVFS2(t *kernel.Task, rights transport.RightsControlMessage) control.SCMRightsVFS2 {
+	switch v := rights.(type) {
+	case control.SCMRightsVFS2:
+		return v
+	case *transport.SCMRights:
+		rf := control.RightsFilesVFS2(fdsToHostFiles(t, v.FDs))
+		return &rf
+	default:
+		panic(fmt.Sprintf("rights of type %T must be *transport.SCMRights or implement SCMRightsVFS2", rights))
+	}
+}
+
+// If an error is encountered, only files created before the error will be
+// returned. This is what Linux does.
+func fdsToHostFiles(ctx context.Context, fds []int) []*vfs.FileDescription {
+	files := make([]*vfs.FileDescription, 0, len(fds))
+	for _, fd := range fds {
+		// Get flags. We do it here because they may be modified
+		// by subsequent functions.
+		fileFlags, _, errno := unix.Syscall(unix.SYS_FCNTL, uintptr(fd), unix.F_GETFL, 0)
+		if errno != 0 {
+			ctx.Warningf("Error retrieving host FD flags: %v", error(errno))
+			break
+		}
+
+		// Create the file backed by hostFD.
+		file, err := host.NewFD(ctx, kernel.KernelFromContext(ctx).HostMount(), fd, &host.NewFDOptions{})
+		if err != nil {
+			ctx.Warningf("Error creating file from host FD: %v", err)
+			break
+		}
+
+		if err := file.SetStatusFlags(ctx, auth.CredentialsFromContext(ctx), uint32(fileFlags&linux.O_NONBLOCK)); err != nil {
+			ctx.Warningf("Error setting flags on host FD file: %v", err)
+			break
+		}
+
+		files = append(files, file)
+	}
+	return files
+}
+
 func recvSingleMsg(t *kernel.Task, s socket.SocketVFS2, msgPtr hostarch.Addr, flags int32, haveDeadline bool, deadline ktime.Time) (uintptr, error) {
 	// Capture the message header and io vectors.
 	var msg MessageHeader64
@@ -765,7 +812,7 @@ func recvSingleMsg(t *kernel.Task, s socket.SocketVFS2, msgPtr hostarch.Addr, fl
 	if msg.ControlLen == 0 && msg.NameLen == 0 {
 		n, mflags, _, _, cms, err := s.RecvMsg(t, dst, int(flags), haveDeadline, deadline, false, 0)
 		if err != nil {
-			return 0, syserr.ConvertIntr(err.ToError(), linuxerr.ERESTARTSYS)
+			return 0, linuxerr.ConvertIntr(err.ToError(), linuxerr.ERESTARTSYS)
 		}
 		if !cms.Unix.Empty() {
 			mflags |= linux.MSG_CTRUNC
@@ -787,7 +834,7 @@ func recvSingleMsg(t *kernel.Task, s socket.SocketVFS2, msgPtr hostarch.Addr, fl
 	}
 	n, mflags, sender, senderLen, cms, e := s.RecvMsg(t, dst, int(flags), haveDeadline, deadline, msg.NameLen != 0, msg.ControlLen)
 	if e != nil {
-		return 0, syserr.ConvertIntr(e.ToError(), linuxerr.ERESTARTSYS)
+		return 0, linuxerr.ConvertIntr(e.ToError(), linuxerr.ERESTARTSYS)
 	}
 	defer cms.Release(t)
 
@@ -800,6 +847,7 @@ func recvSingleMsg(t *kernel.Task, s socket.SocketVFS2, msgPtr hostarch.Addr, fl
 	}
 
 	if cms.Unix.Rights != nil {
+		cms.Unix.Rights = getSCMRightsVFS2(t, cms.Unix.Rights)
 		controlData, mflags = control.PackRightsVFS2(t, cms.Unix.Rights.(control.SCMRightsVFS2), flags&linux.MSG_CMSG_CLOEXEC != 0, controlData, mflags)
 	}
 
@@ -876,7 +924,7 @@ func recvFrom(t *kernel.Task, fd int32, bufPtr hostarch.Addr, bufLen uint64, fla
 	n, _, sender, senderLen, cm, e := s.RecvMsg(t, dst, int(flags), haveDeadline, deadline, nameLenPtr != 0, 0)
 	cm.Release(t)
 	if e != nil {
-		return 0, syserr.ConvertIntr(e.ToError(), linuxerr.ERESTARTSYS)
+		return 0, linuxerr.ConvertIntr(e.ToError(), linuxerr.ERESTARTSYS)
 	}
 
 	// Copy the address to the caller.

@@ -24,8 +24,9 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"go.uber.org/multierr"
+	"gvisor.dev/gvisor/pkg/bufferv2"
 	"gvisor.dev/gvisor/pkg/tcpip"
-	"gvisor.dev/gvisor/pkg/tcpip/buffer"
+	"gvisor.dev/gvisor/pkg/tcpip/checksum"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 )
 
@@ -215,23 +216,34 @@ func NetworkProtocolNumber(v tcpip.NetworkProtocolNumber) *tcpip.NetworkProtocol
 	return &v
 }
 
+// bodySizeHint describes num of bytes left to parse for the rest of layers.
+type bodySizeHint int
+
+const bodySizeUnknown bodySizeHint = -1
+
 // layerParser parses the input bytes and returns a Layer along with the next
 // layerParser to run. If there is no more parsing to do, the returned
 // layerParser is nil.
-type layerParser func([]byte) (Layer, layerParser)
+type layerParser func([]byte) (Layer, bodySizeHint, layerParser)
 
 // parse parses bytes starting with the first layerParser and using successive
 // layerParsers until all the bytes are parsed.
 func parse(parser layerParser, b []byte) Layers {
 	var layers Layers
 	for {
-		var layer Layer
-		layer, parser = parser(b)
+		layer, hint, next := parser(b)
 		layers = append(layers, layer)
 		if parser == nil {
 			break
 		}
 		b = b[layer.length():]
+		if hint != bodySizeUnknown {
+			b = b[:hint]
+		}
+		if next == nil {
+			break
+		}
+		parser = next
 	}
 	layers.linkLayers()
 	return layers
@@ -239,7 +251,7 @@ func parse(parser layerParser, b []byte) Layers {
 
 // parseEther parses the bytes assuming that they start with an ethernet header
 // and continues parsing further encapsulations.
-func parseEther(b []byte) (Layer, layerParser) {
+func parseEther(b []byte) (Layer, bodySizeHint, layerParser) {
 	h := header.Ethernet(b)
 	ether := Ether{
 		SrcAddr: LinkAddress(h.SourceAddress()),
@@ -256,7 +268,7 @@ func parseEther(b []byte) (Layer, layerParser) {
 		// Assume that the rest is a payload.
 		nextParser = parsePayload
 	}
-	return &ether, nextParser
+	return &ether, bodySizeUnknown, nextParser
 }
 
 func (l *Ether) match(other Layer) bool {
@@ -421,7 +433,7 @@ func Address(v tcpip.Address) *tcpip.Address {
 
 // parseIPv4 parses the bytes assuming that they start with an ipv4 header and
 // continues parsing further encapsulations.
-func parseIPv4(b []byte) (Layer, layerParser) {
+func parseIPv4(b []byte) (Layer, bodySizeHint, layerParser) {
 	h := header.IPv4(b)
 	options := h.Options()
 	tos, _ := h.TOS()
@@ -442,7 +454,7 @@ func parseIPv4(b []byte) (Layer, layerParser) {
 	var nextParser layerParser
 	// If it is a fragment, don't treat it as having a transport protocol.
 	if h.FragmentOffset() != 0 || h.More() {
-		return &ipv4, parsePayload
+		return &ipv4, bodySizeHint(h.PayloadLength()), parsePayload
 	}
 	switch h.TransportProtocol() {
 	case header.TCPProtocolNumber:
@@ -455,7 +467,7 @@ func parseIPv4(b []byte) (Layer, layerParser) {
 		// Assume that the rest is a payload.
 		nextParser = parsePayload
 	}
-	return &ipv4, nextParser
+	return &ipv4, bodySizeHint(h.PayloadLength()), nextParser
 }
 
 func (l *IPv4) match(other Layer) bool {
@@ -555,7 +567,7 @@ func nextIPv6PayloadParser(nextHeader uint8) layerParser {
 
 // parseIPv6 parses the bytes assuming that they start with an ipv6 header and
 // continues parsing further encapsulations.
-func parseIPv6(b []byte) (Layer, layerParser) {
+func parseIPv6(b []byte) (Layer, bodySizeHint, layerParser) {
 	h := header.IPv6(b)
 	tos, flowLabel := h.TOS()
 	ipv6 := IPv6{
@@ -568,7 +580,7 @@ func parseIPv6(b []byte) (Layer, layerParser) {
 		DstAddr:       Address(h.DestinationAddress()),
 	}
 	nextParser := nextIPv6PayloadParser(h.NextHeader())
-	return &ipv6, nextParser
+	return &ipv6, bodySizeHint(h.PayloadLength()), nextParser
 }
 
 func (l *IPv6) match(other Layer) bool {
@@ -727,16 +739,16 @@ func parseIPv6ExtHdr(b []byte) (header.IPv6ExtensionHeaderIdentifier, []byte, la
 
 // parseIPv6HopByHopOptionsExtHdr parses the bytes assuming that they start
 // with an IPv6 HopByHop Options Extension Header.
-func parseIPv6HopByHopOptionsExtHdr(b []byte) (Layer, layerParser) {
+func parseIPv6HopByHopOptionsExtHdr(b []byte) (Layer, bodySizeHint, layerParser) {
 	nextHeader, options, nextParser := parseIPv6ExtHdr(b)
-	return &IPv6HopByHopOptionsExtHdr{NextHeader: &nextHeader, Options: options}, nextParser
+	return &IPv6HopByHopOptionsExtHdr{NextHeader: &nextHeader, Options: options}, bodySizeUnknown, nextParser
 }
 
 // parseIPv6DestinationOptionsExtHdr parses the bytes assuming that they start
 // with an IPv6 Destination Options Extension Header.
-func parseIPv6DestinationOptionsExtHdr(b []byte) (Layer, layerParser) {
+func parseIPv6DestinationOptionsExtHdr(b []byte) (Layer, bodySizeHint, layerParser) {
 	nextHeader, options, nextParser := parseIPv6ExtHdr(b)
-	return &IPv6DestinationOptionsExtHdr{NextHeader: &nextHeader, Options: options}, nextParser
+	return &IPv6DestinationOptionsExtHdr{NextHeader: &nextHeader, Options: options}, bodySizeUnknown, nextParser
 }
 
 // Bool is a helper routine that allocates a new
@@ -747,7 +759,7 @@ func Bool(v bool) *bool {
 
 // parseIPv6FragmentExtHdr parses the bytes assuming that they start
 // with an IPv6 Fragment Extension Header.
-func parseIPv6FragmentExtHdr(b []byte) (Layer, layerParser) {
+func parseIPv6FragmentExtHdr(b []byte) (Layer, bodySizeHint, layerParser) {
 	nextHeader := b[0]
 	var extHdr header.IPv6FragmentExtHdr
 	copy(extHdr[:], b[2:])
@@ -759,9 +771,9 @@ func parseIPv6FragmentExtHdr(b []byte) (Layer, layerParser) {
 	}
 	// If it is a fragment, we can't interpret it.
 	if extHdr.FragmentOffset() != 0 || extHdr.More() {
-		return &fragLayer, parsePayload
+		return &fragLayer, bodySizeUnknown, parsePayload
 	}
-	return &fragLayer, nextIPv6PayloadParser(nextHeader)
+	return &fragLayer, bodySizeUnknown, nextIPv6PayloadParser(nextHeader)
 }
 
 func (l *IPv6HopByHopOptionsExtHdr) length() int {
@@ -871,7 +883,7 @@ func (l *ICMPv6) ToBytes() ([]byte, error) {
 					Header:      h[:header.ICMPv6PayloadOffset],
 					Src:         *ipv6.SrcAddr,
 					Dst:         *ipv6.DstAddr,
-					PayloadCsum: header.Checksum(l.Payload, 0 /* initial */),
+					PayloadCsum: checksum.Checksum(l.Payload, 0 /* initial */),
 					PayloadLen:  len(l.Payload),
 				}))
 				break
@@ -894,7 +906,7 @@ func ICMPv6Code(v header.ICMPv6Code) *header.ICMPv6Code {
 }
 
 // parseICMPv6 parses the bytes assuming that they start with an ICMPv6 header.
-func parseICMPv6(b []byte) (Layer, layerParser) {
+func parseICMPv6(b []byte) (Layer, bodySizeHint, layerParser) {
 	h := header.ICMPv6(b)
 	msgType := h.Type()
 	icmpv6 := ICMPv6{
@@ -909,7 +921,7 @@ func parseICMPv6(b []byte) (Layer, layerParser) {
 	case header.ICMPv6ParamProblem:
 		icmpv6.Pointer = Uint32(h.TypeSpecific())
 	}
-	return &icmpv6, nil
+	return &icmpv6, bodySizeUnknown, nil
 }
 
 func (l *ICMPv6) match(other Layer) bool {
@@ -987,7 +999,7 @@ func (l *ICMPv4) ToBytes() ([]byte, error) {
 	if l.Checksum != nil {
 		h.SetChecksum(*l.Checksum)
 	} else {
-		h.SetChecksum(^header.Checksum(h, 0))
+		h.SetChecksum(^checksum.Checksum(h, 0))
 	}
 
 	return h, nil
@@ -995,7 +1007,7 @@ func (l *ICMPv4) ToBytes() ([]byte, error) {
 
 // parseICMPv4 parses the bytes as an ICMPv4 header, returning a Layer and a
 // parser for the encapsulated payload.
-func parseICMPv4(b []byte) (Layer, layerParser) {
+func parseICMPv4(b []byte) (Layer, bodySizeHint, layerParser) {
 	h := header.ICMPv4(b)
 
 	msgType := h.Type()
@@ -1012,7 +1024,7 @@ func parseICMPv4(b []byte) (Layer, layerParser) {
 	case header.ICMPv4ParamProblem:
 		icmpv4.Pointer = Uint8(h.Pointer())
 	}
-	return &icmpv4, nil
+	return &icmpv4, bodySizeUnknown, nil
 }
 
 func (l *ICMPv4) match(other Layer) bool {
@@ -1078,7 +1090,7 @@ func (l *TCP) ToBytes() ([]byte, error) {
 		h.SetWindowSize(32768)
 	}
 	if l.UrgentPointer != nil {
-		h.SetUrgentPoiner(*l.UrgentPointer)
+		h.SetUrgentPointer(*l.UrgentPointer)
 	}
 	copy(b[header.TCPMinimumSize:], l.Options)
 	header.AddTCPOptionPadding(b[header.TCPMinimumSize:], len(l.Options))
@@ -1102,15 +1114,15 @@ func totalLength(l Layer) int {
 	return totalLength
 }
 
-// payload returns a buffer.VectorisedView of l's payload.
-func payload(l Layer) (buffer.VectorisedView, error) {
-	var payloadBytes buffer.VectorisedView
+// payload returns a bufferv2.Buffer of l's payload.
+func payload(l Layer) (bufferv2.Buffer, error) {
+	var payloadBytes bufferv2.Buffer
 	for current := l.next(); current != nil; current = current.next() {
 		payload, err := current.ToBytes()
 		if err != nil {
-			return buffer.VectorisedView{}, fmt.Errorf("can't get bytes for next header: %s", payload)
+			return bufferv2.Buffer{}, fmt.Errorf("can't get bytes for next header: %s", payload)
 		}
-		payloadBytes.AppendView(payload)
+		payloadBytes.Append(bufferv2.NewViewWithData(payload))
 	}
 	return payloadBytes, nil
 }
@@ -1133,7 +1145,7 @@ func layerChecksum(l Layer, protoNumber tcpip.TransportProtocolNumber) (uint16, 
 	if err != nil {
 		return 0, err
 	}
-	xsum = header.ChecksumVV(payloadBytes, xsum)
+	xsum = checksum.Checksum(payloadBytes.Flatten(), xsum)
 	return xsum, nil
 }
 
@@ -1156,7 +1168,7 @@ func Uint32(v uint32) *uint32 {
 
 // parseTCP parses the bytes assuming that they start with a tcp header and
 // continues parsing further encapsulations.
-func parseTCP(b []byte) (Layer, layerParser) {
+func parseTCP(b []byte) (Layer, bodySizeHint, layerParser) {
 	h := header.TCP(b)
 	tcp := TCP{
 		SrcPort:       Uint16(h.SourcePort()),
@@ -1170,7 +1182,7 @@ func parseTCP(b []byte) (Layer, layerParser) {
 		UrgentPointer: Uint16(h.UrgentPointer()),
 		Options:       b[header.TCPMinimumSize:h.DataOffset()],
 	}
-	return &tcp, parsePayload
+	return &tcp, bodySizeUnknown, parsePayload
 }
 
 func (l *TCP) match(other Layer) bool {
@@ -1245,7 +1257,7 @@ func setUDPChecksum(h *header.UDP, udp *UDP) error {
 
 // parseUDP parses the bytes assuming that they start with a udp header and
 // returns the parsed layer and the next parser to use.
-func parseUDP(b []byte) (Layer, layerParser) {
+func parseUDP(b []byte) (Layer, bodySizeHint, layerParser) {
 	h := header.UDP(b)
 	udp := UDP{
 		SrcPort:  Uint16(h.SourcePort()),
@@ -1253,7 +1265,7 @@ func parseUDP(b []byte) (Layer, layerParser) {
 		Length:   Uint16(h.Length()),
 		Checksum: Uint16(h.Checksum()),
 	}
-	return &udp, parsePayload
+	return &udp, bodySizeUnknown, parsePayload
 }
 
 func (l *UDP) match(other Layer) bool {
@@ -1281,11 +1293,11 @@ func (l *Payload) String() string {
 
 // parsePayload parses the bytes assuming that they start with a payload and
 // continue to the end. There can be no further encapsulations.
-func parsePayload(b []byte) (Layer, layerParser) {
+func parsePayload(b []byte) (Layer, bodySizeHint, layerParser) {
 	payload := Payload{
 		Bytes: b,
 	}
-	return &payload, nil
+	return &payload, bodySizeUnknown, nil
 }
 
 // ToBytes implements Layer.ToBytes.

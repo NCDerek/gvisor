@@ -182,7 +182,6 @@ const (
 	traceCategory = "task"
 	runRegion     = ":run"
 	blockRegion   = ":block"
-	cpuidRegion   = ":cpuid"
 	faultRegion   = ":fault"
 )
 
@@ -191,9 +190,11 @@ const (
 //
 // Preconditions: The task's owning TaskSet.mu must be locked.
 func (t *Task) updateInfoLocked() {
-	// Use the task's TID in the root PID namespace for logging.
+	// Use the task's TID and PID in the root PID namespace for logging.
+	pid := t.tg.pidns.owner.Root.tgids[t.tg]
 	tid := t.tg.pidns.owner.Root.tids[t]
-	t.logPrefix.Store(fmt.Sprintf("[% 4d] ", tid))
+	t.logPrefix.Store(fmt.Sprintf("[% 4d:% 4d] ", pid, tid))
+
 	t.rebuildTraceContext(tid)
 }
 
@@ -249,5 +250,9 @@ func (t *Task) traceExecEvent(image *TaskImage) {
 		return
 	}
 	defer file.DecRef(t)
-	trace.Logf(t.traceContext, traceCategory, "exec: %s", file.PathnameWithDeleted(t))
+
+	// traceExecEvent function may be called before the task goroutine
+	// starts, so we must use the async context.
+	name := file.PathnameWithDeleted(t.AsyncContext())
+	trace.Logf(t.traceContext, traceCategory, "exec: %s", name)
 }

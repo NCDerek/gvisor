@@ -18,15 +18,6 @@ import (
 	"sync"
 )
 
-// unsupportedLockerStruct verifies that trying to annotate a field that is not a
-// sync.Mutex or sync.RWMutex results in a failure.
-type unsupportedLockerStruct struct {
-	mu sync.Locker
-
-	// +checklocks:mu
-	x int // +checklocksfail
-}
-
 // badFieldsStruct verifies that refering invalid fields fails.
 type badFieldsStruct struct {
 	// +checklocks:mu

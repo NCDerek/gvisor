@@ -20,8 +20,8 @@ import (
 	"fmt"
 	"math/rand"
 
+	"gvisor.dev/gvisor/pkg/bufferv2"
 	"gvisor.dev/gvisor/pkg/tcpip"
-	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
@@ -30,7 +30,7 @@ import (
 // to it and can mock errors.
 type MockLinkEndpoint struct {
 	// WrittenPackets is where packets written to the endpoint are stored.
-	WrittenPackets []*stack.PacketBuffer
+	WrittenPackets []stack.PacketBufferPtr
 
 	mtu          uint32
 	err          tcpip.Error
@@ -61,27 +61,17 @@ func (*MockLinkEndpoint) MaxHeaderLength() uint16 { return 0 }
 // LinkAddress implements LinkEndpoint.LinkAddress.
 func (*MockLinkEndpoint) LinkAddress() tcpip.LinkAddress { return "" }
 
-// WritePacket implements LinkEndpoint.WritePacket.
-func (ep *MockLinkEndpoint) WritePacket(_ stack.RouteInfo, _ tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) tcpip.Error {
-	if ep.allowPackets == 0 {
-		return ep.err
-	}
-	ep.allowPackets--
-	ep.WrittenPackets = append(ep.WrittenPackets, pkt)
-	return nil
-}
-
 // WritePackets implements LinkEndpoint.WritePackets.
-func (ep *MockLinkEndpoint) WritePackets(r stack.RouteInfo, pkts stack.PacketBufferList, protocol tcpip.NetworkProtocolNumber) (int, tcpip.Error) {
+func (ep *MockLinkEndpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) {
 	var n int
-
-	for pkt := pkts.Front(); pkt != nil; pkt = pkt.Next() {
-		if err := ep.WritePacket(r, protocol, pkt); err != nil {
-			return n, err
+	for _, pkt := range pkts.AsSlice() {
+		if ep.allowPackets == 0 {
+			return n, ep.err
 		}
+		ep.allowPackets--
+		ep.WrittenPackets = append(ep.WrittenPackets, pkt.IncRef())
 		n++
 	}
-
 	return n, nil
 }
 
@@ -98,12 +88,14 @@ func (*MockLinkEndpoint) Wait() {}
 func (*MockLinkEndpoint) ARPHardwareType() header.ARPHardwareType { return header.ARPHardwareNone }
 
 // AddHeader implements LinkEndpoint.AddHeader.
-func (*MockLinkEndpoint) AddHeader(_, _ tcpip.LinkAddress, _ tcpip.NetworkProtocolNumber, _ *stack.PacketBuffer) {
-}
+func (*MockLinkEndpoint) AddHeader(stack.PacketBufferPtr) {}
 
-// WriteRawPacket implements stack.LinkEndpoint.
-func (*MockLinkEndpoint) WriteRawPacket(*stack.PacketBuffer) tcpip.Error {
-	return &tcpip.ErrNotSupported{}
+// Close releases all resources.
+func (ep *MockLinkEndpoint) Close() {
+	for _, pkt := range ep.WrittenPackets {
+		pkt.DecRef()
+	}
+	ep.WrittenPackets = nil
 }
 
 // MakeRandPkt generates a randomized packet. transportHeaderLength indicates
@@ -111,20 +103,20 @@ func (*MockLinkEndpoint) WriteRawPacket(*stack.PacketBuffer) tcpip.Error {
 // extraHeaderReserveLength indicates how much extra space will be reserved for
 // the other headers. The payload is made from Views of the sizes listed in
 // viewSizes.
-func MakeRandPkt(transportHeaderLength int, extraHeaderReserveLength int, viewSizes []int, proto tcpip.NetworkProtocolNumber) *stack.PacketBuffer {
-	var views buffer.VectorisedView
+func MakeRandPkt(transportHeaderLength int, extraHeaderReserveLength int, viewSizes []int, proto tcpip.NetworkProtocolNumber) stack.PacketBufferPtr {
+	var buf bufferv2.Buffer
 
 	for _, s := range viewSizes {
-		newView := buffer.NewView(s)
-		if _, err := rand.Read(newView); err != nil {
+		newView := bufferv2.NewViewSize(s)
+		if _, err := rand.Read(newView.AsSlice()); err != nil {
 			panic(fmt.Sprintf("rand.Read: %s", err))
 		}
-		views.AppendView(newView)
+		buf.Append(newView)
 	}
 
 	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
 		ReserveHeaderBytes: transportHeaderLength + extraHeaderReserveLength,
-		Data:               views,
+		Payload:            buf,
 	})
 	pkt.NetworkProtocolNumber = proto
 	if _, err := rand.Read(pkt.TransportHeader().Push(transportHeaderLength)); err != nil {

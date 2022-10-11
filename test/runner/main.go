@@ -33,9 +33,11 @@ import (
 	"github.com/syndtr/gocapability/capability"
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/log"
+	"gvisor.dev/gvisor/pkg/sentry/seccheck"
 	"gvisor.dev/gvisor/pkg/test/testutil"
 	"gvisor.dev/gvisor/runsc/specutils"
 	"gvisor.dev/gvisor/test/runner/gtest"
+	"gvisor.dev/gvisor/test/trace/config"
 	"gvisor.dev/gvisor/test/uds"
 )
 
@@ -43,21 +45,39 @@ var (
 	debug              = flag.Bool("debug", false, "enable debug logs")
 	strace             = flag.Bool("strace", false, "enable strace logs")
 	platform           = flag.String("platform", "ptrace", "platform to run on")
+	platformSupport    = flag.String("platform-support", "", "String passed to the test as GVISOR_PLATFORM_SUPPORT environment variable. Used to determine which syscall tests are expected to work with the current platform.")
 	network            = flag.String("network", "none", "network stack to run on (sandbox, host, none)")
 	useTmpfs           = flag.Bool("use-tmpfs", false, "mounts tmpfs for /tmp")
 	fileAccess         = flag.String("file-access", "exclusive", "mounts root in exclusive or shared mode")
 	overlay            = flag.Bool("overlay", false, "wrap filesystem mounts with writable tmpfs overlay")
-	vfs2               = flag.Bool("vfs2", false, "enable VFS2")
 	fuse               = flag.Bool("fuse", false, "enable FUSE")
-	container          = flag.Bool("container", false, "run tests in their own namespaces (user ns, network ns, etc), pretending to be root")
+	lisafs             = flag.Bool("lisafs", true, "enable lisafs protocol if vfs2 is also enabled")
+	container          = flag.Bool("container", false, "run tests in their own namespaces (user ns, network ns, etc), pretending to be root. Implicitly enabled if network=host, or if using network namespaces")
 	setupContainerPath = flag.String("setup-container", "", "path to setup_container binary (for use with --container)")
-	runscPath          = flag.String("runsc", "", "path to runsc binary")
+	trace              = flag.Bool("trace", false, "enables all trace points")
 
 	addUDSTree = flag.Bool("add-uds-tree", false, "expose a tree of UDS utilities for use in tests")
 	// TODO(gvisor.dev/issue/4572): properly support leak checking for runsc, and
 	// set to true as the default for the test runner.
 	leakCheck = flag.Bool("leak-check", false, "check for reference leaks")
 )
+
+const (
+	// Environment variable used by platform_util.cc to determine platform capabilities.
+	platformSupportEnvVar = "GVISOR_PLATFORM_SUPPORT"
+)
+
+// getSetupContainerPath returns the path to the setup_container binary.
+func getSetupContainerPath() string {
+	if *setupContainerPath != "" {
+		return *setupContainerPath
+	}
+	setupContainer, err := testutil.FindFile("test/runner/setup_container/setup_container")
+	if err != nil {
+		fatalf("cannot find setup_container: %v", err)
+	}
+	return setupContainer
+}
 
 // runTestCaseNative runs the test case directly on the host machine.
 func runTestCaseNative(testBin string, tc gtest.TestCase, t *testing.T) {
@@ -101,32 +121,15 @@ func runTestCaseNative(testBin string, tc gtest.TestCase, t *testing.T) {
 		env = append(env, "TEST_UDS_ATTACH_TREE="+socketDir)
 	}
 
+	if *platformSupport != "" {
+		env = append(env, fmt.Sprintf("%s=%s", platformSupportEnvVar, *platformSupport))
+	}
+
 	cmd := exec.Command(testBin, tc.Args()...)
 	cmd.Env = env
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.SysProcAttr = &unix.SysProcAttr{}
-
-	if *container {
-		// setup_container takes in its target argv as positional arguments.
-		cmd.Path = *setupContainerPath
-		cmd.Args = append([]string{cmd.Path}, cmd.Args...)
-		cmd.SysProcAttr = &unix.SysProcAttr{
-			Cloneflags: unix.CLONE_NEWUSER | unix.CLONE_NEWNET | unix.CLONE_NEWIPC | unix.CLONE_NEWUTS,
-			// Set current user/group as root inside the namespace.
-			UidMappings: []syscall.SysProcIDMap{
-				{ContainerID: 0, HostID: os.Getuid(), Size: 1},
-			},
-			GidMappings: []syscall.SysProcIDMap{
-				{ContainerID: 0, HostID: os.Getgid(), Size: 1},
-			},
-			GidMappingsEnableSetgroups: false,
-			Credential: &syscall.Credential{
-				Uid: 0,
-				Gid: 0,
-			},
-		}
-	}
 
 	if specutils.HasCapabilities(capability.CAP_SYS_ADMIN) {
 		cmd.SysProcAttr.Cloneflags |= unix.CLONE_NEWUTS
@@ -134,6 +137,25 @@ func runTestCaseNative(testBin string, tc gtest.TestCase, t *testing.T) {
 
 	if specutils.HasCapabilities(capability.CAP_NET_ADMIN) {
 		cmd.SysProcAttr.Cloneflags |= unix.CLONE_NEWNET
+	}
+
+	if *container || (cmd.SysProcAttr.Cloneflags&unix.CLONE_NEWNET != 0) {
+		// setup_container takes in its target argv as positional arguments.
+		cmd.Path = getSetupContainerPath()
+		cmd.Args = append([]string{cmd.Path}, cmd.Args...)
+		cmd.SysProcAttr.Cloneflags |= unix.CLONE_NEWUSER | unix.CLONE_NEWNET | unix.CLONE_NEWIPC | unix.CLONE_NEWUTS
+		// Set current user/group as root inside the namespace.
+		cmd.SysProcAttr.UidMappings = []syscall.SysProcIDMap{
+			{ContainerID: 0, HostID: os.Getuid(), Size: 1},
+		}
+		cmd.SysProcAttr.GidMappings = []syscall.SysProcIDMap{
+			{ContainerID: 0, HostID: os.Getgid(), Size: 1},
+		}
+		cmd.SysProcAttr.GidMappingsEnableSetgroups = false
+		cmd.SysProcAttr.Credential = &syscall.Credential{
+			Uid: 0,
+			Gid: 0,
+		}
 	}
 
 	if err := cmd.Run(); err != nil {
@@ -173,6 +195,7 @@ func runRunsc(tc gtest.TestCase, spec *specs.Spec) error {
 		"-TESTONLY-allow-packet-endpoint-write=true",
 		"-net-raw=true",
 		fmt.Sprintf("-panic-signal=%d", unix.SIGTERM),
+		fmt.Sprintf("-lisafs=%t", *lisafs),
 		"-watchdog-action=panic",
 		"-platform", *platform,
 		"-file-access", *fileAccess,
@@ -180,11 +203,8 @@ func runRunsc(tc gtest.TestCase, spec *specs.Spec) error {
 	if *overlay {
 		args = append(args, "-overlay")
 	}
-	if *vfs2 {
-		args = append(args, "-vfs2")
-		if *fuse {
-			args = append(args, "-fuse")
-		}
+	if *fuse {
+		args = append(args, "-fuse")
 	}
 	if *debug {
 		args = append(args, "-debug", "-log-packets=true")
@@ -197,6 +217,14 @@ func runRunsc(tc gtest.TestCase, spec *specs.Spec) error {
 	}
 	if *leakCheck {
 		args = append(args, "-ref-leak-mode=log-names")
+	}
+	if *trace {
+		flag, err := enableAllTraces(rootDir)
+		if err != nil {
+			return fmt.Errorf("enabling all traces: %w", err)
+		}
+		log.Infof("Enabling all trace points: %s", flag)
+		args = append(args, flag)
 	}
 
 	testLogDir := ""
@@ -224,7 +252,7 @@ func runRunsc(tc gtest.TestCase, spec *specs.Spec) error {
 	// Current process doesn't have CAP_SYS_ADMIN, create user namespace and run
 	// as root inside that namespace to get it.
 	rArgs := append(args, "run", "--bundle", bundleDir, id)
-	cmd := exec.Command(*runscPath, rArgs...)
+	cmd := exec.Command(specutils.ExePath, rArgs...)
 	cmd.SysProcAttr = &unix.SysProcAttr{
 		Cloneflags: unix.CLONE_NEWUSER | unix.CLONE_NEWNS,
 		// Set current user/group as root inside the namespace.
@@ -240,6 +268,11 @@ func runRunsc(tc gtest.TestCase, spec *specs.Spec) error {
 			Gid: 0,
 		},
 	}
+	if *container || *network == "host" || (cmd.SysProcAttr.Cloneflags&unix.CLONE_NEWNET != 0) {
+		cmd.SysProcAttr.Cloneflags |= unix.CLONE_NEWNET
+		cmd.Path = getSetupContainerPath()
+		cmd.Args = append([]string{cmd.Path}, cmd.Args...)
+	}
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	sig := make(chan os.Signal, 1)
@@ -254,9 +287,9 @@ func runRunsc(tc gtest.TestCase, spec *specs.Spec) error {
 		log.Warningf("%s: Got signal: %v", name, s)
 		done := make(chan bool, 1)
 		dArgs := append([]string{}, args...)
-		dArgs = append(dArgs, "-alsologtostderr=true", "debug", "--stacks", id)
+		dArgs = append(dArgs, "debug", "--stacks", id)
 		go func(dArgs []string) {
-			debug := exec.Command(*runscPath, dArgs...)
+			debug := exec.Command(specutils.ExePath, dArgs...)
 			debug.Stdout = os.Stdout
 			debug.Stderr = os.Stderr
 			debug.Run()
@@ -274,7 +307,7 @@ func runRunsc(tc gtest.TestCase, spec *specs.Spec) error {
 		dArgs = append(args, "debug",
 			fmt.Sprintf("--signal=%d", unix.SIGTERM),
 			id)
-		signal := exec.Command(*runscPath, dArgs...)
+		signal := exec.Command(specutils.ExePath, dArgs...)
 		signal.Stdout = os.Stdout
 		signal.Stderr = os.Stderr
 		signal.Run()
@@ -393,20 +426,25 @@ func runTestCaseRunsc(testBin string, tc gtest.TestCase, t *testing.T) {
 
 	// Set environment variables that indicate we are running in gVisor with
 	// the given platform, network, and filesystem stack.
-	platformVar := "TEST_ON_GVISOR"
-	networkVar := "GVISOR_NETWORK"
+	const (
+		platformVar = "TEST_ON_GVISOR"
+		networkVar  = "GVISOR_NETWORK"
+		fuseVar     = "FUSE_ENABLED"
+		lisafsVar   = "LISAFS_ENABLED"
+	)
 	env := append(os.Environ(), platformVar+"="+*platform, networkVar+"="+*network)
-	vfsVar := "GVISOR_VFS"
-	if *vfs2 {
-		env = append(env, vfsVar+"=VFS2")
-		fuseVar := "FUSE_ENABLED"
-		if *fuse {
-			env = append(env, fuseVar+"=TRUE")
-		} else {
-			env = append(env, fuseVar+"=FALSE")
-		}
+	if *platformSupport != "" {
+		env = append(env, fmt.Sprintf("%s=%s", platformSupportEnvVar, *platformSupport))
+	}
+	if *fuse {
+		env = append(env, fuseVar+"=TRUE")
 	} else {
-		env = append(env, vfsVar+"=VFS1")
+		env = append(env, fuseVar+"=FALSE")
+	}
+	if *lisafs {
+		env = append(env, lisafsVar+"=TRUE")
+	} else {
+		env = append(env, lisafsVar+"=FALSE")
 	}
 
 	// Remove shard env variables so that the gunit binary does not try to
@@ -472,18 +510,10 @@ func main() {
 		log.SetLevel(log.Debug)
 	}
 
-	if *platform != "native" && *runscPath == "" {
+	if *platform != "native" {
 		if err := testutil.ConfigureExePath(); err != nil {
 			panic(err.Error())
 		}
-		*runscPath = specutils.ExePath
-	}
-	if *container && *setupContainerPath == "" {
-		setupContainer, err := testutil.FindFile("test/runner/setup_container/setup_container")
-		if err != nil {
-			fatalf("cannot find setup_container: %v", err)
-		}
-		*setupContainerPath = setupContainer
 	}
 
 	// Make sure stdout and stderr are opened with O_APPEND, otherwise logs
@@ -540,4 +570,25 @@ func main() {
 	}
 
 	testing.Main(matchString, tests, nil, nil)
+}
+
+func enableAllTraces(dir string) (string, error) {
+	builder := config.Builder{}
+	if err := builder.LoadAllPoints(specutils.ExePath); err != nil {
+		return "", err
+	}
+	builder.AddSink(seccheck.SinkConfig{
+		Name: "null",
+	})
+	path := filepath.Join(dir, "pod_init.json")
+	cfgFile, err := os.Create(path)
+	if err != nil {
+		return "", err
+	}
+	defer cfgFile.Close()
+
+	if err := builder.WriteInitConfig(cfgFile); err != nil {
+		return "", fmt.Errorf("writing config file: %w", err)
+	}
+	return "--pod-init-config=" + path, nil
 }

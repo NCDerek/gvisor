@@ -18,13 +18,13 @@
 //
 // Lock order (outermost locks must be taken first):
 //
-// Kernel.extMu
-//   ThreadGroup.timerMu
-//     ktime.Timer.mu (for kernelCPUClockTicker and IntervalTimer)
-//       TaskSet.mu
-//         SignalHandlers.mu
-//           Task.mu
-//       runningTasksMu
+//	Kernel.extMu
+//		ThreadGroup.timerMu
+//		  ktime.Timer.mu (for kernelCPUClockTicker and IntervalTimer)
+//		    TaskSet.mu
+//		      SignalHandlers.mu
+//		        Task.mu
+//		    runningTasksMu
 //
 // Locking SignalHandlers.mu in multiple SignalHandlers requires locking
 // TaskSet.mu exclusively first. Locking Task.mu in multiple Tasks at the same
@@ -35,13 +35,14 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
-	"sync/atomic"
 	"time"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/cpuid"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/eventchannel"
 	"gvisor.dev/gvisor/pkg/fspath"
 	"gvisor.dev/gvisor/pkg/log"
@@ -57,8 +58,8 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/hostcpu"
 	"gvisor.dev/gvisor/pkg/sentry/inet"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
-	"gvisor.dev/gvisor/pkg/sentry/kernel/epoll"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/futex"
+	"gvisor.dev/gvisor/pkg/sentry/kernel/ipc"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/sched"
 	ktime "gvisor.dev/gvisor/pkg/sentry/kernel/time"
 	"gvisor.dev/gvisor/pkg/sentry/limits"
@@ -78,13 +79,49 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip"
 )
 
-// VFS2Enabled is set to true when VFS2 is enabled. Added as a global for allow
-// easy access everywhere. To be removed once VFS2 becomes the default.
+// VFS2Enabled is set to true when VFS2 is enabled. Added as a global to allow
+// easy access everywhere.
+//
+// TODO(gvisor.dev/issue/1624): Remove when VFS1 is no longer used.
 var VFS2Enabled = false
 
-// FUSEEnabled is set to true when FUSE is enabled. Added as a global for allow
+// LISAFSEnabled is set to true when lisafs protocol is enabled. Added as a
+// global to allow easy access everywhere.
+//
+// TODO(gvisor.dev/issue/7911): Remove when 9P is deleted.
+var LISAFSEnabled = false
+
+// FUSEEnabled is set to true when FUSE is enabled. Added as a global to allow
 // easy access everywhere. To be removed once FUSE is completed.
 var FUSEEnabled = false
+
+// userCounters is a set of user counters.
+//
+// +stateify savable
+type userCounters struct {
+	uid auth.KUID
+
+	rlimitNProc atomicbitops.Uint64
+}
+
+// incRLimitNProc increments the rlimitNProc counter.
+func (uc *userCounters) incRLimitNProc(ctx context.Context) error {
+	lim := limits.FromContext(ctx).Get(limits.ProcessCount)
+	creds := auth.CredentialsFromContext(ctx)
+	nproc := uc.rlimitNProc.Add(1)
+	if nproc > lim.Cur &&
+		!creds.HasCapability(linux.CAP_SYS_ADMIN) &&
+		!creds.HasCapability(linux.CAP_SYS_RESOURCE) {
+		uc.rlimitNProc.Add(^uint64(0))
+		return linuxerr.EAGAIN
+	}
+	return nil
+}
+
+// decRLimitNProc decrements the rlimitNProc counter.
+func (uc *userCounters) decRLimitNProc() {
+	uc.rlimitNProc.Add(^uint64(0))
+}
 
 // Kernel represents an emulated Linux kernel. It must be initialized by calling
 // Init() or LoadFrom().
@@ -116,7 +153,7 @@ type Kernel struct {
 	mf *pgalloc.MemoryFile `state:"nosave"`
 
 	// See InitKernelArgs for the meaning of these fields.
-	featureSet                  *cpuid.FeatureSet
+	featureSet                  cpuid.FeatureSet
 	timekeeper                  *Timekeeper
 	tasks                       *TaskSet
 	rootUserNamespace           *auth.UserNamespace
@@ -152,7 +189,7 @@ type Kernel struct {
 	// runningTasksMu is used to exclude critical sections when the timer
 	// disables itself and when the first active task enables the timer,
 	// ensuring that tasks always see a valid cpuClock value.
-	runningTasksMu sync.Mutex `state:"nosave"`
+	runningTasksMu runningTasksMutex `state:"nosave"`
 
 	// runningTasks is the total count of tasks currently in
 	// TaskGoroutineRunningSys or TaskGoroutineRunningApp. i.e., they are
@@ -160,7 +197,7 @@ type Kernel struct {
 	//
 	// runningTasks must be accessed atomically. Increments from 0 to 1 are
 	// further protected by runningTasksMu (see incRunningTasks).
-	runningTasks int64
+	runningTasks atomicbitops.Int64
 
 	// cpuClock is incremented every linux.ClockTick. cpuClock is used to
 	// measure task CPU usage, since sampling monotonicClock twice on every
@@ -172,7 +209,7 @@ type Kernel struct {
 	// doesn't provide this information.
 	//
 	// cpuClock is mutable, and is accessed using atomic memory operations.
-	cpuClock uint64
+	cpuClock atomicbitops.Uint64
 
 	// cpuClockTicker increments cpuClock.
 	cpuClockTicker *ktime.Timer `state:"nosave"`
@@ -196,14 +233,13 @@ type Kernel struct {
 	// uniqueID is used to generate unique identifiers.
 	//
 	// uniqueID is mutable, and is accessed using atomic memory operations.
-	uniqueID uint64
+	uniqueID atomicbitops.Uint64
 
 	// nextInotifyCookie is a monotonically increasing counter used for
 	// generating unique inotify event cookies.
 	//
-	// nextInotifyCookie is mutable, and is accessed using atomic memory
-	// operations.
-	nextInotifyCookie uint32
+	// nextInotifyCookie is mutable.
+	nextInotifyCookie atomicbitops.Uint32
 
 	// netlinkPorts manages allocation of netlink socket port IDs.
 	netlinkPorts *port.Manager
@@ -262,7 +298,7 @@ type Kernel struct {
 	pipeMount *vfs.Mount
 
 	// shmMount is the Mount used for anonymous files created by the
-	// memfd_create() syscalls. It is analagous to Linux's shm_mnt.
+	// memfd_create() syscalls. It is analogous to Linux's shm_mnt.
 	shmMount *vfs.Mount
 
 	// socketMount is the Mount used for sockets created by the socket() and
@@ -287,18 +323,22 @@ type Kernel struct {
 	ptraceExceptions map[*Task]*Task
 
 	// YAMAPtraceScope is the current level of YAMA ptrace restrictions.
-	YAMAPtraceScope int32
+	YAMAPtraceScope atomicbitops.Int32
 
 	// cgroupRegistry contains the set of active cgroup controllers on the
 	// system. It is controller by cgroupfs. Nil if cgroupfs is unavailable on
 	// the system.
 	cgroupRegistry *CgroupRegistry
+
+	// userCountersMap maps auth.KUID into a set of user counters.
+	userCountersMap   map[auth.KUID]*userCounters
+	userCountersMapMu userCountersMutex `state:"nosave"`
 }
 
 // InitKernelArgs holds arguments to Init.
 type InitKernelArgs struct {
 	// FeatureSet is the emulated CPU feature set.
-	FeatureSet *cpuid.FeatureSet
+	FeatureSet cpuid.FeatureSet
 
 	// Timekeeper manages time for all tasks in the system.
 	Timekeeper *Timekeeper
@@ -347,9 +387,6 @@ type InitKernelArgs struct {
 // Callers must manually set Kernel.Platform and call Kernel.SetMemoryFile
 // before calling Init.
 func (k *Kernel) Init(args InitKernelArgs) error {
-	if args.FeatureSet == nil {
-		return fmt.Errorf("args.FeatureSet is nil")
-	}
 	if args.Timekeeper == nil {
 		return fmt.Errorf("args.Timekeeper is nil")
 	}
@@ -392,7 +429,8 @@ func (k *Kernel) Init(args InitKernelArgs) error {
 	k.futexes = futex.NewManager()
 	k.netlinkPorts = port.New()
 	k.ptraceExceptions = make(map[*Task]*Task)
-	k.YAMAPtraceScope = linux.YAMA_SCOPE_RELATIONAL
+	k.YAMAPtraceScope = atomicbitops.FromInt32(linux.YAMA_SCOPE_RELATIONAL)
+	k.userCountersMap = make(map[auth.KUID]*userCounters)
 
 	if VFS2Enabled {
 		ctx := k.SupervisorContext()
@@ -400,15 +438,17 @@ func (k *Kernel) Init(args InitKernelArgs) error {
 			return fmt.Errorf("failed to initialize VFS: %v", err)
 		}
 
+		err := k.rootIPCNamespace.InitPosixQueues(ctx, &k.vfs, auth.CredentialsFromContext(ctx))
+		if err != nil {
+			return fmt.Errorf("failed to create mqfs filesystem: %v", err)
+		}
+
 		pipeFilesystem, err := pipefs.NewFilesystem(&k.vfs)
 		if err != nil {
 			return fmt.Errorf("failed to create pipefs filesystem: %v", err)
 		}
 		defer pipeFilesystem.DecRef(ctx)
-		pipeMount, err := k.vfs.NewDisconnectedMount(pipeFilesystem, nil, &vfs.MountOptions{})
-		if err != nil {
-			return fmt.Errorf("failed to create pipefs mount: %v", err)
-		}
+		pipeMount := k.vfs.NewDisconnectedMount(pipeFilesystem, nil, &vfs.MountOptions{})
 		k.pipeMount = pipeMount
 
 		tmpfsFilesystem, tmpfsRoot, err := tmpfs.NewFilesystem(ctx, &k.vfs, auth.NewRootCredentials(k.rootUserNamespace))
@@ -417,22 +457,14 @@ func (k *Kernel) Init(args InitKernelArgs) error {
 		}
 		defer tmpfsFilesystem.DecRef(ctx)
 		defer tmpfsRoot.DecRef(ctx)
-		shmMount, err := k.vfs.NewDisconnectedMount(tmpfsFilesystem, tmpfsRoot, &vfs.MountOptions{})
-		if err != nil {
-			return fmt.Errorf("failed to create tmpfs mount: %v", err)
-		}
-		k.shmMount = shmMount
+		k.shmMount = k.vfs.NewDisconnectedMount(tmpfsFilesystem, tmpfsRoot, &vfs.MountOptions{})
 
 		socketFilesystem, err := sockfs.NewFilesystem(&k.vfs)
 		if err != nil {
 			return fmt.Errorf("failed to create sockfs filesystem: %v", err)
 		}
 		defer socketFilesystem.DecRef(ctx)
-		socketMount, err := k.vfs.NewDisconnectedMount(socketFilesystem, nil, &vfs.MountOptions{})
-		if err != nil {
-			return fmt.Errorf("failed to create sockfs mount: %v", err)
-		}
-		k.socketMount = socketMount
+		k.socketMount = k.vfs.NewDisconnectedMount(socketFilesystem, nil, &vfs.MountOptions{})
 
 		k.socketsVFS2 = make(map[*vfs.FileDescription]*SocketRecord)
 
@@ -478,11 +510,6 @@ func (k *Kernel) SaveTo(ctx context.Context, w wire.Writer) error {
 			return err
 		}
 
-		// Remove all epoll waiter objects from underlying wait queues.
-		// NOTE: for programs to resume execution in future snapshot scenarios,
-		// we will need to re-establish these waiter objects after saving.
-		k.tasks.unregisterEpollWaiters(ctx)
-
 		// Clear the dirent cache before saving because Dirents must be Loaded in a
 		// particular order (parents before children), and Loading dirents from a cache
 		// breaks that order.
@@ -516,12 +543,21 @@ func (k *Kernel) SaveTo(ctx context.Context, w wire.Writer) error {
 	//
 	// N.B. This will also be saved along with the full kernel save below.
 	cpuidStart := time.Now()
-	if _, err := state.Save(ctx, w, k.FeatureSet()); err != nil {
+	if _, err := state.Save(ctx, w, &k.featureSet); err != nil {
 		return err
 	}
 	log.Infof("CPUID save took [%s].", time.Since(cpuidStart))
 
 	// Save the timekeeper's state.
+
+	if rootNS := k.rootNetworkNamespace; rootNS != nil && rootNS.Stack() != nil {
+		// Pause the network stack.
+		netstackPauseStart := time.Now()
+		log.Infof("Pausing root network namespace")
+		k.rootNetworkNamespace.Stack().Pause()
+		defer k.rootNetworkNamespace.Stack().Resume()
+		log.Infof("Pausing root network namespace took [%s].", time.Since(netstackPauseStart))
+	}
 
 	// Save the kernel state.
 	kernelStart := time.Now()
@@ -615,32 +651,6 @@ func (k *Kernel) flushWritesToFiles(ctx context.Context) error {
 	})
 }
 
-// Preconditions: !VFS2Enabled.
-func (ts *TaskSet) unregisterEpollWaiters(ctx context.Context) {
-	ts.mu.RLock()
-	defer ts.mu.RUnlock()
-
-	// Tasks that belong to the same process could potentially point to the
-	// same FDTable. So we retain a map of processed ones to avoid
-	// processing the same FDTable multiple times.
-	processed := make(map[*FDTable]struct{})
-	for t := range ts.Root.tids {
-		// We can skip locking Task.mu here since the kernel is paused.
-		if t.fdTable == nil {
-			continue
-		}
-		if _, ok := processed[t.fdTable]; ok {
-			continue
-		}
-		t.fdTable.forEach(ctx, func(_ int32, file *fs.File, _ *vfs.FileDescription, _ FDFlags) {
-			if e, ok := file.FileOperations.(*epoll.EventPoll); ok {
-				e.UnregisterEpollWaiters()
-			}
-		})
-		processed[t.fdTable] = struct{}{}
-	}
-}
-
 // Preconditions: The kernel must be paused.
 func (k *Kernel) invalidateUnsavableMappings(ctx context.Context) error {
 	invalidated := make(map[*mm.MemoryManager]struct{})
@@ -677,8 +687,7 @@ func (k *Kernel) LoadFrom(ctx context.Context, r wire.Reader, timeReady chan str
 	// N.B. This was also saved along with the full kernel below, so we
 	// don't need to explicitly install it in the Kernel.
 	cpuidStart := time.Now()
-	var features cpuid.FeatureSet
-	if _, err := state.Load(ctx, r, &features); err != nil {
+	if _, err := state.Load(ctx, r, &k.featureSet); err != nil {
 		return err
 	}
 	log.Infof("CPUID load took [%s].", time.Since(cpuidStart))
@@ -687,7 +696,7 @@ func (k *Kernel) LoadFrom(ctx context.Context, r wire.Reader, timeReady chan str
 	// Kernel load so that the explicit CPUID mismatch error has priority
 	// over floating point state restore errors that may occur on load on
 	// an incompatible machine.
-	if err := features.CheckHostCompatible(); err != nil {
+	if err := k.featureSet.CheckHostCompatible(); err != nil {
 		return err
 	}
 
@@ -755,7 +764,7 @@ func (k *Kernel) LoadFrom(ctx context.Context, r wire.Reader, timeReady chan str
 
 // UniqueID returns a unique identifier.
 func (k *Kernel) UniqueID() uint64 {
-	id := atomic.AddUint64(&k.uniqueID, 1)
+	id := k.uniqueID.Add(1)
 	if id == 0 {
 		panic("unique identifier generator wrapped around")
 	}
@@ -835,33 +844,32 @@ type CreateProcessArgs struct {
 
 // NewContext returns a context.Context that represents the task that will be
 // created by args.NewContext(k).
-func (args *CreateProcessArgs) NewContext(k *Kernel) *createProcessContext {
+func (args *CreateProcessArgs) NewContext(k *Kernel) context.Context {
 	return &createProcessContext{
-		Logger: log.Log(),
-		k:      k,
-		args:   args,
+		Context: context.Background(),
+		kernel:  k,
+		args:    args,
 	}
 }
 
 // createProcessContext is a context.Context that represents the context
 // associated with a task that is being created.
 type createProcessContext struct {
-	context.NoopSleeper
-	log.Logger
-	k    *Kernel
-	args *CreateProcessArgs
+	context.Context
+	kernel *Kernel
+	args   *CreateProcessArgs
 }
 
 // Value implements context.Context.Value.
 func (ctx *createProcessContext) Value(key interface{}) interface{} {
 	switch key {
 	case CtxKernel:
-		return ctx.k
+		return ctx.kernel
 	case CtxPIDNamespace:
 		return ctx.args.PIDNamespace
 	case CtxUTSNamespace:
 		return ctx.args.UTSNamespace
-	case CtxIPCNamespace:
+	case ipc.CtxIPCNamespace:
 		ipcns := ctx.args.IPCNamespace
 		ipcns.IncRef()
 		return ipcns
@@ -881,34 +889,34 @@ func (ctx *createProcessContext) Value(key interface{}) interface{} {
 		root.IncRef()
 		return root
 	case vfs.CtxMountNamespace:
-		if ctx.k.globalInit == nil {
+		if ctx.kernel.globalInit == nil {
 			return nil
 		}
-		mntns := ctx.k.GlobalInit().Leader().MountNamespaceVFS2()
+		mntns := ctx.kernel.GlobalInit().Leader().MountNamespaceVFS2()
 		mntns.IncRef()
 		return mntns
 	case fs.CtxDirentCacheLimiter:
-		return ctx.k.DirentCacheLimiter
+		return ctx.kernel.DirentCacheLimiter
 	case inet.CtxStack:
-		return ctx.k.RootNetworkNamespace().Stack()
+		return ctx.kernel.RootNetworkNamespace().Stack()
 	case ktime.CtxRealtimeClock:
-		return ctx.k.RealtimeClock()
+		return ctx.kernel.RealtimeClock()
 	case limits.CtxLimits:
 		return ctx.args.Limits
 	case pgalloc.CtxMemoryFile:
-		return ctx.k.mf
+		return ctx.kernel.mf
 	case pgalloc.CtxMemoryFileProvider:
-		return ctx.k
+		return ctx.kernel
 	case platform.CtxPlatform:
-		return ctx.k
+		return ctx.kernel
 	case uniqueid.CtxGlobalUniqueID:
-		return ctx.k.UniqueID()
+		return ctx.kernel.UniqueID()
 	case uniqueid.CtxGlobalUniqueIDProvider:
-		return ctx.k
+		return ctx.kernel
 	case uniqueid.CtxInotifyCookie:
-		return ctx.k.GenerateInotifyCookie()
+		return ctx.kernel.GenerateInotifyCookie()
 	case unimpl.CtxEvents:
-		return ctx.k
+		return ctx.kernel
 	default:
 		return nil
 	}
@@ -942,6 +950,9 @@ func (k *Kernel) CreateProcess(args CreateProcessArgs) (*ThreadGroup, ThreadID, 
 	if VFS2Enabled {
 		mntnsVFS2 = args.MountNamespaceVFS2
 		if mntnsVFS2 == nil {
+			if k.globalInit == nil {
+				return nil, 0, fmt.Errorf("mount namespace is nil")
+			}
 			// Add a reference to the namespace, which is transferred to the new process.
 			mntnsVFS2 = k.globalInit.Leader().MountNamespaceVFS2()
 			mntnsVFS2.IncRef()
@@ -960,10 +971,15 @@ func (k *Kernel) CreateProcess(args CreateProcessArgs) (*ThreadGroup, ThreadID, 
 				Path:               fspath.Parse(args.WorkingDirectory),
 				FollowFinalSymlink: true,
 			}
+			// NOTE(b/236028361): Do not set CheckSearchable flag to true.
+			// Application is allowed to start with a working directory that it can
+			// not access/search. This is consistent with Docker and VFS1. Runc
+			// explicitly allows for this in 6ce2d63a5db6 ("libct/init_linux: retry
+			// chdir to fix EPERM"). As described in the commit, runc unintentionally
+			// allowed this behavior in a couple of releases and applications started
+			// relying on it. So they decided to allow it for backward compatibility.
 			var err error
-			wd, err = k.VFS().GetDentryAt(ctx, args.Credentials, &pop, &vfs.GetDentryOptions{
-				CheckSearchable: true,
-			})
+			wd, err = k.VFS().GetDentryAt(ctx, args.Credentials, &pop, &vfs.GetDentryOptions{})
 			if err != nil {
 				return nil, 0, fmt.Errorf("failed to find initial working directory %q: %v", args.WorkingDirectory, err)
 			}
@@ -975,6 +991,9 @@ func (k *Kernel) CreateProcess(args CreateProcessArgs) (*ThreadGroup, ThreadID, 
 	} else {
 		mntns = args.MountNamespace
 		if mntns == nil {
+			if k.globalInit == nil {
+				return nil, 0, fmt.Errorf("mount namespace is nil")
+			}
 			mntns = k.GlobalInit().Leader().MountNamespace()
 			mntns.IncRef()
 		}
@@ -1013,6 +1032,7 @@ func (k *Kernel) CreateProcess(args CreateProcessArgs) (*ThreadGroup, ThreadID, 
 		args.File = nil
 	case args.File != nil:
 		// If File is set, take the File provided directly.
+		args.Filename = args.File.PathnameWithDeleted(ctx)
 	default:
 		// Otherwise look at Argv and see if the first argument is a valid path.
 		if len(args.Argv) == 0 {
@@ -1062,7 +1082,9 @@ func (k *Kernel) CreateProcess(args CreateProcessArgs) (*ThreadGroup, ThreadID, 
 		AbstractSocketNamespace: args.AbstractSocketNamespace,
 		MountNamespaceVFS2:      mntnsVFS2,
 		ContainerID:             args.ContainerID,
+		UserCounters:            k.GetUserCounters(args.Credentials.RealKUID),
 	}
+	config.NetworkNamespace.IncRef()
 	t, err := k.tasks.NewTask(ctx, config)
 	if err != nil {
 		return nil, 0, err
@@ -1092,9 +1114,6 @@ func (k *Kernel) Start() error {
 	k.extMu.Lock()
 	defer k.extMu.Unlock()
 
-	if k.globalInit == nil {
-		return fmt.Errorf("kernel contains no tasks")
-	}
 	if k.started {
 		return fmt.Errorf("kernel already started")
 	}
@@ -1109,11 +1128,18 @@ func (k *Kernel) Start() error {
 	// Kernel.SaveTo and need to be resumed. If k was created by NewKernel,
 	// this is a no-op.
 	k.resumeTimeLocked(k.SupervisorContext())
-	// Start task goroutines.
 	k.tasks.mu.RLock()
-	defer k.tasks.mu.RUnlock()
-	for t, tid := range k.tasks.Root.tids {
-		t.Start(tid)
+	ts := make([]*Task, 0, len(k.tasks.Root.tids))
+	for t := range k.tasks.Root.tids {
+		ts = append(ts, t)
+	}
+	k.tasks.mu.RUnlock()
+	// Start task goroutines.
+	// NOTE(b/235349091): We don't actually need the TaskSet mutex, we just
+	// need to make sure we only call t.Start() once for each task. Holding the
+	// mutex for each task start may cause a nested locking error.
+	for _, t := range ts {
+		t.Start(t.ThreadID())
 	}
 	return nil
 }
@@ -1121,8 +1147,8 @@ func (k *Kernel) Start() error {
 // pauseTimeLocked pauses all Timers and Timekeeper updates.
 //
 // Preconditions:
-// * Any task goroutines running in k must be stopped.
-// * k.extMu must be locked.
+//   - Any task goroutines running in k must be stopped.
+//   - k.extMu must be locked.
 func (k *Kernel) pauseTimeLocked(ctx context.Context) {
 	// k.cpuClockTicker may be nil since Kernel.SaveTo() may be called before
 	// Kernel.Start().
@@ -1166,8 +1192,8 @@ func (k *Kernel) pauseTimeLocked(ctx context.Context) {
 // effect.
 //
 // Preconditions:
-// * Any task goroutines running in k must be stopped.
-// * k.extMu must be locked.
+//   - Any task goroutines running in k must be stopped.
+//   - k.extMu must be locked.
 func (k *Kernel) resumeTimeLocked(ctx context.Context) {
 	if k.cpuClockTicker != nil {
 		k.cpuClockTicker.Resume()
@@ -1199,10 +1225,10 @@ func (k *Kernel) resumeTimeLocked(ctx context.Context) {
 
 func (k *Kernel) incRunningTasks() {
 	for {
-		tasks := atomic.LoadInt64(&k.runningTasks)
+		tasks := k.runningTasks.Load()
 		if tasks != 0 {
 			// Standard case. Simply increment.
-			if !atomic.CompareAndSwapInt64(&k.runningTasks, tasks, tasks+1) {
+			if !k.runningTasks.CompareAndSwap(tasks, tasks+1) {
 				continue
 			}
 			return
@@ -1210,18 +1236,18 @@ func (k *Kernel) incRunningTasks() {
 
 		// Transition from 0 -> 1. Synchronize with other transitions and timer.
 		k.runningTasksMu.Lock()
-		tasks = atomic.LoadInt64(&k.runningTasks)
+		tasks = k.runningTasks.Load()
 		if tasks != 0 {
 			// We're no longer the first task, no need to
 			// re-enable.
-			atomic.AddInt64(&k.runningTasks, 1)
+			k.runningTasks.Add(1)
 			k.runningTasksMu.Unlock()
 			return
 		}
 
 		if !k.cpuClockTickerDisabled {
 			// Timer was never disabled.
-			atomic.StoreInt64(&k.runningTasks, 1)
+			k.runningTasks.Store(1)
 			k.runningTasksMu.Unlock()
 			return
 		}
@@ -1257,12 +1283,12 @@ func (k *Kernel) incRunningTasks() {
 		// don't matter.
 		setting, exp := k.cpuClockTickerSetting.At(k.timekeeper.monotonicClock.Now())
 		if exp > 0 {
-			atomic.AddUint64(&k.cpuClock, exp)
+			k.cpuClock.Add(exp)
 		}
 
 		// Now that cpuClock is updated it is safe to allow other tasks to
 		// transition to running.
-		atomic.StoreInt64(&k.runningTasks, 1)
+		k.runningTasks.Store(1)
 
 		// N.B. we must unlock before calling Swap to maintain lock ordering.
 		//
@@ -1282,7 +1308,7 @@ func (k *Kernel) incRunningTasks() {
 }
 
 func (k *Kernel) decRunningTasks() {
-	tasks := atomic.AddInt64(&k.runningTasks, -1)
+	tasks := k.runningTasks.Add(-1)
 	if tasks < 0 {
 		panic(fmt.Sprintf("Invalid running count %d", tasks))
 	}
@@ -1398,7 +1424,7 @@ func (k *Kernel) RebuildTraceContexts() {
 }
 
 // FeatureSet returns the FeatureSet.
-func (k *Kernel) FeatureSet() *cpuid.FeatureSet {
+func (k *Kernel) FeatureSet() cpuid.FeatureSet {
 	return k.featureSet
 }
 
@@ -1475,7 +1501,7 @@ func (k *Kernel) MonotonicClock() ktime.Clock {
 
 // CPUClockNow returns the current value of k.cpuClock.
 func (k *Kernel) CPUClockNow() uint64 {
-	return atomic.LoadUint64(&k.cpuClock)
+	return k.cpuClock.Load()
 }
 
 // Syslog returns the syslog.
@@ -1489,10 +1515,10 @@ func (k *Kernel) Syslog() *syslog {
 // space is exhausted. 0 is not a valid cookie value, all other values
 // representable in a uint32 are allowed.
 func (k *Kernel) GenerateInotifyCookie() uint32 {
-	id := atomic.AddUint32(&k.nextInotifyCookie, 1)
+	id := k.nextInotifyCookie.Add(1)
 	// Wrap-around is explicitly allowed for inotify event cookies.
 	if id == 0 {
-		id = atomic.AddUint32(&k.nextInotifyCookie, 1)
+		id = k.nextInotifyCookie.Add(1)
 	}
 	return id
 }
@@ -1568,9 +1594,9 @@ func (k *Kernel) MemoryFile() *pgalloc.MemoryFile {
 // Callers are responsible for ensuring that the returned Context is not used
 // concurrently with changes to the Kernel.
 func (k *Kernel) SupervisorContext() context.Context {
-	return supervisorContext{
+	return &supervisorContext{
+		Kernel: k,
 		Logger: log.Log(),
-		k:      k,
 	}
 }
 
@@ -1670,13 +1696,28 @@ func (k *Kernel) ListSockets() []*SocketRecord {
 
 // supervisorContext is a privileged context.
 type supervisorContext struct {
-	context.NoopSleeper
+	context.NoTask
 	log.Logger
-	k *Kernel
+	*Kernel
+}
+
+// Deadline implements context.Context.Deadline.
+func (*Kernel) Deadline() (time.Time, bool) {
+	return time.Time{}, false
+}
+
+// Done implements context.Context.Done.
+func (*Kernel) Done() <-chan struct{} {
+	return nil
+}
+
+// Err implements context.Context.Err.
+func (*Kernel) Err() error {
+	return nil
 }
 
 // Value implements context.Context.
-func (ctx supervisorContext) Value(key interface{}) interface{} {
+func (ctx *supervisorContext) Value(key interface{}) interface{} {
 	switch key {
 	case CtxCanTrace:
 		// The supervisor context can trace anything. (None of
@@ -1684,60 +1725,62 @@ func (ctx supervisorContext) Value(key interface{}) interface{} {
 		// permissions are required for certain file accesses.)
 		return func(*Task, bool) bool { return true }
 	case CtxKernel:
-		return ctx.k
+		return ctx.Kernel
 	case CtxPIDNamespace:
-		return ctx.k.tasks.Root
+		return ctx.Kernel.tasks.Root
 	case CtxUTSNamespace:
-		return ctx.k.rootUTSNamespace
-	case CtxIPCNamespace:
-		ipcns := ctx.k.rootIPCNamespace
+		return ctx.Kernel.rootUTSNamespace
+	case ipc.CtxIPCNamespace:
+		ipcns := ctx.Kernel.rootIPCNamespace
 		ipcns.IncRef()
 		return ipcns
 	case auth.CtxCredentials:
 		// The supervisor context is global root.
-		return auth.NewRootCredentials(ctx.k.rootUserNamespace)
+		return auth.NewRootCredentials(ctx.Kernel.rootUserNamespace)
 	case fs.CtxRoot:
-		if ctx.k.globalInit != nil {
-			return ctx.k.globalInit.mounts.Root()
+		if ctx.Kernel.globalInit != nil {
+			return ctx.Kernel.globalInit.mounts.Root()
 		}
 		return nil
 	case vfs.CtxRoot:
-		if ctx.k.globalInit == nil {
+		if ctx.Kernel.globalInit == nil {
 			return vfs.VirtualDentry{}
 		}
-		root := ctx.k.GlobalInit().Leader().MountNamespaceVFS2().Root()
+		root := ctx.Kernel.GlobalInit().Leader().MountNamespaceVFS2().Root()
 		root.IncRef()
 		return root
 	case vfs.CtxMountNamespace:
-		if ctx.k.globalInit == nil {
+		if ctx.Kernel.globalInit == nil {
 			return nil
 		}
-		mntns := ctx.k.GlobalInit().Leader().MountNamespaceVFS2()
+		mntns := ctx.Kernel.GlobalInit().Leader().MountNamespaceVFS2()
 		mntns.IncRef()
 		return mntns
 	case fs.CtxDirentCacheLimiter:
-		return ctx.k.DirentCacheLimiter
+		return ctx.Kernel.DirentCacheLimiter
 	case inet.CtxStack:
-		return ctx.k.RootNetworkNamespace().Stack()
+		return ctx.Kernel.RootNetworkNamespace().Stack()
 	case ktime.CtxRealtimeClock:
-		return ctx.k.RealtimeClock()
+		return ctx.Kernel.RealtimeClock()
 	case limits.CtxLimits:
 		// No limits apply.
 		return limits.NewLimitSet()
 	case pgalloc.CtxMemoryFile:
-		return ctx.k.mf
+		return ctx.Kernel.mf
 	case pgalloc.CtxMemoryFileProvider:
-		return ctx.k
+		return ctx.Kernel
 	case platform.CtxPlatform:
-		return ctx.k
+		return ctx.Kernel
 	case uniqueid.CtxGlobalUniqueID:
-		return ctx.k.UniqueID()
+		return ctx.Kernel.UniqueID()
 	case uniqueid.CtxGlobalUniqueIDProvider:
-		return ctx.k
+		return ctx.Kernel
 	case uniqueid.CtxInotifyCookie:
-		return ctx.k.GenerateInotifyCookie()
+		return ctx.Kernel.GenerateInotifyCookie()
 	case unimpl.CtxEvents:
-		return ctx.k
+		return ctx.Kernel
+	case cpuid.CtxFeatureSet:
+		return ctx.Kernel.featureSet
 	default:
 		return nil
 	}
@@ -1816,6 +1859,7 @@ func (k *Kernel) Release() {
 	}
 	k.timekeeper.Destroy()
 	k.vdso.Release(ctx)
+	k.RootNetworkNamespace().DecRef()
 }
 
 // PopulateNewCgroupHierarchy moves all tasks into a newly created cgroup
@@ -1844,7 +1888,11 @@ func (k *Kernel) PopulateNewCgroupHierarchy(root Cgroup) {
 // hierarchy with the provided id.  This is intended for use during hierarchy
 // teardown, as otherwise the tasks would be orphaned w.r.t to some controllers.
 func (k *Kernel) ReleaseCgroupHierarchy(hid uint32) {
+	var releasedCGs []Cgroup
+
 	k.tasks.mu.RLock()
+	// We'll have one cgroup per hierarchy per task.
+	releasedCGs = make([]Cgroup, 0, len(k.tasks.Root.tids))
 	k.tasks.forEachTaskLocked(func(t *Task) {
 		if t.exitState != TaskExitNone {
 			return
@@ -1852,10 +1900,60 @@ func (k *Kernel) ReleaseCgroupHierarchy(hid uint32) {
 		t.mu.Lock()
 		for cg := range t.cgroups {
 			if cg.HierarchyID() == hid {
-				t.leaveCgroupLocked(cg)
+				cg.Leave(t)
+				delete(t.cgroups, cg)
+				releasedCGs = append(releasedCGs, cg)
+				// A task can't be part of multiple cgroups from the same
+				// hierarchy, so we can skip checking the rest once we find a
+				// match.
+				break
 			}
 		}
 		t.mu.Unlock()
 	})
 	k.tasks.mu.RUnlock()
+
+	for _, c := range releasedCGs {
+		c.decRef()
+	}
+}
+
+func (k *Kernel) ReplaceFSContextRoots(ctx context.Context, oldRoot vfs.VirtualDentry, newRoot vfs.VirtualDentry) {
+	k.tasks.mu.RLock()
+	oldRootDecRefs := 0
+	k.tasks.forEachTaskLocked(func(t *Task) {
+		t.mu.Lock()
+		defer t.mu.Unlock()
+		if fsc := t.fsContext; fsc != nil {
+			fsc.mu.Lock()
+			defer fsc.mu.Unlock()
+			if fsc.rootVFS2 == oldRoot {
+				newRoot.IncRef()
+				oldRootDecRefs++
+				fsc.rootVFS2 = newRoot
+			}
+			if fsc.cwdVFS2 == oldRoot {
+				newRoot.IncRef()
+				oldRootDecRefs++
+				fsc.cwdVFS2 = newRoot
+			}
+		}
+	})
+	k.tasks.mu.RUnlock()
+	for i := 0; i < oldRootDecRefs; i++ {
+		oldRoot.DecRef(ctx)
+	}
+}
+
+func (k *Kernel) GetUserCounters(uid auth.KUID) *userCounters {
+	k.userCountersMapMu.Lock()
+	defer k.userCountersMapMu.Unlock()
+
+	if uc, ok := k.userCountersMap[uid]; ok {
+		return uc
+	}
+
+	uc := &userCounters{}
+	k.userCountersMap[uid] = uc
+	return uc
 }

@@ -80,7 +80,7 @@ func InotifyAddWatch(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kern
 	mask := args[2].Uint()
 
 	// "EINVAL: The given event mask contains no valid events."
-	// -- inotify_add_watch(2)
+	//	-- inotify_add_watch(2)
 	if mask&linux.ALL_INOTIFY_BITS == 0 {
 		return 0, nil, linuxerr.EINVAL
 	}
@@ -88,7 +88,7 @@ func InotifyAddWatch(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kern
 	// "IN_DONT_FOLLOW: Don't dereference pathname if it is a symbolic link."
 	//  -- inotify(7)
 	follow := followFinalSymlink
-	if mask&linux.IN_DONT_FOLLOW == 0 {
+	if mask&linux.IN_DONT_FOLLOW != 0 {
 		follow = nofollowFinalSymlink
 	}
 
@@ -116,11 +116,7 @@ func InotifyAddWatch(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kern
 	}
 	defer d.DecRef(t)
 
-	fd, err = ino.AddWatch(d.Dentry(), mask)
-	if err != nil {
-		return 0, nil, err
-	}
-	return uintptr(fd), nil, nil
+	return uintptr(ino.AddWatch(d.Dentry(), mask)), nil, nil
 }
 
 // InotifyRmWatch implements the inotify_rm_watch() syscall.

@@ -16,7 +16,9 @@ package fuse
 
 import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/kernfs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
@@ -29,7 +31,7 @@ type fileDescription struct {
 	vfsfd vfs.FileDescription
 	vfs.FileDescriptionDefaultImpl
 	vfs.DentryMetadataFileDescriptionImpl
-	vfs.NoLockFD
+	vfs.LockFD
 
 	// the file handle used in userspace.
 	Fh uint64
@@ -44,7 +46,7 @@ type fileDescription struct {
 	OpenFlag uint32
 
 	// off is the file offset.
-	off int64
+	off atomicbitops.Int64
 }
 
 func (fd *fileDescription) dentry() *kernfs.Dentry {
@@ -126,4 +128,27 @@ func (fd *fileDescription) SetStat(ctx context.Context, opts vfs.SetStatOptions)
 	fs := fd.filesystem()
 	creds := auth.CredentialsFromContext(ctx)
 	return fd.inode().setAttr(ctx, fs, creds, opts, true, fd.Fh)
+}
+
+// Sync implements vfs.FileDescriptionImpl.Sync.
+func (fd *fileDescription) Sync(ctx context.Context) error {
+	if fd.inode().Mode().IsDir() {
+		return linuxerr.EPERM
+	}
+	conn := fd.inode().fs.conn
+	// no need to proceed if FUSE server doesn't implement Open.
+	if conn.noOpen {
+		return linuxerr.EINVAL
+	}
+	kernelTask := kernel.TaskFromContext(ctx)
+
+	in := linux.FUSEFsyncIn{
+		Fh:         fd.Fh,
+		FsyncFlags: fd.statusFlags(),
+	}
+	// Ignoring errors and FUSE server reply is analogous to Linux's behavior.
+	req := conn.NewRequest(auth.CredentialsFromContext(ctx), uint32(kernelTask.ThreadID()), fd.inode().nodeID, linux.FUSE_FSYNC, &in)
+	// The reply will be ignored since no callback is defined in asyncCallBack().
+	conn.CallAsync(kernelTask, req)
+	return nil
 }

@@ -12,8 +12,13 @@ go_library(
         "state.go",
     ],
     nogo = False,
-    visibility = ["//tools/nogo:__subpackages__"],
+    visibility = [
+        "//:__pkg__",
+        "//tools/checklocks/cmd:__subpackages__",
+        "//tools/nogo:__subpackages__",
+    ],
     deps = [
+        "//pkg/atomicbitops",
         "@org_golang_x_tools//go/analysis:go_default_library",
         "@org_golang_x_tools//go/analysis/passes/buildssa:go_default_library",
         "@org_golang_x_tools//go/ssa:go_default_library",

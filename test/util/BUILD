@@ -60,6 +60,17 @@ cc_library(
 )
 
 cc_library(
+    name = "io_uring_util",
+    testonly = 1,
+    hdrs = ["io_uring_util.h"],
+    deps = [
+        ":file_descriptor",
+        ":posix_error",
+        ":save_util",
+    ],
+)
+
+cc_library(
     name = "proc_util",
     testonly = 1,
     srcs = ["proc_util.cc"],
@@ -350,18 +361,6 @@ cc_library(
 )
 
 cc_library(
-    name = "benchmark_main",
-    testonly = 1,
-    linkstatic = 1,
-    deps = [
-        ":test_util",
-        "@com_google_absl//absl/flags:flag",
-        gtest,
-        gbenchmark_internal,
-    ],
-)
-
-cc_library(
     name = "epoll_util",
     testonly = 1,
     srcs = ["epoll_util.cc"],
@@ -418,19 +417,6 @@ cc_library(
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/container:flat_hash_set",
         "@com_google_absl//absl/strings",
-    ],
-)
-
-cc_library(
-    name = "verity_util",
-    testonly = 1,
-    srcs = ["verity_util.cc"],
-    hdrs = ["verity_util.h"],
-    deps = [
-        ":fs_util",
-        ":mount_util",
-        ":posix_error",
-        ":temp_path",
     ],
 )
 

@@ -5,6 +5,12 @@ package(
     licenses = ["notice"],
 )
 
+filegroup(
+    name = "all_benchmarks",
+    testonly = 1,
+    data = [":%s" % f[:-3] for f in glob(["*_benchmark.cc"])],
+)
+
 cc_binary(
     name = "getpid_benchmark",
     testonly = 1,
@@ -384,101 +390,5 @@ cc_binary(
         "//test/util:logging",
         "//test/util:temp_path",
         "//test/util:test_main",
-    ],
-)
-
-cc_binary(
-    name = "verity_open_benchmark",
-    testonly = 1,
-    srcs = [
-        "verity_open_benchmark.cc",
-    ],
-    deps = [
-        gbenchmark,
-        gtest,
-        "//test/util:capability_util",
-        "//test/util:fs_util",
-        "//test/util:logging",
-        "//test/util:temp_path",
-        "//test/util:test_main",
-        "//test/util:test_util",
-        "//test/util:verity_util",
-    ],
-)
-
-cc_binary(
-    name = "verity_read_benchmark",
-    testonly = 1,
-    srcs = [
-        "verity_read_benchmark.cc",
-    ],
-    deps = [
-        gbenchmark,
-        gtest,
-        "//test/util:capability_util",
-        "//test/util:fs_util",
-        "//test/util:logging",
-        "//test/util:temp_path",
-        "//test/util:test_main",
-        "//test/util:test_util",
-        "//test/util:verity_util",
-    ],
-)
-
-cc_binary(
-    name = "verity_randread_benchmark",
-    testonly = 1,
-    srcs = [
-        "verity_randread_benchmark.cc",
-    ],
-    deps = [
-        gbenchmark,
-        gtest,
-        "//test/util:capability_util",
-        "//test/util:fs_util",
-        "//test/util:logging",
-        "//test/util:temp_path",
-        "//test/util:test_main",
-        "//test/util:test_util",
-        "//test/util:verity_util",
-    ],
-)
-
-cc_binary(
-    name = "verity_open_read_close_benchmark",
-    testonly = 1,
-    srcs = [
-        "verity_open_read_close_benchmark.cc",
-    ],
-    deps = [
-        gbenchmark,
-        gtest,
-        "//test/util:capability_util",
-        "//test/util:fs_util",
-        "//test/util:logging",
-        "//test/util:temp_path",
-        "//test/util:test_main",
-        "//test/util:test_util",
-        "//test/util:verity_util",
-    ],
-)
-
-cc_binary(
-    name = "verity_stat_benchmark",
-    testonly = 1,
-    srcs = [
-        "verity_stat_benchmark.cc",
-    ],
-    deps = [
-        gbenchmark,
-        gtest,
-        "//test/util:capability_util",
-        "//test/util:fs_util",
-        "//test/util:logging",
-        "//test/util:temp_path",
-        "//test/util:test_main",
-        "//test/util:test_util",
-        "//test/util:verity_util",
-        "@com_google_absl//absl/strings",
     ],
 )

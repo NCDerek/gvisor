@@ -22,7 +22,6 @@ package loopback
 
 import (
 	"gvisor.dev/gvisor/pkg/tcpip"
-	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
@@ -74,15 +73,19 @@ func (*endpoint) LinkAddress() tcpip.LinkAddress {
 // Wait implements stack.LinkEndpoint.Wait.
 func (*endpoint) Wait() {}
 
-// WritePacket implements stack.LinkEndpoint.WritePacket. It delivers outbound
-// packets to the network-layer dispatcher.
-func (e *endpoint) WritePacket(_ stack.RouteInfo, _ tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) tcpip.Error {
-	return e.WriteRawPacket(pkt)
-}
-
 // WritePackets implements stack.LinkEndpoint.WritePackets.
-func (e *endpoint) WritePackets(stack.RouteInfo, stack.PacketBufferList, tcpip.NetworkProtocolNumber) (int, tcpip.Error) {
-	panic("not implemented")
+func (e *endpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) {
+	for _, pkt := range pkts.AsSlice() {
+		// In order to properly loop back to the inbound side we must create a
+		// fresh packet that only contains the underlying payload with no headers
+		// or struct fields set.
+		newPkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
+			Payload: pkt.ToBuffer(),
+		})
+		e.dispatcher.DeliverNetworkPacket(pkt.NetworkProtocolNumber, newPkt)
+		newPkt.DecRef()
+	}
+	return pkts.Len(), nil
 }
 
 // ARPHardwareType implements stack.LinkEndpoint.ARPHardwareType.
@@ -90,21 +93,4 @@ func (*endpoint) ARPHardwareType() header.ARPHardwareType {
 	return header.ARPHardwareLoopback
 }
 
-func (e *endpoint) AddHeader(local, remote tcpip.LinkAddress, protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) {
-}
-
-// WriteRawPacket implements stack.LinkEndpoint.
-func (e *endpoint) WriteRawPacket(pkt *stack.PacketBuffer) tcpip.Error {
-	// Construct data as the unparsed portion for the loopback packet.
-	data := buffer.NewVectorisedView(pkt.Size(), pkt.Views())
-
-	// Because we're immediately turning around and writing the packet back
-	// to the rx path, we intentionally don't preserve the remote and local
-	// link addresses from the stack.Route we're passed.
-	newPkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
-		Data: data,
-	})
-	e.dispatcher.DeliverNetworkPacket("" /* remote */, "" /* local */, pkt.NetworkProtocolNumber, newPkt)
-
-	return nil
-}
+func (*endpoint) AddHeader(stack.PacketBufferPtr) {}

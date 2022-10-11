@@ -71,11 +71,24 @@ func (seg FileRangeIterator) FileRange() memmap.FileRange {
 // FileRangeOf returns the FileRange mapped by mr.
 //
 // Preconditions:
-// * seg.Range().IsSupersetOf(mr).
-// * mr.Length() != 0.
+//   - seg.Range().IsSupersetOf(mr).
+//   - mr.Length() != 0.
 func (seg FileRangeIterator) FileRangeOf(mr memmap.MappableRange) memmap.FileRange {
 	frstart := seg.Value() + (mr.Start - seg.Start())
 	return memmap.FileRange{frstart, frstart + mr.Length()}
+}
+
+// PagesToFill returns the number of pages that that Fill() will allocate
+// for the given required and optional parameters.
+func (frs *FileRangeSet) PagesToFill(required, optional memmap.MappableRange) uint64 {
+	var numPages uint64
+	gap := frs.LowerBoundGap(required.Start)
+	for gap.Ok() && gap.Start() < required.End {
+		gr := gap.Range().Intersect(optional)
+		numPages += gr.Length() / hostarch.PageSize
+		gap = gap.NextGap()
+	}
+	return numPages
 }
 
 // Fill attempts to ensure that all memmap.Mappable offsets in required are
@@ -85,18 +98,22 @@ func (seg FileRangeIterator) FileRangeOf(mr memmap.MappableRange) memmap.FileRan
 // bytes have been read.) EOF is handled consistently with the requirements of
 // mmap(2): bytes after EOF on the same page are zeroed; pages after EOF are
 // invalid. fileSize is an upper bound on the file's size; bytes after fileSize
-// will be zeroed without calling readAt.
+// will be zeroed without calling readAt. populate has the same meaning as the
+// pgalloc.MemoryFile.AllocateAndFill() argument of the same name.
 //
 // Fill may read offsets outside of required, but will never read offsets
 // outside of optional. It returns a non-nil error if any error occurs, even
 // if the error only affects offsets in optional, but not in required.
 //
+// Fill returns the number of pages that were allocated.
+//
 // Preconditions:
-// * required.Length() > 0.
-// * optional.IsSupersetOf(required).
-// * required and optional must be page-aligned.
-func (frs *FileRangeSet) Fill(ctx context.Context, required, optional memmap.MappableRange, fileSize uint64, mf *pgalloc.MemoryFile, kind usage.MemoryKind, readAt func(ctx context.Context, dsts safemem.BlockSeq, offset uint64) (uint64, error)) error {
+//   - required.Length() > 0.
+//   - optional.IsSupersetOf(required).
+//   - required and optional must be page-aligned.
+func (frs *FileRangeSet) Fill(ctx context.Context, required, optional memmap.MappableRange, fileSize uint64, mf *pgalloc.MemoryFile, kind usage.MemoryKind, populate bool, readAt func(ctx context.Context, dsts safemem.BlockSeq, offset uint64) (uint64, error)) (uint64, error) {
 	gap := frs.LowerBoundGap(required.Start)
+	var pagesAlloced uint64
 	for gap.Ok() && gap.Start() < required.End {
 		if gap.Range().Length() == 0 {
 			gap = gap.NextGap()
@@ -105,7 +122,7 @@ func (frs *FileRangeSet) Fill(ctx context.Context, required, optional memmap.Map
 		gr := gap.Range().Intersect(optional)
 
 		// Read data into the gap.
-		fr, err := mf.AllocateAndFill(gr.Length(), kind, safemem.ReaderFunc(func(dsts safemem.BlockSeq) (uint64, error) {
+		fr, err := mf.AllocateAndFill(gr.Length(), kind, populate, safemem.ReaderFunc(func(dsts safemem.BlockSeq) (uint64, error) {
 			var done uint64
 			for !dsts.IsEmpty() {
 				n, err := func() (uint64, error) {
@@ -148,14 +165,15 @@ func (frs *FileRangeSet) Fill(ctx context.Context, required, optional memmap.Map
 		// Store anything we managed to read into the cache.
 		if done := fr.Length(); done != 0 {
 			gr.End = gr.Start + done
+			pagesAlloced += gr.Length() / hostarch.PageSize
 			gap = frs.Insert(gap, gr, fr.Start).NextGap()
 		}
 
 		if err != nil {
-			return err
+			return pagesAlloced, err
 		}
 	}
-	return nil
+	return pagesAlloced, nil
 }
 
 // Drop removes segments for memmap.Mappable offsets in mr, freeing the
@@ -172,18 +190,22 @@ func (frs *FileRangeSet) Drop(mr memmap.MappableRange, mf *pgalloc.MemoryFile) {
 }
 
 // DropAll removes all segments in mr, freeing the corresponding
-// memmap.FileRanges.
-func (frs *FileRangeSet) DropAll(mf *pgalloc.MemoryFile) {
+// memmap.FileRanges. It returns the number of pages freed.
+func (frs *FileRangeSet) DropAll(mf *pgalloc.MemoryFile) uint64 {
+	var pagesFreed uint64
 	for seg := frs.FirstSegment(); seg.Ok(); seg = seg.NextSegment() {
 		mf.DecRef(seg.FileRange())
+		pagesFreed += seg.Range().Length() / hostarch.PageSize
 	}
 	frs.RemoveAll()
+	return pagesFreed
 }
 
 // Truncate updates frs to reflect Mappable truncation to the given length:
 // bytes after the new EOF on the same page are zeroed, and pages after the new
-// EOF are freed.
-func (frs *FileRangeSet) Truncate(end uint64, mf *pgalloc.MemoryFile) {
+// EOF are freed. It returns the number of pages freed.
+func (frs *FileRangeSet) Truncate(end uint64, mf *pgalloc.MemoryFile) uint64 {
+	var pagesFreed uint64
 	pgendaddr, ok := hostarch.Addr(end).RoundUp()
 	if ok {
 		pgend := uint64(pgendaddr)
@@ -193,11 +215,12 @@ func (frs *FileRangeSet) Truncate(end uint64, mf *pgalloc.MemoryFile) {
 		seg := frs.LowerBoundSegment(pgend)
 		for seg.Ok() {
 			mf.DecRef(seg.FileRange())
+			pagesFreed += seg.Range().Length() / hostarch.PageSize
 			seg = frs.Remove(seg).NextSegment()
 		}
 
 		if end == pgend {
-			return
+			return pagesFreed
 		}
 	}
 
@@ -224,4 +247,5 @@ func (frs *FileRangeSet) Truncate(end uint64, mf *pgalloc.MemoryFile) {
 			panic(fmt.Sprintf("Zeroing %v failed: %v", fr, err))
 		}
 	}
+	return pagesFreed
 }

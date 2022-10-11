@@ -943,5 +943,60 @@ TEST_P(AllSocketPairTest, GetSocketOutOfBandInlineOption) {
   EXPECT_EQ(enable, want);
 }
 
+TEST_P(AllSocketPairTest, GetSocketRcvbufOption) {
+  auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
+
+  int rcvBufSz = 0;
+  ASSERT_THAT(setsockopt(sockets->first_fd(), SOL_SOCKET, SO_RCVBUF, &rcvBufSz,
+                         sizeof(rcvBufSz)),
+              SyscallSucceeds());
+
+  int opt = 0;
+  socklen_t opt_len = sizeof(opt);
+  ASSERT_THAT(
+      getsockopt(sockets->first_fd(), SOL_SOCKET, SO_RCVBUF, &opt, &opt_len),
+      SyscallSucceeds());
+  ASSERT_EQ(opt_len, sizeof(opt));
+
+  if (IsRunningOnGvisor()) {
+    // Minimum buffer size in gVisor is 4KiB.
+    const int minRcvBufSizeGvisor = 4096;
+    EXPECT_EQ(opt, minRcvBufSizeGvisor);
+  } else {
+    // This value is derived as (2048 + sizeof(sk_buff)).
+    const int minRcvBufSizeLinux = 2304;
+    EXPECT_EQ(opt, minRcvBufSizeLinux);
+  }
+}
+
+TEST_P(AllSocketPairTest, GetSetSocketRcvlowatOption) {
+  auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
+
+  int opt = 0;
+  socklen_t opt_len = sizeof(opt);
+  constexpr int defaultSz = 1;
+  ASSERT_THAT(
+      getsockopt(sockets->first_fd(), SOL_SOCKET, SO_RCVLOWAT, &opt, &opt_len),
+      SyscallSucceeds());
+  ASSERT_EQ(opt_len, sizeof(opt));
+  EXPECT_EQ(opt, defaultSz);
+
+  int rcvlowatSz = 100;
+  ASSERT_THAT(setsockopt(sockets->first_fd(), SOL_SOCKET, SO_RCVLOWAT,
+                         &rcvlowatSz, sizeof(rcvlowatSz)),
+              SyscallSucceeds());
+
+  ASSERT_THAT(
+      getsockopt(sockets->first_fd(), SOL_SOCKET, SO_RCVLOWAT, &opt, &opt_len),
+      SyscallSucceeds());
+  ASSERT_EQ(opt_len, sizeof(opt));
+
+  if (IsRunningOnGvisor()) {
+    // TODO(b/226603727): Add support for setting SO_RCVLOWAT option in gVisor.
+    EXPECT_EQ(opt, defaultSz);
+  } else {
+    EXPECT_EQ(opt, rcvlowatSz);
+  }
+}
 }  // namespace testing
 }  // namespace gvisor

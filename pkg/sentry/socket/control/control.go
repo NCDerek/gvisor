@@ -17,6 +17,9 @@
 package control
 
 import (
+	"math"
+	"time"
+
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/bits"
 	"gvisor.dev/gvisor/pkg/context"
@@ -30,8 +33,6 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/socket"
 	"gvisor.dev/gvisor/pkg/sentry/socket/unix/transport"
 )
-
-const maxInt = int(^uint(0) >> 1)
 
 // SCMCredentials represents a SCM_CREDENTIALS socket control message.
 type SCMCredentials interface {
@@ -64,10 +65,10 @@ type RightsFiles []*fs.File
 
 // NewSCMRights creates a new SCM_RIGHTS socket control message representation
 // using local sentry FDs.
-func NewSCMRights(t *kernel.Task, fds []int32) (SCMRights, error) {
+func NewSCMRights(t *kernel.Task, fds []primitive.Int32) (SCMRights, error) {
 	files := make(RightsFiles, 0, len(fds))
 	for _, fd := range fds {
-		file := t.GetFile(fd)
+		file := t.GetFile(int32(fd))
 		if file == nil {
 			files.Release(t)
 			return nil, linuxerr.EBADF
@@ -78,7 +79,7 @@ func NewSCMRights(t *kernel.Task, fds []int32) (SCMRights, error) {
 }
 
 // Files implements SCMRights.Files.
-func (fs *RightsFiles) Files(ctx context.Context, max int) (RightsFiles, bool) {
+func (fs *RightsFiles) Files(_ context.Context, max int) (RightsFiles, bool) {
 	n := max
 	var trunc bool
 	if l := len(*fs); n > l {
@@ -124,7 +125,7 @@ func rightsFDs(t *kernel.Task, rights SCMRights, cloexec bool, max int) ([]int32
 			break
 		}
 
-		fds = append(fds, int32(fd))
+		fds = append(fds, fd)
 	}
 	return fds, trunc
 }
@@ -300,8 +301,8 @@ func alignSlice(buf []byte, align uint) []byte {
 }
 
 // PackTimestamp packs a SO_TIMESTAMP socket control message.
-func PackTimestamp(t *kernel.Task, timestamp int64, buf []byte) []byte {
-	timestampP := linux.NsecToTimeval(timestamp)
+func PackTimestamp(t *kernel.Task, timestamp time.Time, buf []byte) []byte {
+	timestampP := linux.NsecToTimeval(timestamp.UnixNano())
 	return putCmsgStruct(
 		buf,
 		linux.SOL_SOCKET,
@@ -344,12 +345,45 @@ func PackTClass(t *kernel.Task, tClass uint32, buf []byte) []byte {
 	)
 }
 
+// PackTTL packs an IP_TTL socket control message.
+func PackTTL(t *kernel.Task, ttl uint32, buf []byte) []byte {
+	return putCmsgStruct(
+		buf,
+		linux.SOL_IP,
+		linux.IP_TTL,
+		t.Arch().Width(),
+		primitive.AllocateUint32(ttl),
+	)
+}
+
+// PackHopLimit packs an IPV6_HOPLIMIT socket control message.
+func PackHopLimit(t *kernel.Task, hoplimit uint32, buf []byte) []byte {
+	return putCmsgStruct(
+		buf,
+		linux.SOL_IPV6,
+		linux.IPV6_HOPLIMIT,
+		t.Arch().Width(),
+		primitive.AllocateUint32(hoplimit),
+	)
+}
+
 // PackIPPacketInfo packs an IP_PKTINFO socket control message.
 func PackIPPacketInfo(t *kernel.Task, packetInfo *linux.ControlMessageIPPacketInfo, buf []byte) []byte {
 	return putCmsgStruct(
 		buf,
 		linux.SOL_IP,
 		linux.IP_PKTINFO,
+		t.Arch().Width(),
+		packetInfo,
+	)
+}
+
+// PackIPv6PacketInfo packs an IPV6_PKTINFO socket control message.
+func PackIPv6PacketInfo(t *kernel.Task, packetInfo *linux.ControlMessageIPv6PacketInfo, buf []byte) []byte {
+	return putCmsgStruct(
+		buf,
+		linux.SOL_IPV6,
+		linux.IPV6_PKTINFO,
 		t.Arch().Width(),
 		packetInfo,
 	)
@@ -404,12 +438,24 @@ func PackControlMessages(t *kernel.Task, cmsgs socket.ControlMessages, buf []byt
 		buf = PackTOS(t, cmsgs.IP.TOS, buf)
 	}
 
+	if cmsgs.IP.HasTTL {
+		buf = PackTTL(t, cmsgs.IP.TTL, buf)
+	}
+
 	if cmsgs.IP.HasTClass {
 		buf = PackTClass(t, cmsgs.IP.TClass, buf)
 	}
 
+	if cmsgs.IP.HasHopLimit {
+		buf = PackHopLimit(t, cmsgs.IP.HopLimit, buf)
+	}
+
 	if cmsgs.IP.HasIPPacketInfo {
 		buf = PackIPPacketInfo(t, &cmsgs.IP.PacketInfo, buf)
+	}
+
+	if cmsgs.IP.HasIPv6PacketInfo {
+		buf = PackIPv6PacketInfo(t, &cmsgs.IP.IPv6PacketInfo, buf)
 	}
 
 	if cmsgs.IP.OriginalDstAddress != nil {
@@ -445,12 +491,24 @@ func CmsgsSpace(t *kernel.Task, cmsgs socket.ControlMessages) int {
 		space += cmsgSpace(t, linux.SizeOfControlMessageTOS)
 	}
 
+	if cmsgs.IP.HasTTL {
+		space += cmsgSpace(t, linux.SizeOfControlMessageTTL)
+	}
+
 	if cmsgs.IP.HasTClass {
 		space += cmsgSpace(t, linux.SizeOfControlMessageTClass)
 	}
 
+	if cmsgs.IP.HasHopLimit {
+		space += cmsgSpace(t, linux.SizeOfControlMessageHopLimit)
+	}
+
 	if cmsgs.IP.HasIPPacketInfo {
 		space += cmsgSpace(t, linux.SizeOfControlMessageIPPacketInfo)
+	}
+
+	if cmsgs.IP.HasIPv6PacketInfo {
+		space += cmsgSpace(t, linux.SizeOfControlMessageIPv6PacketInfo)
 	}
 
 	if cmsgs.IP.OriginalDstAddress != nil {
@@ -465,29 +523,32 @@ func CmsgsSpace(t *kernel.Task, cmsgs socket.ControlMessages) int {
 }
 
 // Parse parses a raw socket control message into portable objects.
+// TODO(https://gvisor.dev/issue/7188): Parse is only called on raw cmsg that
+// are used when sending a messages. We should fail with EINVAL when we find a
+// non-sendable control messages (such as IP_RECVERR). And the function should
+// be renamed to reflect that.
 func Parse(t *kernel.Task, socketOrEndpoint interface{}, buf []byte, width uint) (socket.ControlMessages, error) {
 	var (
 		cmsgs socket.ControlMessages
-		fds   linux.ControlMessageRights
+		fds   []primitive.Int32
 	)
 
-	for i := 0; i < len(buf); {
-		if i+linux.SizeOfControlMessageHeader > len(buf) {
+	for len(buf) > 0 {
+		if linux.SizeOfControlMessageHeader > len(buf) {
 			return cmsgs, linuxerr.EINVAL
 		}
 
 		var h linux.ControlMessageHeader
-		h.UnmarshalUnsafe(buf[i : i+linux.SizeOfControlMessageHeader])
+		buf = h.UnmarshalUnsafe(buf)
 
 		if h.Length < uint64(linux.SizeOfControlMessageHeader) {
 			return socket.ControlMessages{}, linuxerr.EINVAL
 		}
-		if h.Length > uint64(len(buf)-i) {
+
+		length := int(h.Length) - linux.SizeOfControlMessageHeader
+		if length < 0 || length > len(buf) {
 			return socket.ControlMessages{}, linuxerr.EINVAL
 		}
-
-		i += linux.SizeOfControlMessageHeader
-		length := int(h.Length) - linux.SizeOfControlMessageHeader
 
 		switch h.Level {
 		case linux.SOL_SOCKET:
@@ -500,11 +561,9 @@ func Parse(t *kernel.Task, socketOrEndpoint interface{}, buf []byte, width uint)
 					return socket.ControlMessages{}, linuxerr.EINVAL
 				}
 
-				for j := i; j < i+rightsSize; j += linux.SizeOfControlMessageRight {
-					fds = append(fds, int32(hostarch.ByteOrder.Uint32(buf[j:j+linux.SizeOfControlMessageRight])))
-				}
-
-				i += bits.AlignUp(length, width)
+				curFDs := make([]primitive.Int32, numRights)
+				primitive.UnmarshalUnsafeInt32Slice(curFDs, buf[:rightsSize])
+				fds = append(fds, curFDs...)
 
 			case linux.SCM_CREDENTIALS:
 				if length < linux.SizeOfControlMessageCredentials {
@@ -512,23 +571,21 @@ func Parse(t *kernel.Task, socketOrEndpoint interface{}, buf []byte, width uint)
 				}
 
 				var creds linux.ControlMessageCredentials
-				creds.UnmarshalUnsafe(buf[i : i+linux.SizeOfControlMessageCredentials])
+				creds.UnmarshalUnsafe(buf)
 				scmCreds, err := NewSCMCredentials(t, creds)
 				if err != nil {
 					return socket.ControlMessages{}, err
 				}
 				cmsgs.Unix.Credentials = scmCreds
-				i += bits.AlignUp(length, width)
 
 			case linux.SO_TIMESTAMP:
 				if length < linux.SizeOfTimeval {
 					return socket.ControlMessages{}, linuxerr.EINVAL
 				}
 				var ts linux.Timeval
-				ts.UnmarshalUnsafe(buf[i : i+linux.SizeOfTimeval])
-				cmsgs.IP.Timestamp = ts.ToNsecCapped()
+				ts.UnmarshalUnsafe(buf)
+				cmsgs.IP.Timestamp = ts.ToTime()
 				cmsgs.IP.HasTimestamp = true
-				i += bits.AlignUp(length, width)
 
 			default:
 				// Unknown message type.
@@ -542,9 +599,20 @@ func Parse(t *kernel.Task, socketOrEndpoint interface{}, buf []byte, width uint)
 				}
 				cmsgs.IP.HasTOS = true
 				var tos primitive.Uint8
-				tos.UnmarshalUnsafe(buf[i : i+linux.SizeOfControlMessageTOS])
+				tos.UnmarshalUnsafe(buf)
 				cmsgs.IP.TOS = uint8(tos)
-				i += bits.AlignUp(length, width)
+
+			case linux.IP_TTL:
+				if length < linux.SizeOfControlMessageTTL {
+					return socket.ControlMessages{}, linuxerr.EINVAL
+				}
+				var ttl primitive.Uint32
+				ttl.UnmarshalUnsafe(buf)
+				if ttl == 0 || ttl > math.MaxUint8 {
+					return socket.ControlMessages{}, linuxerr.EINVAL
+				}
+				cmsgs.IP.TTL = uint32(ttl)
+				cmsgs.IP.HasTTL = true
 
 			case linux.IP_PKTINFO:
 				if length < linux.SizeOfControlMessageIPPacketInfo {
@@ -553,19 +621,16 @@ func Parse(t *kernel.Task, socketOrEndpoint interface{}, buf []byte, width uint)
 
 				cmsgs.IP.HasIPPacketInfo = true
 				var packetInfo linux.ControlMessageIPPacketInfo
-				packetInfo.UnmarshalUnsafe(buf[i : i+linux.SizeOfControlMessageIPPacketInfo])
-
+				packetInfo.UnmarshalUnsafe(buf)
 				cmsgs.IP.PacketInfo = packetInfo
-				i += bits.AlignUp(length, width)
 
 			case linux.IP_RECVORIGDSTADDR:
 				var addr linux.SockAddrInet
 				if length < addr.SizeBytes() {
 					return socket.ControlMessages{}, linuxerr.EINVAL
 				}
-				addr.UnmarshalUnsafe(buf[i : i+addr.SizeBytes()])
+				addr.UnmarshalUnsafe(buf)
 				cmsgs.IP.OriginalDstAddress = &addr
-				i += bits.AlignUp(length, width)
 
 			case linux.IP_RECVERR:
 				var errCmsg linux.SockErrCMsgIPv4
@@ -573,9 +638,8 @@ func Parse(t *kernel.Task, socketOrEndpoint interface{}, buf []byte, width uint)
 					return socket.ControlMessages{}, linuxerr.EINVAL
 				}
 
-				errCmsg.UnmarshalBytes(buf[i : i+errCmsg.SizeBytes()])
+				errCmsg.UnmarshalBytes(buf)
 				cmsgs.IP.SockErr = &errCmsg
-				i += bits.AlignUp(length, width)
 
 			default:
 				return socket.ControlMessages{}, linuxerr.EINVAL
@@ -588,18 +652,38 @@ func Parse(t *kernel.Task, socketOrEndpoint interface{}, buf []byte, width uint)
 				}
 				cmsgs.IP.HasTClass = true
 				var tclass primitive.Uint32
-				tclass.UnmarshalUnsafe(buf[i : i+linux.SizeOfControlMessageTClass])
+				tclass.UnmarshalUnsafe(buf)
 				cmsgs.IP.TClass = uint32(tclass)
-				i += bits.AlignUp(length, width)
+
+			case linux.IPV6_PKTINFO:
+				if length < linux.SizeOfControlMessageIPv6PacketInfo {
+					return socket.ControlMessages{}, linuxerr.EINVAL
+				}
+
+				cmsgs.IP.HasIPv6PacketInfo = true
+				var packetInfo linux.ControlMessageIPv6PacketInfo
+				packetInfo.UnmarshalUnsafe(buf)
+				cmsgs.IP.IPv6PacketInfo = packetInfo
+
+			case linux.IPV6_HOPLIMIT:
+				if length < linux.SizeOfControlMessageHopLimit {
+					return socket.ControlMessages{}, linuxerr.EINVAL
+				}
+				var hoplimit primitive.Uint32
+				hoplimit.UnmarshalUnsafe(buf)
+				if hoplimit > math.MaxUint8 {
+					return socket.ControlMessages{}, linuxerr.EINVAL
+				}
+				cmsgs.IP.HasHopLimit = true
+				cmsgs.IP.HopLimit = uint32(hoplimit)
 
 			case linux.IPV6_RECVORIGDSTADDR:
 				var addr linux.SockAddrInet6
 				if length < addr.SizeBytes() {
 					return socket.ControlMessages{}, linuxerr.EINVAL
 				}
-				addr.UnmarshalUnsafe(buf[i : i+addr.SizeBytes()])
+				addr.UnmarshalUnsafe(buf)
 				cmsgs.IP.OriginalDstAddress = &addr
-				i += bits.AlignUp(length, width)
 
 			case linux.IPV6_RECVERR:
 				var errCmsg linux.SockErrCMsgIPv6
@@ -607,15 +691,19 @@ func Parse(t *kernel.Task, socketOrEndpoint interface{}, buf []byte, width uint)
 					return socket.ControlMessages{}, linuxerr.EINVAL
 				}
 
-				errCmsg.UnmarshalBytes(buf[i : i+errCmsg.SizeBytes()])
+				errCmsg.UnmarshalBytes(buf)
 				cmsgs.IP.SockErr = &errCmsg
-				i += bits.AlignUp(length, width)
 
 			default:
 				return socket.ControlMessages{}, linuxerr.EINVAL
 			}
 		default:
 			return socket.ControlMessages{}, linuxerr.EINVAL
+		}
+		if shift := bits.AlignUp(length, width); shift > len(buf) {
+			buf = buf[:0]
+		} else {
+			buf = buf[shift:]
 		}
 	}
 

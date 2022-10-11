@@ -11,6 +11,7 @@ proto_library(
 go_library(
     name = "control",
     srcs = [
+        "cgroups.go",
         "control.go",
         "events.go",
         "fs.go",
@@ -25,16 +26,19 @@ go_library(
         "//:sandbox",
     ],
     deps = [
+        ":control_go_proto",
         "//pkg/abi/linux",
         "//pkg/context",
         "//pkg/eventchannel",
         "//pkg/fd",
+        "//pkg/fspath",
         "//pkg/log",
         "//pkg/sentry/fdimport",
         "//pkg/sentry/fs",
         "//pkg/sentry/fs/host",
         "//pkg/sentry/fs/user",
         "//pkg/sentry/fsimpl/host",
+        "//pkg/sentry/fsmetric",
         "//pkg/sentry/kernel",
         "//pkg/sentry/kernel/auth",
         "//pkg/sentry/kernel/time",

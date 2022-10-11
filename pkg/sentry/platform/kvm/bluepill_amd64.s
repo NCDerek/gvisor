@@ -19,6 +19,11 @@
 // This is guaranteed to be zero.
 #define VCPU_CPU 0x0
 
+// ENTRY_CPU_SELF is the location of the CPU in the entry struct.
+//
+// This is sourced from ring0.
+#define ENTRY_CPU_SELF {{ .kernelEntry.cpuSelf.Offset }}
+
 // Context offsets.
 //
 // Only limited use of the context is done in the assembly stub below, most is
@@ -31,6 +36,9 @@
 //
 // This is checked as the source of the fault.
 #define CLI $0xfa
+
+// System call definitions.
+#define SYS_MMAP 9
 
 // See bluepill.go.
 TEXT ·bluepill(SB),NOSPLIT,$0
@@ -92,6 +100,31 @@ fallback:
 // func addrOfSighandler() uintptr
 TEXT ·addrOfSighandler(SB), $0-8
 	MOVQ $·sighandler(SB), AX
+	MOVQ AX, ret+0(FP)
+	RET
+
+TEXT ·sigsysHandler(SB),NOSPLIT,$0
+	// Check if the signal is from the kernel.
+	MOVQ $1, CX
+	CMPL CX, 0x8(SI)
+	JNE fallback
+
+	MOVL CONTEXT_RAX(DX), CX
+	CMPL CX, $SYS_MMAP
+	JNE fallback
+	PUSHQ DX                    // First argument (context).
+	CALL ·seccompMmapHandler(SB)    // Call the handler.
+	POPQ DX                     // Discard the argument.
+	RET
+fallback:
+	// Jump to the previous signal handler.
+	XORQ CX, CX
+	MOVQ ·savedSigsysHandler(SB), AX
+	JMP AX
+
+// func addrOfSighandler() uintptr
+TEXT ·addrOfSigsysHandler(SB), $0-8
+	MOVQ $·sigsysHandler(SB), AX
 	MOVQ AX, ret+0(FP)
 	RET
 

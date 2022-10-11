@@ -19,23 +19,31 @@ import (
 	"go/token"
 	"go/types"
 	"strings"
-	"sync/atomic"
 
 	"golang.org/x/tools/go/ssa"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 )
+
+// lockInfo describes a held lock.
+type lockInfo struct {
+	exclusive bool
+	object    types.Object
+}
 
 // lockState tracks the locking state and aliases.
 type lockState struct {
 	// lockedMutexes is used to track which mutexes in a given struct are
 	// currently locked. Note that most of the heavy lifting is done by
-	// valueAsString below, which maps to specific structure fields, etc.
-	lockedMutexes []string
+	// valueAndObject below, which maps to specific structure fields, etc.
+	//
+	// The value indicates whether this is an exclusive lock.
+	lockedMutexes map[string]lockInfo
 
 	// stored stores values that have been stored in memory, bound to
 	// FreeVars or passed as Parameterse.
 	stored map[ssa.Value]ssa.Value
 
-	// used is a temporary map, used only for valueAsString. It prevents
+	// used is a temporary map, used only for valueAndObject. It prevents
 	// multiple use of the same memory location.
 	used map[ssa.Value]struct{}
 
@@ -44,14 +52,14 @@ type lockState struct {
 
 	// refs indicates the number of references on this structure. If it's
 	// greater than one, we will do copy-on-write.
-	refs *int32
+	refs *atomicbitops.Int32
 }
 
 // newLockState makes a new lockState.
 func newLockState() *lockState {
-	refs := int32(1) // Not shared.
+	refs := atomicbitops.FromInt32(1) // Not shared.
 	return &lockState{
-		lockedMutexes: make([]string, 0),
+		lockedMutexes: make(map[string]lockInfo),
 		used:          make(map[ssa.Value]struct{}),
 		stored:        make(map[ssa.Value]ssa.Value),
 		defers:        make([]*ssa.Defer, 0),
@@ -65,7 +73,7 @@ func (l *lockState) fork() *lockState {
 	if l == nil {
 		return newLockState()
 	}
-	atomic.AddInt32(l.refs, 1)
+	l.refs.Add(1)
 	return &lockState{
 		lockedMutexes: l.lockedMutexes,
 		used:          make(map[ssa.Value]struct{}),
@@ -77,10 +85,12 @@ func (l *lockState) fork() *lockState {
 
 // modify indicates that this state will be modified.
 func (l *lockState) modify() {
-	if atomic.LoadInt32(l.refs) > 1 {
+	if l.refs.Load() > 1 {
 		// Copy the lockedMutexes.
-		lm := make([]string, len(l.lockedMutexes))
-		copy(lm, l.lockedMutexes)
+		lm := make(map[string]lockInfo)
+		for k, v := range l.lockedMutexes {
+			lm[k] = v
+		}
 		l.lockedMutexes = lm
 
 		// Copy the stored values.
@@ -99,62 +109,95 @@ func (l *lockState) modify() {
 		l.defers = ds
 
 		// Drop our reference.
-		atomic.AddInt32(l.refs, -1)
-		newRefs := int32(1) // Not shared.
+		l.refs.Add(-1)
+		newRefs := atomicbitops.FromInt32(1) // Not shared.
 		l.refs = &newRefs
 	}
 }
 
 // isHeld indicates whether the field is held is not.
-func (l *lockState) isHeld(rv resolvedValue) (string, bool) {
-	if !rv.valid {
-		return rv.valueAsString(l), false
+//
+// Precondition: rv must be valid.
+func (l *lockState) isHeld(rv resolvedValue, exclusiveRequired bool) (string, bool) {
+	if !rv.valid() {
+		panic("invalid resolvedValue passed to isHeld")
 	}
-	s := rv.valueAsString(l)
-	for _, k := range l.lockedMutexes {
-		if k == s {
-			return s, true
-		}
+	s, _ := rv.valueAndObject(l)
+	info, ok := l.lockedMutexes[s]
+	if !ok {
+		return s, false
 	}
-	return s, false
+	// Accept a weaker lock if exclusiveRequired is false.
+	if exclusiveRequired && !info.exclusive {
+		return s, false
+	}
+	return s, true
 }
 
 // lockField locks the given field.
 //
 // If false is returned, the field was already locked.
-func (l *lockState) lockField(rv resolvedValue) (string, bool) {
-	if !rv.valid {
-		return rv.valueAsString(l), false
+//
+// Precondition: rv must be valid.
+func (l *lockState) lockField(rv resolvedValue, exclusive bool) (string, bool) {
+	if !rv.valid() {
+		panic("invalid resolvedValue passed to isHeld")
 	}
-	s := rv.valueAsString(l)
-	for _, k := range l.lockedMutexes {
-		if k == s {
-			return s, false
-		}
+	s, obj := rv.valueAndObject(l)
+	if _, ok := l.lockedMutexes[s]; ok {
+		return s, false
 	}
 	l.modify()
-	l.lockedMutexes = append(l.lockedMutexes, s)
+	l.lockedMutexes[s] = lockInfo{
+		exclusive: exclusive,
+		object:    obj,
+	}
 	return s, true
 }
 
 // unlockField unlocks the given field.
 //
 // If false is returned, the field was not locked.
-func (l *lockState) unlockField(rv resolvedValue) (string, bool) {
-	if !rv.valid {
-		return rv.valueAsString(l), false
+//
+// Precondition: rv must be valid.
+func (l *lockState) unlockField(rv resolvedValue, exclusive bool) (string, bool) {
+	if !rv.valid() {
+		panic("invalid resolvedValue passed to isHeld")
 	}
-	s := rv.valueAsString(l)
-	for i, k := range l.lockedMutexes {
-		if k == s {
-			// Copy the last lock in and truncate.
-			l.modify()
-			l.lockedMutexes[i] = l.lockedMutexes[len(l.lockedMutexes)-1]
-			l.lockedMutexes = l.lockedMutexes[:len(l.lockedMutexes)-1]
-			return s, true
-		}
+	s, _ := rv.valueAndObject(l)
+	info, ok := l.lockedMutexes[s]
+	if !ok {
+		return s, false
 	}
-	return s, false
+	if info.exclusive != exclusive {
+		return s, false
+	}
+	l.modify()
+	delete(l.lockedMutexes, s)
+	return s, true
+}
+
+// downgradeField downgrades the given field.
+//
+// If false was returned, the field was not downgraded.
+//
+// Precondition: rv must be valid.
+func (l *lockState) downgradeField(rv resolvedValue) (string, bool) {
+	if !rv.valid() {
+		panic("invalid resolvedValue passed to isHeld")
+	}
+	s, _ := rv.valueAndObject(l)
+	info, ok := l.lockedMutexes[s]
+	if !ok {
+		return s, false
+	}
+	if !info.exclusive {
+		return s, false
+	}
+	l.modify()
+	info.exclusive = false
+	l.lockedMutexes[s] = info // Downgraded.
+	return s, true
 }
 
 // store records an alias.
@@ -165,16 +208,17 @@ func (l *lockState) store(addr ssa.Value, v ssa.Value) {
 
 // isSubset indicates other holds all the locks held by l.
 func (l *lockState) isSubset(other *lockState) bool {
-	held := 0 // Number in l, held by other.
-	for _, k := range l.lockedMutexes {
-		for _, ok := range other.lockedMutexes {
-			if k == ok {
-				held++
-				break
-			}
+	for k, info := range l.lockedMutexes {
+		otherInfo, otherOk := other.lockedMutexes[k]
+		if !otherOk {
+			return false
+		}
+		// Accept weaker locks as a subset.
+		if info.exclusive && !otherInfo.exclusive {
+			return false
 		}
 	}
-	return held >= len(l.lockedMutexes)
+	return true
 }
 
 // count indicates the number of locks held.
@@ -192,25 +236,26 @@ type elemType interface {
 	Elem() types.Type
 }
 
-// valueAsString returns a string for a given value.
+// valueAndObject returns a string for a given value, along with a source level
+// object (if available and relevant).
 //
 // This decomposes the value into the simplest possible representation in terms
 // of parameters, free variables and globals. During resolution, stored values
 // may be transferred, as well as bound free variables.
 //
 // Nil may not be passed here.
-func (l *lockState) valueAsString(v ssa.Value) string {
+func (l *lockState) valueAndObject(v ssa.Value) (string, types.Object) {
 	switch x := v.(type) {
 	case *ssa.Parameter:
 		// Was this provided as a paramter for a local anonymous
 		// function invocation?
 		v, ok := l.stored[x]
 		if ok {
-			return l.valueAsString(v)
+			return l.valueAndObject(v)
 		}
-		return fmt.Sprintf("{param:%s}", x.Name())
+		return fmt.Sprintf("{param:%s}", x.Name()), x.Object()
 	case *ssa.Global:
-		return fmt.Sprintf("{global:%s}", x.Name())
+		return fmt.Sprintf("{global:%s}", x.Name()), x.Object()
 	case *ssa.FreeVar:
 		// Attempt to resolve this, in case we are being invoked in a
 		// scope where all the variables are bound.
@@ -221,16 +266,18 @@ func (l *lockState) valueAsString(v ssa.Value) string {
 			// may map to the same FreeVar, which we can check.
 			stored, ok := l.stored[v]
 			if ok {
-				return l.valueAsString(stored)
+				return l.valueAndObject(stored)
 			}
 		}
-		return fmt.Sprintf("{freevar:%s}", x.Name())
+		// FreeVar does not have a corresponding source-level object
+		// that we can return here.
+		return fmt.Sprintf("{freevar:%s}", x.Name()), nil
 	case *ssa.Convert:
 		// Just disregard conversion.
-		return l.valueAsString(x.X)
+		return l.valueAndObject(x.X)
 	case *ssa.ChangeType:
 		// Ditto, disregard.
-		return l.valueAsString(x.X)
+		return l.valueAndObject(x.X)
 	case *ssa.UnOp:
 		if x.Op != token.MUL {
 			break
@@ -238,7 +285,7 @@ func (l *lockState) valueAsString(v ssa.Value) string {
 		// Is this loading a free variable? If yes, then this can be
 		// resolved in the original isAlias function.
 		if fv, ok := x.X.(*ssa.FreeVar); ok {
-			return l.valueAsString(fv)
+			return l.valueAndObject(fv)
 		}
 		// Should be try to resolve via a memory address? This needs to
 		// be done since a memory location can hold its own value.
@@ -249,12 +296,13 @@ func (l *lockState) valueAsString(v ssa.Value) string {
 			if ok {
 				l.used[x.X] = struct{}{}
 				defer func() { delete(l.used, x.X) }()
-				return l.valueAsString(v)
+				return l.valueAndObject(v)
 			}
 		}
 		// x.X.Type is pointer. We must construct this type
 		// dynamically, since the ssa.Value could be synthetic.
-		return fmt.Sprintf("*(%s)", l.valueAsString(x.X))
+		s, obj := l.valueAndObject(x.X)
+		return fmt.Sprintf("*(%s)", s), obj
 	case *ssa.Field:
 		structType, ok := resolveStruct(x.X.Type())
 		if !ok {
@@ -262,7 +310,8 @@ func (l *lockState) valueAsString(v ssa.Value) string {
 			panic(fmt.Sprintf("structType not available for struct: %#v", x.X))
 		}
 		fieldObj := structType.Field(x.Field)
-		return fmt.Sprintf("%s.%s", l.valueAsString(x.X), fieldObj.Name())
+		s, _ := l.valueAndObject(x.X)
+		return fmt.Sprintf("%s.%s", s, fieldObj.Name()), fieldObj
 	case *ssa.FieldAddr:
 		structType, ok := resolveStruct(x.X.Type())
 		if !ok {
@@ -270,22 +319,30 @@ func (l *lockState) valueAsString(v ssa.Value) string {
 			panic(fmt.Sprintf("structType not available for struct: %#v", x.X))
 		}
 		fieldObj := structType.Field(x.Field)
-		return fmt.Sprintf("&(%s.%s)", l.valueAsString(x.X), fieldObj.Name())
+		s, _ := l.valueAndObject(x.X)
+		return fmt.Sprintf("&(%s.%s)", s, fieldObj.Name()), fieldObj
 	case *ssa.Index:
-		return fmt.Sprintf("%s[%s]", l.valueAsString(x.X), l.valueAsString(x.Index))
+		s, _ := l.valueAndObject(x.X)
+		i, _ := l.valueAndObject(x.Index)
+		return fmt.Sprintf("%s[%s]", s, i), nil
 	case *ssa.IndexAddr:
-		return fmt.Sprintf("&(%s[%s])", l.valueAsString(x.X), l.valueAsString(x.Index))
+		s, _ := l.valueAndObject(x.X)
+		i, _ := l.valueAndObject(x.Index)
+		return fmt.Sprintf("&(%s[%s])", s, i), nil
 	case *ssa.Lookup:
-		return fmt.Sprintf("%s[%s]", l.valueAsString(x.X), l.valueAsString(x.Index))
+		s, _ := l.valueAndObject(x.X)
+		i, _ := l.valueAndObject(x.Index)
+		return fmt.Sprintf("%s[%s]", s, i), nil
 	case *ssa.Extract:
-		return fmt.Sprintf("%s[%d]", l.valueAsString(x.Tuple), x.Index)
+		s, _ := l.valueAndObject(x.Tuple)
+		return fmt.Sprintf("%s[%d]", s, x.Index), nil
 	}
 
 	// In the case of any other type (e.g. this may be an alloc, a return
 	// value, etc.), just return the literal pointer value to the Value.
 	// This will be unique within the ssa graph, and so if two values are
 	// equal, they are from the same type.
-	return fmt.Sprintf("{%T:%p}", v, v)
+	return fmt.Sprintf("{%T:%p}", v, v), nil
 }
 
 // String returns the full lock state.
@@ -293,7 +350,12 @@ func (l *lockState) String() string {
 	if l.count() == 0 {
 		return "no locks held"
 	}
-	return strings.Join(l.lockedMutexes, ",")
+	keys := make([]string, 0, len(l.lockedMutexes))
+	for k, info := range l.lockedMutexes {
+		// Include the exclusive status of each lock.
+		keys = append(keys, fmt.Sprintf("%s %s", k, exclusiveStr(info.exclusive)))
+	}
+	return strings.Join(keys, ",")
 }
 
 // pushDefer pushes a defer onto the stack.

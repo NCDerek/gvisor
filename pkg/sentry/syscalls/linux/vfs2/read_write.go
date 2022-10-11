@@ -102,8 +102,10 @@ func read(t *kernel.Task, file *vfs.FileDescription, dst usermem.IOSequence, opt
 	}
 
 	// Register for notifications.
-	w, ch := waiter.NewChannelEntry(nil)
-	file.EventRegister(&w, eventMaskRead)
+	w, ch := waiter.NewChannelEntry(eventMaskRead)
+	if err := file.EventRegister(&w); err != nil {
+		return n, err
+	}
 
 	total := n
 	for {
@@ -257,9 +259,10 @@ func pread(t *kernel.Task, file *vfs.FileDescription, dst usermem.IOSequence, of
 	}
 
 	// Register for notifications.
-	w, ch := waiter.NewChannelEntry(nil)
-	file.EventRegister(&w, eventMaskRead)
-
+	w, ch := waiter.NewChannelEntry(eventMaskRead)
+	if err := file.EventRegister(&w); err != nil {
+		return n, err
+	}
 	total := n
 	for {
 		// Shorten dst to reflect bytes previously read.
@@ -353,8 +356,10 @@ func write(t *kernel.Task, file *vfs.FileDescription, src usermem.IOSequence, op
 	}
 
 	// Register for notifications.
-	w, ch := waiter.NewChannelEntry(nil)
-	file.EventRegister(&w, eventMaskWrite)
+	w, ch := waiter.NewChannelEntry(eventMaskWrite)
+	if err := file.EventRegister(&w); err != nil {
+		return n, err
+	}
 
 	total := n
 	for {
@@ -507,8 +512,10 @@ func pwrite(t *kernel.Task, file *vfs.FileDescription, src usermem.IOSequence, o
 	}
 
 	// Register for notifications.
-	w, ch := waiter.NewChannelEntry(nil)
-	file.EventRegister(&w, eventMaskWrite)
+	w, ch := waiter.NewChannelEntry(eventMaskWrite)
+	if err := file.EventRegister(&w); err != nil {
+		return n, err
+	}
 
 	total := n
 	for {

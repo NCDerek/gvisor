@@ -37,6 +37,11 @@ type Stack struct {
 	Stack *stack.Stack `state:"manual"`
 }
 
+// Destroy implements inet.Stack.Destroy.
+func (s *Stack) Destroy() {
+	s.Stack.Close()
+}
+
 // SupportsIPv6 implements Stack.SupportsIPv6.
 func (s *Stack) SupportsIPv6() bool {
 	return s.Stack.CheckNetworkProtocol(ipv6.ProtocolNumber)
@@ -155,7 +160,7 @@ func (s *Stack) AddInterfaceAddr(idx int32, addr inet.InterfaceAddr) error {
 
 	// Attach address to interface.
 	nicID := tcpip.NICID(idx)
-	if err := s.Stack.AddProtocolAddressWithOptions(nicID, protocolAddress, stack.CanBePrimaryEndpoint); err != nil {
+	if err := s.Stack.AddProtocolAddress(nicID, protocolAddress, stack.AddressProperties{}); err != nil {
 		return syserr.TranslateNetstackError(err).ToError()
 	}
 
@@ -442,6 +447,11 @@ func (s *Stack) RouteTable() []inet.Route {
 // IPTables returns the stack's iptables.
 func (s *Stack) IPTables() (*stack.IPTables, error) {
 	return s.Stack.IPTables(), nil
+}
+
+// Pause implements inet.Stack.Pause.
+func (s *Stack) Pause() {
+	s.Stack.Pause()
 }
 
 // Resume implements inet.Stack.Resume.

@@ -14,8 +14,61 @@
 
 #include "test/syscalls/linux/socket_ipv4_udp_unbound_external_networking.h"
 
+#include <net/if.h>
+
+#include "absl/cleanup/cleanup.h"
+#include "test/util/socket_util.h"
+#include "test/util/test_util.h"
+
 namespace gvisor {
 namespace testing {
+
+void IPv4UDPUnboundExternalNetworkingSocketTest::SetUp() {
+#ifdef ANDROID
+  GTEST_SKIP() << "Android does not support getifaddrs in r22";
+#endif
+
+  ifaddrs* ifaddr;
+  ASSERT_THAT(getifaddrs(&ifaddr), SyscallSucceeds());
+  auto cleanup = absl::MakeCleanup([ifaddr] { freeifaddrs(ifaddr); });
+
+  for (const ifaddrs* ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next) {
+    ASSERT_NE(ifa->ifa_name, nullptr);
+    ASSERT_NE(ifa->ifa_addr, nullptr);
+
+    if (ifa->ifa_addr->sa_family != AF_INET) {
+      continue;
+    }
+
+    std::optional<std::pair<int, sockaddr_in>>& if_pair = *[this, ifa]() {
+      if (strcmp(ifa->ifa_name, "lo") == 0) {
+        return &lo_if_;
+      }
+      return &eth_if_;
+    }();
+
+    const int if_index =
+        ASSERT_NO_ERRNO_AND_VALUE(InterfaceIndex(ifa->ifa_name));
+
+    std::cout << " name=" << ifa->ifa_name
+              << " addr=" << GetAddrStr(ifa->ifa_addr) << " index=" << if_index
+              << " has_value=" << if_pair.has_value() << std::endl;
+
+    if (if_pair.has_value()) {
+      continue;
+    }
+
+    if_pair = std::make_pair(
+        if_index, *reinterpret_cast<const sockaddr_in*>(ifa->ifa_addr));
+  }
+
+  if (!(eth_if_.has_value() && lo_if_.has_value())) {
+    // FIXME(b/137899561): Linux instance for syscall tests sometimes misses its
+    // IPv4 address on eth0.
+    GTEST_SKIP() << " eth_if_.has_value()=" << eth_if_.has_value()
+                 << " lo_if_.has_value()=" << lo_if_.has_value();
+  }
+}
 
 TestAddress V4EmptyAddress() {
   TestAddress t("V4Empty");
@@ -28,7 +81,6 @@ TestAddress V4EmptyAddress() {
 // the destination port number.
 TEST_P(IPv4UDPUnboundExternalNetworkingSocketTest,
        UDPBroadcastReceivedOnExpectedPort) {
-  SKIP_IF(!found_net_interfaces_);
   auto sender = ASSERT_NO_ERRNO_AND_VALUE(NewSocket());
   auto rcvr1 = ASSERT_NO_ERRNO_AND_VALUE(NewSocket());
   auto rcvr2 = ASSERT_NO_ERRNO_AND_VALUE(NewSocket());
@@ -101,8 +153,6 @@ TEST_P(IPv4UDPUnboundExternalNetworkingSocketTest,
 // not a unicast address.
 TEST_P(IPv4UDPUnboundExternalNetworkingSocketTest,
        UDPBroadcastReceivedOnExpectedAddresses) {
-  SKIP_IF(!found_net_interfaces_);
-
   auto sender = ASSERT_NO_ERRNO_AND_VALUE(NewSocket());
   auto rcvr1 = ASSERT_NO_ERRNO_AND_VALUE(NewSocket());
   auto rcvr2 = ASSERT_NO_ERRNO_AND_VALUE(NewSocket());
@@ -149,7 +199,7 @@ TEST_P(IPv4UDPUnboundExternalNetworkingSocketTest,
   // Bind the non-receiving socket to the unicast ethernet address.
   auto norecv_addr = rcv1_addr;
   reinterpret_cast<sockaddr_in*>(&norecv_addr.addr)->sin_addr =
-      eth_if_addr_.sin_addr;
+      eth_if_addr().sin_addr;
   ASSERT_THAT(
       bind(norcv->get(), AsSockAddr(&norecv_addr.addr), norecv_addr.addr_len),
       SyscallSucceedsWithValue(0));
@@ -184,7 +234,6 @@ TEST_P(IPv4UDPUnboundExternalNetworkingSocketTest,
 //                     (UDPBroadcastSendRecvOnSocketBoundToAny).
 TEST_P(IPv4UDPUnboundExternalNetworkingSocketTest,
        UDPBroadcastSendRecvOnSocketBoundToBroadcast) {
-  SKIP_IF(!found_net_interfaces_);
   auto sender = ASSERT_NO_ERRNO_AND_VALUE(NewSocket());
 
   // Enable SO_BROADCAST.
@@ -224,7 +273,6 @@ TEST_P(IPv4UDPUnboundExternalNetworkingSocketTest,
 //                     (UDPBroadcastSendRecvOnSocketBoundToBroadcast).
 TEST_P(IPv4UDPUnboundExternalNetworkingSocketTest,
        UDPBroadcastSendRecvOnSocketBoundToAny) {
-  SKIP_IF(!found_net_interfaces_);
   auto sender = ASSERT_NO_ERRNO_AND_VALUE(NewSocket());
 
   // Enable SO_BROADCAST.
@@ -261,7 +309,6 @@ TEST_P(IPv4UDPUnboundExternalNetworkingSocketTest,
 // Verifies that a UDP broadcast fails to send on a socket with SO_BROADCAST
 // disabled.
 TEST_P(IPv4UDPUnboundExternalNetworkingSocketTest, TestSendBroadcast) {
-  SKIP_IF(!found_net_interfaces_);
   auto sender = ASSERT_NO_ERRNO_AND_VALUE(NewSocket());
 
   // Broadcast a test message without having enabled SO_BROADCAST on the sending
@@ -306,12 +353,6 @@ TEST_P(IPv4UDPUnboundExternalNetworkingSocketTest, TestSendUnicastOnUnbound) {
 // set interface or group membership.
 TEST_P(IPv4UDPUnboundExternalNetworkingSocketTest,
        TestSendMulticastSelfNoGroup) {
-  // FIXME(b/125485338): A group membership is not required for external
-  // multicast on gVisor.
-  SKIP_IF(IsRunningOnGvisor());
-
-  SKIP_IF(!found_net_interfaces_);
-
   auto socket = ASSERT_NO_ERRNO_AND_VALUE(NewSocket());
 
   auto bind_addr = V4Any();
@@ -345,7 +386,6 @@ TEST_P(IPv4UDPUnboundExternalNetworkingSocketTest,
 // Check that multicast packets will be delivered to the sending socket without
 // setting an interface.
 TEST_P(IPv4UDPUnboundExternalNetworkingSocketTest, TestSendMulticastSelf) {
-  SKIP_IF(!found_net_interfaces_);
   auto socket = ASSERT_NO_ERRNO_AND_VALUE(NewSocket());
 
   auto bind_addr = V4Any();
@@ -388,7 +428,6 @@ TEST_P(IPv4UDPUnboundExternalNetworkingSocketTest, TestSendMulticastSelf) {
 // set interface and IP_MULTICAST_LOOP disabled.
 TEST_P(IPv4UDPUnboundExternalNetworkingSocketTest,
        TestSendMulticastSelfLoopOff) {
-  SKIP_IF(!found_net_interfaces_);
   auto socket = ASSERT_NO_ERRNO_AND_VALUE(NewSocket());
 
   auto bind_addr = V4Any();
@@ -434,12 +473,6 @@ TEST_P(IPv4UDPUnboundExternalNetworkingSocketTest,
 // Check that multicast packets won't be delivered to another socket with no
 // set interface or group membership.
 TEST_P(IPv4UDPUnboundExternalNetworkingSocketTest, TestSendMulticastNoGroup) {
-  // FIXME(b/125485338): A group membership is not required for external
-  // multicast on gVisor.
-  SKIP_IF(IsRunningOnGvisor());
-
-  SKIP_IF(!found_net_interfaces_);
-
   auto sender = ASSERT_NO_ERRNO_AND_VALUE(NewSocket());
   auto receiver = ASSERT_NO_ERRNO_AND_VALUE(NewSocket());
 
@@ -476,7 +509,6 @@ TEST_P(IPv4UDPUnboundExternalNetworkingSocketTest, TestSendMulticastNoGroup) {
 // Check that multicast packets will be delivered to another socket without
 // setting an interface.
 TEST_P(IPv4UDPUnboundExternalNetworkingSocketTest, TestSendMulticast) {
-  SKIP_IF(!found_net_interfaces_);
   auto sender = ASSERT_NO_ERRNO_AND_VALUE(NewSocket());
   auto receiver = ASSERT_NO_ERRNO_AND_VALUE(NewSocket());
 
@@ -522,7 +554,6 @@ TEST_P(IPv4UDPUnboundExternalNetworkingSocketTest, TestSendMulticast) {
 // set interface and IP_MULTICAST_LOOP disabled on the sending socket.
 TEST_P(IPv4UDPUnboundExternalNetworkingSocketTest,
        TestSendMulticastSenderNoLoop) {
-  SKIP_IF(!found_net_interfaces_);
   auto sender = ASSERT_NO_ERRNO_AND_VALUE(NewSocket());
   auto receiver = ASSERT_NO_ERRNO_AND_VALUE(NewSocket());
 
@@ -572,8 +603,6 @@ TEST_P(IPv4UDPUnboundExternalNetworkingSocketTest,
 // setting an interface and IP_MULTICAST_LOOP disabled on the receiving socket.
 TEST_P(IPv4UDPUnboundExternalNetworkingSocketTest,
        TestSendMulticastReceiverNoLoop) {
-  SKIP_IF(!found_net_interfaces_);
-
   auto sender = ASSERT_NO_ERRNO_AND_VALUE(NewSocket());
   auto receiver = ASSERT_NO_ERRNO_AND_VALUE(NewSocket());
 
@@ -624,7 +653,6 @@ TEST_P(IPv4UDPUnboundExternalNetworkingSocketTest,
 // and both will receive data on it when bound to the ANY address.
 TEST_P(IPv4UDPUnboundExternalNetworkingSocketTest,
        TestSendMulticastToTwoBoundToAny) {
-  SKIP_IF(!found_net_interfaces_);
   auto sender = ASSERT_NO_ERRNO_AND_VALUE(NewSocket());
   std::unique_ptr<FileDescriptor> receivers[2] = {
       ASSERT_NO_ERRNO_AND_VALUE(NewSocket()),
@@ -689,7 +717,6 @@ TEST_P(IPv4UDPUnboundExternalNetworkingSocketTest,
 // and both will receive data on it when bound to the multicast address.
 TEST_P(IPv4UDPUnboundExternalNetworkingSocketTest,
        TestSendMulticastToTwoBoundToMulticastAddress) {
-  SKIP_IF(!found_net_interfaces_);
   auto sender = ASSERT_NO_ERRNO_AND_VALUE(NewSocket());
   std::unique_ptr<FileDescriptor> receivers[2] = {
       ASSERT_NO_ERRNO_AND_VALUE(NewSocket()),
@@ -757,7 +784,6 @@ TEST_P(IPv4UDPUnboundExternalNetworkingSocketTest,
 // multicast address, both will receive data.
 TEST_P(IPv4UDPUnboundExternalNetworkingSocketTest,
        TestSendMulticastToTwoBoundToAnyAndMulticastAddress) {
-  SKIP_IF(!found_net_interfaces_);
   auto sender = ASSERT_NO_ERRNO_AND_VALUE(NewSocket());
   std::unique_ptr<FileDescriptor> receivers[2] = {
       ASSERT_NO_ERRNO_AND_VALUE(NewSocket()),
@@ -829,8 +855,6 @@ TEST_P(IPv4UDPUnboundExternalNetworkingSocketTest,
 // is not a multicast address.
 TEST_P(IPv4UDPUnboundExternalNetworkingSocketTest,
        IpMulticastLoopbackFromAddr) {
-  SKIP_IF(!found_net_interfaces_);
-
   auto sender = ASSERT_NO_ERRNO_AND_VALUE(NewSocket());
   auto receiver = ASSERT_NO_ERRNO_AND_VALUE(NewSocket());
 
@@ -893,8 +917,6 @@ TEST_P(IPv4UDPUnboundExternalNetworkingSocketTest,
 // interface, a multicast packet sent out uses the latter as its source address.
 TEST_P(IPv4UDPUnboundExternalNetworkingSocketTest,
        IpMulticastLoopbackIfNicAndAddr) {
-  SKIP_IF(!found_net_interfaces_);
-
   // Create receiver, bind to ANY and join the multicast group.
   auto receiver = ASSERT_NO_ERRNO_AND_VALUE(NewSocket());
   auto receiver_addr = V4Any();
@@ -906,11 +928,15 @@ TEST_P(IPv4UDPUnboundExternalNetworkingSocketTest,
                           &receiver_addr_len),
               SyscallSucceeds());
   EXPECT_EQ(receiver_addr_len, receiver_addr.addr_len);
-  int receiver_port =
+  const in_port_t receiver_port =
       reinterpret_cast<sockaddr_in*>(&receiver_addr.addr)->sin_port;
-  ip_mreqn group = {};
-  group.imr_multiaddr.s_addr = inet_addr(kMulticastAddress);
-  group.imr_ifindex = lo_if_idx_;
+  const ip_mreqn group = {
+      .imr_multiaddr =
+          {
+              .s_addr = inet_addr(kMulticastAddress),
+          },
+      .imr_ifindex = lo_if_idx(),
+  };
   ASSERT_THAT(setsockopt(receiver->get(), IPPROTO_IP, IP_ADD_MEMBERSHIP, &group,
                          sizeof(group)),
               SyscallSucceeds());
@@ -918,9 +944,10 @@ TEST_P(IPv4UDPUnboundExternalNetworkingSocketTest,
   // Set outgoing multicast interface config, with NIC and addr pointing to
   // different interfaces.
   auto sender = ASSERT_NO_ERRNO_AND_VALUE(NewSocket());
-  ip_mreqn iface = {};
-  iface.imr_ifindex = lo_if_idx_;
-  iface.imr_address = eth_if_addr_.sin_addr;
+  const ip_mreqn iface = {
+      .imr_address = eth_if_addr().sin_addr,
+      .imr_ifindex = lo_if_idx(),
+  };
   ASSERT_THAT(setsockopt(sender->get(), IPPROTO_IP, IP_MULTICAST_IF, &iface,
                          sizeof(iface)),
               SyscallSucceeds());
@@ -928,67 +955,104 @@ TEST_P(IPv4UDPUnboundExternalNetworkingSocketTest,
   // Send a multicast packet.
   auto sendto_addr = V4Multicast();
   reinterpret_cast<sockaddr_in*>(&sendto_addr.addr)->sin_port = receiver_port;
-  char send_buf[4] = {};
+  char send_buf[4];
   ASSERT_THAT(
       RetryEINTR(sendto)(sender->get(), send_buf, sizeof(send_buf), 0,
                          AsSockAddr(&sendto_addr.addr), sendto_addr.addr_len),
       SyscallSucceedsWithValue(sizeof(send_buf)));
 
   // Receive a multicast packet.
-  char recv_buf[sizeof(send_buf)] = {};
+  char recv_buf[sizeof(send_buf) + 1];
   auto src_addr = V4EmptyAddress();
   ASSERT_THAT(
       RetryEINTR(recvfrom)(receiver->get(), recv_buf, sizeof(recv_buf), 0,
                            AsSockAddr(&src_addr.addr), &src_addr.addr_len),
-      SyscallSucceedsWithValue(sizeof(recv_buf)));
-  ASSERT_EQ(sizeof(struct sockaddr_in), src_addr.addr_len);
-  sockaddr_in* src_addr_in = reinterpret_cast<sockaddr_in*>(&src_addr.addr);
-
-  // FIXME (b/137781162): When sending a multicast packet use the proper logic
-  // to determine the packet's src-IP.
-  SKIP_IF(IsRunningOnGvisor());
+      SyscallSucceedsWithValue(sizeof(send_buf)));
+  ASSERT_EQ(src_addr.addr_len, sizeof(struct sockaddr_in));
 
   // Verify the received source address.
-  EXPECT_EQ(eth_if_addr_.sin_addr.s_addr, src_addr_in->sin_addr.s_addr);
+  //
+  // TODO(https://gvisor.dev/issue/6686): gVisor is a strong host, preventing
+  // the packet from being sent from the loopback device using the ethernet
+  // device's address.
+  if (IsRunningOnGvisor()) {
+    EXPECT_EQ(GetAddrStr(AsSockAddr(&src_addr.addr)),
+              GetAddr4Str(&lo_if_addr().sin_addr));
+  } else {
+    EXPECT_EQ(GetAddrStr(AsSockAddr(&src_addr.addr)),
+              GetAddr4Str(&eth_if_addr().sin_addr));
+  }
 }
 
 // Check that when we are bound to one interface we can set IP_MULTICAST_IF to
 // another interface.
 TEST_P(IPv4UDPUnboundExternalNetworkingSocketTest,
        IpMulticastLoopbackBindToOneIfSetMcastIfToAnother) {
-  SKIP_IF(!found_net_interfaces_);
-
-  // FIXME (b/137790511): When bound to one interface it is not possible to set
-  // IP_MULTICAST_IF to a different interface.
-  SKIP_IF(IsRunningOnGvisor());
-
-  // Create sender and bind to eth interface.
-  auto sender = ASSERT_NO_ERRNO_AND_VALUE(NewSocket());
-  ASSERT_THAT(
-      bind(sender->get(), AsSockAddr(&eth_if_addr_), sizeof(eth_if_addr_)),
-      SyscallSucceeds());
-
   // Run through all possible combinations of index and address for
   // IP_MULTICAST_IF that selects the loopback interface.
-  struct {
-    int imr_ifindex;
-    struct in_addr imr_address;
-  } test_data[] = {
-      {lo_if_idx_, {}},
-      {0, lo_if_addr_.sin_addr},
-      {lo_if_idx_, lo_if_addr_.sin_addr},
-      {lo_if_idx_, eth_if_addr_.sin_addr},
+  ip_mreqn ifaces[] = {
+      {
+          .imr_address = {},
+          .imr_ifindex = lo_if_idx(),
+      },
+      {
+          .imr_address = lo_if_addr().sin_addr,
+          .imr_ifindex = 0,
+      },
+      {
+          .imr_address = lo_if_addr().sin_addr,
+          .imr_ifindex = lo_if_idx(),
+      },
+      {
+          .imr_address = eth_if_addr().sin_addr,
+          .imr_ifindex = lo_if_idx(),
+      },
   };
-  for (auto t : test_data) {
-    ip_mreqn iface = {};
-    iface.imr_ifindex = t.imr_ifindex;
-    iface.imr_address = t.imr_address;
-    EXPECT_THAT(setsockopt(sender->get(), IPPROTO_IP, IP_MULTICAST_IF, &iface,
-                           sizeof(iface)),
-                SyscallSucceeds())
-        << "imr_index=" << iface.imr_ifindex
-        << " imr_address=" << GetAddr4Str(&iface.imr_address);
+
+  {
+    auto sender = ASSERT_NO_ERRNO_AND_VALUE(NewSocket());
+    ASSERT_THAT(
+        bind(sender->get(), AsSockAddr(&eth_if_addr()), sizeof(eth_if_addr())),
+        SyscallSucceeds());
+
+    for (const ip_mreqn& iface : ifaces) {
+      EXPECT_THAT(setsockopt(sender->get(), IPPROTO_IP, IP_MULTICAST_IF, &iface,
+                             sizeof(iface)),
+                  SyscallSucceeds())
+          << " imr_index=" << iface.imr_ifindex
+          << " imr_address=" << GetAddr4Str(&iface.imr_address);
+    }
+  }
+
+  {
+    char eth_if_name[IF_NAMESIZE];
+    memset(eth_if_name, 0xAA, sizeof(eth_if_name));
+    ASSERT_NE(if_indextoname(eth_if_idx(), eth_if_name), nullptr)
+        << strerror(errno);
+    auto sender = ASSERT_NO_ERRNO_AND_VALUE(NewSocket());
+    ASSERT_THAT(setsockopt(sender->get(), SOL_SOCKET, SO_BINDTODEVICE,
+                           eth_if_name, sizeof(eth_if_name)),
+                SyscallSucceeds());
+
+    for (const ip_mreqn& iface : ifaces) {
+      // FIXME(b/137790511): Disallow mismatching IP_MULTICAST_IF and
+      // SO_BINDTODEVICE.
+      if (IsRunningOnGvisor()) {
+        EXPECT_THAT(setsockopt(sender->get(), IPPROTO_IP, IP_MULTICAST_IF,
+                               &iface, sizeof(iface)),
+                    SyscallSucceeds())
+            << " imr_index=" << iface.imr_ifindex
+            << " imr_address=" << GetAddr4Str(&iface.imr_address);
+      } else {
+        EXPECT_THAT(setsockopt(sender->get(), IPPROTO_IP, IP_MULTICAST_IF,
+                               &iface, sizeof(iface)),
+                    SyscallFailsWithErrno(EINVAL))
+            << " imr_index=" << iface.imr_ifindex
+            << " imr_address=" << GetAddr4Str(&iface.imr_address);
+      }
+    }
   }
 }
+
 }  // namespace testing
 }  // namespace gvisor

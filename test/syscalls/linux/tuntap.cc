@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include <arpa/inet.h>
+#include <asm-generic/errno.h>
 #include <linux/capability.h>
 #include <linux/if_arp.h>
 #include <linux/if_ether.h>
@@ -269,6 +270,17 @@ TEST_F(TuntapTest, InvalidReadWrite) {
   EXPECT_THAT(write(fd.get(), buf, sizeof(buf)), SyscallFailsWithErrno(EBADFD));
 }
 
+TEST_F(TuntapTest, ZeroWrite) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
+
+  FileDescriptor fd = ASSERT_NO_ERRNO_AND_VALUE(Open(kDevNetTun, O_RDWR));
+  struct ifreq ifr_set = {};
+  ifr_set.ifr_flags = IFF_TUN | IFF_NO_PI;
+  strncpy(ifr_set.ifr_name, kTunName, IFNAMSIZ);
+  EXPECT_THAT(ioctl(fd.get(), TUNSETIFF, &ifr_set), SyscallSucceeds());
+  EXPECT_THAT(write(fd.get(), nullptr, 0), SyscallFailsWithErrno(EINVAL));
+}
+
 TEST_F(TuntapTest, WriteToDownDevice) {
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
 
@@ -401,6 +413,34 @@ TEST_F(TuntapTest, PingKernel) {
       break;
     }
   }
+}
+
+TEST_F(TuntapTest, LargeWritesFailWithEMSGSIZE) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
+
+  const auto& [fd, link] = ASSERT_NO_ERRNO_AND_VALUE(OpenAndAttachTunTap(
+      kTapName, kTapIPAddr, true /* tap */, false /* no_pi */));
+
+  ping_pkt ping_req =
+      CreatePingPacket(kMacB, kTapPeerIPAddr, kMacA, kTapIPAddr);
+  std::string arp_rep =
+      CreateArpPacket(kMacB, kTapPeerIPAddr, kMacA, kTapIPAddr);
+
+  constexpr int kBufSize = 4096;
+  std::vector<char> buf(kBufSize);
+  struct iovec iov[2] = {
+      {
+          .iov_base = &ping_req,
+          .iov_len = sizeof(ping_req),
+      },
+      {
+          .iov_base = buf.data(),
+          .iov_len = kBufSize,
+      },
+  };
+
+  // A packet is large than MTU which is 1500 by default..
+  EXPECT_THAT(writev(fd.get(), iov, 2), SyscallFailsWithErrno(EMSGSIZE));
 }
 
 TEST_F(TuntapTest, SendUdpTriggersArpResolution) {

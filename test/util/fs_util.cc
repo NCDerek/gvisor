@@ -188,6 +188,14 @@ PosixError MknodAt(const FileDescriptor& dfd, absl::string_view path, int mode,
   return NoError();
 }
 
+PosixError Unlink(absl::string_view path) {
+  int res = unlink(std::string(path).c_str());
+  if (res < 0) {
+    return PosixError(errno, absl::StrCat("unlink ", path));
+  }
+  return NoError();
+}
+
 PosixError UnlinkAt(const FileDescriptor& dfd, absl::string_view path,
                     int flags) {
   int res = unlinkat(dfd.get(), std::string(path).c_str(), flags);
@@ -724,5 +732,10 @@ PosixError CheckSameFile(const FileDescriptor& fd1, const FileDescriptor& fd2) {
 
   return NoError();
 }
+
+::testing::Matcher<mode_t> PermissionIs(mode_t want) {
+  return MakeMatcher(new ModePermissionMatcher(want));
+}
+
 }  // namespace testing
 }  // namespace gvisor

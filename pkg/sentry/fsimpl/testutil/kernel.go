@@ -44,7 +44,8 @@ import (
 )
 
 var (
-	platformFlag = flag.String("platform", "ptrace", "specify which platform to use")
+	platformFlag           = flag.String("platform", "ptrace", "specify which platform to use")
+	platformDevicePathFlag = flag.String("platform_device_path", "", "path to a platform-specific device file (e.g. /dev/kvm for KVM platform). If unset, will use a sane platform-specific default.")
 )
 
 // Boot initializes a new bare bones kernel for test.
@@ -53,7 +54,7 @@ func Boot() (*kernel.Kernel, error) {
 	if err != nil {
 		return nil, fmt.Errorf("platform not found: %v", err)
 	}
-	deviceFile, err := platformCtr.OpenDevice()
+	deviceFile, err := platformCtr.OpenDevice(*platformDevicePathFlag)
 	if err != nil {
 		return nil, fmt.Errorf("creating platform: %v", err)
 	}
@@ -130,6 +131,7 @@ func CreateTask(ctx context.Context, name string, tc *kernel.ThreadGroup, mntns 
 	m := mm.NewMemoryManager(k, k, k.SleepForAddressSpaceActivation)
 	m.SetExecutable(ctx, fsbridge.NewVFSFile(exe))
 
+	creds := auth.CredentialsFromContext(ctx)
 	config := &kernel.TaskConfig{
 		Kernel:                  k,
 		ThreadGroup:             tc,
@@ -143,7 +145,9 @@ func CreateTask(ctx context.Context, name string, tc *kernel.ThreadGroup, mntns 
 		MountNamespaceVFS2:      mntns,
 		FSContext:               kernel.NewFSContextVFS2(root, cwd, 0022),
 		FDTable:                 k.NewFDTable(),
+		UserCounters:            k.GetUserCounters(creds.RealKUID),
 	}
+	config.NetworkNamespace.IncRef()
 	t, err := k.TaskSet().NewTask(ctx, config)
 	if err != nil {
 		config.ThreadGroup.Release(ctx)

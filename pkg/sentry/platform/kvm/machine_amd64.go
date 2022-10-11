@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"math/big"
 	"reflect"
+	"runtime"
 	"runtime/debug"
 
 	"golang.org/x/sys/unix"
@@ -29,7 +30,6 @@ import (
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/ring0"
 	"gvisor.dev/gvisor/pkg/ring0/pagetables"
-	"gvisor.dev/gvisor/pkg/sentry/arch/fpu"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 	ktime "gvisor.dev/gvisor/pkg/sentry/time"
 )
@@ -56,6 +56,14 @@ func (m *machine) initArchState() error {
 		recover()
 		debug.SetPanicOnFault(old)
 	}()
+
+	// Initialize all vCPUs to minimize kvm ioctl-s allowed by seccomp filters.
+	m.mu.Lock()
+	for i := 0; i < m.maxVCPUs; i++ {
+		m.createVCPU(i)
+	}
+	m.mu.Unlock()
+
 	c := m.Get()
 	defer m.Put(c)
 	bluepill(c)
@@ -64,18 +72,11 @@ func (m *machine) initArchState() error {
 	return nil
 }
 
-type machineArchState struct {
-}
-
 type vCPUArchState struct {
 	// PCIDs is the set of PCIDs for this vCPU.
 	//
 	// This starts above fixedKernelPCID.
 	PCIDs *pagetables.PCIDs
-
-	// floatingPointState is the floating point state buffer used in guest
-	// to host transitions. See usage in bluepill_amd64.go.
-	floatingPointState fpu.State
 }
 
 const (
@@ -152,12 +153,6 @@ func (c *vCPU) initArchState() error {
 		return fmt.Errorf("error setting user registers: %v", errno)
 	}
 
-	// Allocate some floating point state save area for the local vCPU.
-	// This will be saved prior to leaving the guest, and we restore from
-	// this always. We cannot use the pointer in the context alone because
-	// we don't know how large the area there is in reality.
-	c.floatingPointState = fpu.NewState()
-
 	// Set the time offset to the host native time.
 	return c.setSystemTime()
 }
@@ -193,7 +188,7 @@ var bitsForScaling = func() int64 {
 // strict inverse of this value. This simplifies this function considerably.
 //
 // Roughly, the returned value "scaledTSC" will have:
-// 	scaledTSC/hostTSC == 1/rawFreq
+// scaledTSC/hostTSC == 1/rawFreq
 //
 //go:nosplit
 func scaledTSC(rawFreq uintptr) int64 {
@@ -290,10 +285,13 @@ func (c *vCPU) fault(signal int32, info *linux.SignalInfo) (hostarch.AccessType,
 	// Reset the pointed SignalInfo.
 	*info = linux.SignalInfo{Signo: signal}
 	info.SetAddr(uint64(faultAddr))
-	accessType := hostarch.AccessType{
-		Read:    code&(1<<1) == 0,
-		Write:   code&(1<<1) != 0,
-		Execute: code&(1<<4) != 0,
+	accessType := hostarch.AccessType{}
+	if signal == int32(unix.SIGSEGV) {
+		accessType = hostarch.AccessType{
+			Read:    code&(1<<1) == 0,
+			Write:   code&(1<<1) != 0,
+			Execute: code&(1<<4) != 0,
+		}
 	}
 	if !accessType.Write && !accessType.Execute {
 		info.Code = 1 // SEGV_MAPERR.
@@ -307,22 +305,6 @@ func (c *vCPU) fault(signal int32, info *linux.SignalInfo) (hostarch.AccessType,
 //go:noinline
 func loadByte(ptr *byte) byte {
 	return *ptr
-}
-
-// prefaultFloatingPointState touches each page of the floating point state to
-// be sure that its physical pages are mapped.
-//
-// Otherwise the kernel can trigger KVM_EXIT_MMIO and an instruction that
-// triggered a fault will be emulated by the kvm kernel code, but it can't
-// emulate instructions like xsave and xrstor.
-//
-//go:nosplit
-func prefaultFloatingPointState(data *fpu.State) {
-	size := len(*data)
-	for i := 0; i < size; i += hostarch.PageSize {
-		loadByte(&(*data)[i])
-	}
-	loadByte(&(*data)[size-1])
 }
 
 // SwitchToUser unpacks architectural-details.
@@ -355,11 +337,6 @@ func (c *vCPU) SwitchToUser(switchOpts ring0.SwitchOpts, info *linux.SignalInfo)
 	// allocations occur.
 	entersyscall()
 	bluepill(c)
-	// The root table physical page has to be mapped to not fault in iret
-	// or sysret after switching into a user address space.  sysret and
-	// iret are in the upper half that is global and already mapped.
-	switchOpts.PageTables.PrefaultRootTable()
-	prefaultFloatingPointState(switchOpts.FloatingPointState)
 	vector = c.CPU.SwitchToUser(switchOpts)
 	exitsyscall()
 
@@ -393,7 +370,7 @@ func (c *vCPU) SwitchToUser(switchOpts ring0.SwitchOpts, info *linux.SignalInfo)
 			// When CPUID faulting is enabled, we will generate a #GP(0) when
 			// userspace executes a CPUID instruction. This is handled above,
 			// because we need to be able to map and read user memory.
-			return hostarch.AccessType{}, platform.ErrContextSignalCPUID
+			return hostarch.AccessType{}, tryCPUIDError{}
 		}
 		return hostarch.AccessType{}, platform.ErrContextSignal
 
@@ -459,16 +436,6 @@ func (c *vCPU) SwitchToUser(switchOpts ring0.SwitchOpts, info *linux.SignalInfo)
 	}
 }
 
-// On x86 platform, the flags for "setMemoryRegion" can always be set as 0.
-// There is no need to return read-only physicalRegions.
-func rdonlyRegionsForSetMem() (phyRegions []physicalRegion) {
-	return nil
-}
-
-func availableRegionsForSetMem() (phyRegions []physicalRegion) {
-	return physicalRegions
-}
-
 func (m *machine) mapUpperHalf(pageTable *pagetables.PageTables) {
 	// Map all the executable regions so that all the entry functions
 	// are mapped in the upper half.
@@ -512,13 +479,18 @@ func (m *machine) getMaxVCPU() {
 	} else {
 		m.maxVCPUs = int(maxVCPUs)
 	}
+
+	// The goal here is to avoid vCPU contentions for reasonable workloads.
+	// But "reasonable" isn't defined well in this case. Let's say that CPU
+	// overcommit with factor 2 is still acceptable. We allocate a set of
+	// vCPU for each goruntime processor (P) and two sets of vCPUs to run
+	// user code.
+	rCPUs := runtime.GOMAXPROCS(0)
+	if 3*rCPUs < m.maxVCPUs {
+		m.maxVCPUs = 3 * rCPUs
+	}
 }
 
-// getNewVCPU create a new vCPU (maybe)
-func (m *machine) getNewVCPU() *vCPU {
-	if int(m.nextID) < m.maxVCPUs {
-		c := m.newVCPU()
-		return c
-	}
-	return nil
+func archPhysicalRegions(physicalRegions []physicalRegion) []physicalRegion {
+	return physicalRegions
 }

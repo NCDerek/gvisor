@@ -608,30 +608,31 @@ TEST_F(XattrTest, XattrWithFD) {
 }
 
 TEST_F(XattrTest, XattrWithOPath) {
-  SKIP_IF(IsRunningWithVFS1());
   const FileDescriptor fd =
       ASSERT_NO_ERRNO_AND_VALUE(Open(test_file_name_.c_str(), O_PATH));
   const char name[] = "user.test";
   int val = 1234;
   size_t size = sizeof(val);
-  EXPECT_THAT(fsetxattr(fd.get(), name, &val, size, /*flags=*/0),
+
+  // Bionic's implementations of f*xattr() use *xattr() when O_PATH is set
+  // to circumvent the behavior this is testing for.
+  // Use syscall() here to avoid running through Bionic on Android.
+  EXPECT_THAT(syscall(SYS_fsetxattr, fd.get(), name, &val, size, /*flags=*/0),
               SyscallFailsWithErrno(EBADF));
 
   int buf;
-  EXPECT_THAT(fgetxattr(fd.get(), name, &buf, size),
+  EXPECT_THAT(syscall(SYS_fgetxattr, fd.get(), name, &buf, size),
               SyscallFailsWithErrno(EBADF));
 
   char list[sizeof(name)];
-  EXPECT_THAT(flistxattr(fd.get(), list, sizeof(list)),
+  EXPECT_THAT(syscall(SYS_flistxattr, fd.get(), list, sizeof(list)),
               SyscallFailsWithErrno(EBADF));
 
-  EXPECT_THAT(fremovexattr(fd.get(), name), SyscallFailsWithErrno(EBADF));
+  EXPECT_THAT(syscall(SYS_fremovexattr, fd.get(), name),
+              SyscallFailsWithErrno(EBADF));
 }
 
 TEST_F(XattrTest, TrustedNamespaceWithCapSysAdmin) {
-  // Trusted namespace not supported in VFS1.
-  SKIP_IF(IsRunningWithVFS1());
-
   // TODO(b/166162845): Only gVisor tmpfs currently supports trusted namespace.
   SKIP_IF(IsRunningOnGvisor() &&
           !ASSERT_NO_ERRNO_AND_VALUE(IsTmpfs(test_file_name_)));
@@ -672,9 +673,6 @@ TEST_F(XattrTest, TrustedNamespaceWithCapSysAdmin) {
 }
 
 TEST_F(XattrTest, TrustedNamespaceWithoutCapSysAdmin) {
-  // Trusted namespace not supported in VFS1.
-  SKIP_IF(IsRunningWithVFS1());
-
   // TODO(b/66162845): Only gVisor tmpfs currently supports trusted namespace.
   SKIP_IF(IsRunningOnGvisor() &&
           !ASSERT_NO_ERRNO_AND_VALUE(IsTmpfs(test_file_name_)));

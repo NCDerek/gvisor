@@ -18,10 +18,10 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"sync/atomic"
 	"testing"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/sentry/contexttest"
@@ -39,12 +39,12 @@ type fileDescription struct {
 // genCount contains the number of times its DynamicBytesSource.Generate()
 // implementation has been called.
 type genCount struct {
-	count uint64 // accessed using atomic memory ops
+	count atomicbitops.Uint64
 }
 
 // Generate implements DynamicBytesSource.Generate.
 func (g *genCount) Generate(ctx context.Context, buf *bytes.Buffer) error {
-	fmt.Fprintf(buf, "%d", atomic.AddUint64(&g.count, 1))
+	fmt.Fprintf(buf, "%d", g.count.Add(1))
 	return nil
 }
 
@@ -61,7 +61,7 @@ func (d *storeData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 }
 
 // Generate implements WritableDynamicBytesSource.
-func (d *storeData) Write(ctx context.Context, src usermem.IOSequence, offset int64) (int64, error) {
+func (d *storeData) Write(ctx context.Context, _ *FileDescription, src usermem.IOSequence, offset int64) (int64, error) {
 	buf := make([]byte, src.NumBytes())
 	n, err := src.CopyIn(ctx, buf)
 	if err != nil {
@@ -84,9 +84,9 @@ func newTestFD(ctx context.Context, vfsObj *VirtualFilesystem, statusFlags uint3
 	vd := vfsObj.NewAnonVirtualDentry("genCountFD")
 	defer vd.DecRef(ctx)
 	var fd testFD
-	fd.vfsfd.Init(&fd, statusFlags, vd.Mount(), vd.Dentry(), &FileDescriptionOptions{})
-	fd.DynamicBytesFileDescriptionImpl.SetDataSource(data)
-	return &fd.vfsfd
+	fd.fileDescription.vfsfd.Init(&fd, statusFlags, vd.Mount(), vd.Dentry(), &FileDescriptionOptions{})
+	fd.DynamicBytesFileDescriptionImpl.Init(&fd.fileDescription.vfsfd, data)
+	return &fd.fileDescription.vfsfd
 }
 
 // Release implements FileDescriptionImpl.Release.

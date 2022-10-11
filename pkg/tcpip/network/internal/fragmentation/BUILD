@@ -27,10 +27,10 @@ go_library(
         "//pkg/tcpip/network/ipv6:__pkg__",
     ],
     deps = [
+        "//pkg/bufferv2",
         "//pkg/log",
         "//pkg/sync",
         "//pkg/tcpip",
-        "//pkg/tcpip/buffer",
         "//pkg/tcpip/header",
         "//pkg/tcpip/stack",
     ],
@@ -41,11 +41,14 @@ go_test(
     size = "small",
     srcs = [
         "fragmentation_test.go",
+        "main_test.go",
         "reassembler_test.go",
     ],
     library = ":fragmentation",
     deps = [
-        "//pkg/tcpip/buffer",
+        "//pkg/bufferv2",
+        "//pkg/refs",
+        "//pkg/refsvfs2",
         "//pkg/tcpip/faketime",
         "//pkg/tcpip/network/internal/testutil",
         "//pkg/tcpip/stack",

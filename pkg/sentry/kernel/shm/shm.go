@@ -16,19 +16,19 @@
 //
 // Known missing features:
 //
-// - SHM_LOCK/SHM_UNLOCK are no-ops. The sentry currently doesn't implement
-//   memory locking in general.
+//   - SHM_LOCK/SHM_UNLOCK are no-ops. The sentry currently doesn't implement
+//     memory locking in general.
 //
-// - SHM_HUGETLB and related flags for shmget(2) are ignored. There's no easy
-//   way to implement hugetlb support on a per-map basis, and it has no impact
-//   on correctness.
+//   - SHM_HUGETLB and related flags for shmget(2) are ignored. There's no easy
+//     way to implement hugetlb support on a per-map basis, and it has no impact
+//     on correctness.
 //
-// - SHM_NORESERVE for shmget(2) is ignored, the sentry doesn't implement swap
-//   so it's meaningless to reserve space for swap.
+//   - SHM_NORESERVE for shmget(2) is ignored, the sentry doesn't implement swap
+//     so it's meaningless to reserve space for swap.
 //
-// - No per-process segment size enforcement. This feature probably isn't used
-//   much anyways, since Linux sets the per-process limits to the system-wide
-//   limits by default.
+//   - No per-process segment size enforcement. This feature probably isn't used
+//     much anyways, since Linux sets the per-process limits to the system-wide
+//     limits by default.
 //
 // Lock ordering: mm.mappingMu -> shm registry lock -> shm lock
 package shm
@@ -207,7 +207,7 @@ func (r *Registry) newShmLocked(ctx context.Context, pid int32, key ipc.Key, cre
 	}
 
 	effectiveSize := uint64(hostarch.Addr(size).MustRoundUp())
-	fr, err := mfp.MemoryFile().Allocate(effectiveSize, usage.Anonymous)
+	fr, err := mfp.MemoryFile().Allocate(effectiveSize, pgalloc.AllocOpts{Kind: usage.Anonymous})
 	if err != nil {
 		return nil, err
 	}
@@ -444,7 +444,7 @@ func (s *Shm) AddMapping(ctx context.Context, _ memmap.MappingSpace, _ hostarch.
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.attachTime = ktime.NowFromContext(ctx)
-	if pid, ok := context.ThreadGroupIDFromContext(ctx); ok {
+	if pid, ok := auth.ThreadGroupIDFromContext(ctx); ok {
 		s.lastAttachDetachPID = pid
 	} else {
 		// AddMapping is called during a syscall, so ctx should always be a task
@@ -468,7 +468,7 @@ func (s *Shm) RemoveMapping(ctx context.Context, _ memmap.MappingSpace, _ hostar
 
 	// If called from a non-task context we also won't have a threadgroup
 	// id. Silently skip updating the lastAttachDetachPid in that case.
-	if pid, ok := context.ThreadGroupIDFromContext(ctx); ok {
+	if pid, ok := auth.ThreadGroupIDFromContext(ctx); ok {
 		s.lastAttachDetachPID = pid
 	} else {
 		log.Debugf("Couldn't obtain pid when removing mapping to %s, not updating the last detach pid.", s.debugLocked())

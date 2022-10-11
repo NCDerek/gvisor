@@ -1,4 +1,4 @@
-load("//tools:defs.bzl", "go_library", "go_test", "more_shards")
+load("//tools:defs.bzl", "go_library", "go_test")
 load("//tools/go_generics:defs.bzl", "go_template_instance")
 
 package(licenses = ["notice"])
@@ -12,6 +12,17 @@ go_template_instance(
     types = {
         "Element": "*segment",
         "Linker": "*segment",
+    },
+)
+
+go_template_instance(
+    name = "tcp_segment_refs",
+    out = "tcp_segment_refs.go",
+    package = "tcp",
+    prefix = "segment",
+    template = "//pkg/refsvfs2:refs_template",
+    types = {
+        "T": "segment",
     },
 )
 
@@ -54,17 +65,20 @@ go_library(
         "snd.go",
         "tcp_endpoint_list.go",
         "tcp_segment_list.go",
+        "tcp_segment_refs.go",
         "timer.go",
     ],
-    imports = ["gvisor.dev/gvisor/pkg/tcpip/buffer"],
     visibility = ["//visibility:public"],
     deps = [
+        "//pkg/atomicbitops",
+        "//pkg/bufferv2",
         "//pkg/log",
         "//pkg/rand",
+        "//pkg/refsvfs2",
         "//pkg/sleep",
         "//pkg/sync",
         "//pkg/tcpip",
-        "//pkg/tcpip/buffer",
+        "//pkg/tcpip/checksum",
         "//pkg/tcpip/hash/jenkins",
         "//pkg/tcpip/header",
         "//pkg/tcpip/header/parse",
@@ -79,61 +93,19 @@ go_library(
 )
 
 go_test(
-    name = "tcp_x_test",
-    size = "medium",
-    srcs = [
-        "dual_stack_test.go",
-        "sack_scoreboard_test.go",
-        "tcp_noracedetector_test.go",
-        "tcp_rack_test.go",
-        "tcp_sack_test.go",
-        "tcp_test.go",
-        "tcp_timestamp_test.go",
-    ],
-    shard_count = more_shards,
-    deps = [
-        ":tcp",
-        "//pkg/rand",
-        "//pkg/sync",
-        "//pkg/tcpip",
-        "//pkg/tcpip/checker",
-        "//pkg/tcpip/faketime",
-        "//pkg/tcpip/header",
-        "//pkg/tcpip/link/loopback",
-        "//pkg/tcpip/link/sniffer",
-        "//pkg/tcpip/network/ipv4",
-        "//pkg/tcpip/network/ipv6",
-        "//pkg/tcpip/seqnum",
-        "//pkg/tcpip/stack",
-        "//pkg/tcpip/testutil",
-        "//pkg/tcpip/transport/tcp/testing/context",
-        "//pkg/test/testutil",
-        "//pkg/waiter",
-        "@com_github_google_go_cmp//cmp:go_default_library",
-    ],
-)
-
-go_test(
-    name = "rcv_test",
-    size = "small",
-    srcs = ["rcv_test.go"],
-    deps = [
-        "//pkg/tcpip/header",
-        "//pkg/tcpip/seqnum",
-    ],
-)
-
-go_test(
     name = "tcp_test",
     size = "small",
     srcs = [
+        "main_test.go",
         "segment_test.go",
         "timer_test.go",
     ],
     library = ":tcp",
     deps = [
+        "//pkg/bufferv2",
+        "//pkg/refs",
+        "//pkg/refsvfs2",
         "//pkg/sleep",
-        "//pkg/tcpip/buffer",
         "//pkg/tcpip/faketime",
         "//pkg/tcpip/stack",
         "@com_github_google_go_cmp//cmp:go_default_library",

@@ -25,28 +25,28 @@ import (
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	"gvisor.dev/gvisor/pkg/bufferv2"
 	"gvisor.dev/gvisor/pkg/tcpip"
-	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/checker"
-	"gvisor.dev/gvisor/pkg/tcpip/faketime"
+	"gvisor.dev/gvisor/pkg/tcpip/checksum"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/link/channel"
 	iptestutil "gvisor.dev/gvisor/pkg/tcpip/network/internal/testutil"
+	"gvisor.dev/gvisor/pkg/tcpip/prependable"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/tcpip/testutil"
-	"gvisor.dev/gvisor/pkg/tcpip/transport/icmp"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
 
 const (
-	addr1 = "\x0a\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01"
-	addr2 = "\x0a\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02"
+	addr1 = tcpip.Address("\x0a\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01")
+	addr2 = tcpip.Address("\x0a\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02")
 	// The least significant 3 bytes are the same as addr2 so both addr2 and
 	// addr3 will have the same solicited-node address.
-	addr3 = "\x0a\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x02"
-	addr4 = "\x0a\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x03"
+	addr3 = tcpip.Address("\x0a\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x02")
+	addr4 = tcpip.Address("\x0a\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x03")
 
 	// Tests use the extension header identifier values as uint8 instead of
 	// header.IPv6ExtensionHeaderIdentifier.
@@ -60,13 +60,22 @@ const (
 	extraHeaderReserve = 50
 )
 
+var _ stack.MulticastForwardingEventDispatcher = (*fakeMulticastEventDispatcher)(nil)
+
+type fakeMulticastEventDispatcher struct{}
+
+func (m *fakeMulticastEventDispatcher) OnMissingRoute(context stack.MulticastPacketContext) {}
+
+func (m *fakeMulticastEventDispatcher) OnUnexpectedInputInterface(context stack.MulticastPacketContext, expectedInputInterface tcpip.NICID) {
+}
+
 // testReceiveICMP tests receiving an ICMP packet from src to dst. want is the
 // expected Neighbor Advertisement received count after receiving the packet.
 func testReceiveICMP(t *testing.T, s *stack.Stack, e *channel.Endpoint, src, dst tcpip.Address, want uint64) {
 	t.Helper()
 
 	// Receive ICMP packet.
-	hdr := buffer.NewPrependable(header.IPv6MinimumSize + header.ICMPv6NeighborAdvertMinimumSize)
+	hdr := prependable.New(header.IPv6MinimumSize + header.ICMPv6NeighborAdvertMinimumSize)
 	pkt := header.ICMPv6(hdr.Prepend(header.ICMPv6NeighborAdvertMinimumSize))
 	pkt.SetType(header.ICMPv6NeighborAdvert)
 	pkt.SetChecksum(header.ICMPv6Checksum(header.ICMPv6ChecksumParams{
@@ -84,9 +93,11 @@ func testReceiveICMP(t *testing.T, s *stack.Stack, e *channel.Endpoint, src, dst
 		DstAddr:           dst,
 	})
 
-	e.InjectInbound(ProtocolNumber, stack.NewPacketBuffer(stack.PacketBufferOptions{
-		Data: hdr.View().ToVectorisedView(),
-	}))
+	pktBuf := stack.NewPacketBuffer(stack.PacketBufferOptions{
+		Payload: bufferv2.MakeWithData(hdr.View()),
+	})
+	e.InjectInbound(ProtocolNumber, pktBuf)
+	pktBuf.DecRef()
 
 	stats := s.Stats().ICMP.V6.PacketsReceived
 
@@ -101,8 +112,8 @@ func testReceiveUDP(t *testing.T, s *stack.Stack, e *channel.Endpoint, src, dst 
 	t.Helper()
 
 	wq := waiter.Queue{}
-	we, ch := waiter.NewChannelEntry(nil)
-	wq.EventRegister(&we, waiter.ReadableEvents)
+	we, ch := waiter.NewChannelEntry(waiter.ReadableEvents)
+	wq.EventRegister(&we)
 	defer wq.EventUnregister(&we)
 	defer close(ch)
 
@@ -117,7 +128,7 @@ func testReceiveUDP(t *testing.T, s *stack.Stack, e *channel.Endpoint, src, dst 
 	}
 
 	// Receive UDP Packet.
-	hdr := buffer.NewPrependable(header.IPv6MinimumSize + header.UDPMinimumSize)
+	hdr := prependable.New(header.IPv6MinimumSize + header.UDPMinimumSize)
 	u := header.UDP(hdr.Prepend(header.UDPMinimumSize))
 	u.Encode(&header.UDPFields{
 		SrcPort: 5555,
@@ -129,7 +140,7 @@ func testReceiveUDP(t *testing.T, s *stack.Stack, e *channel.Endpoint, src, dst 
 	sum := header.PseudoHeaderChecksum(udp.ProtocolNumber, src, dst, header.UDPMinimumSize)
 
 	// UDP checksum
-	sum = header.Checksum(nil, sum)
+	sum = checksum.Checksum(nil, sum)
 	u.SetChecksum(^u.CalculateChecksum(sum))
 
 	payloadLength := hdr.UsedLength()
@@ -142,9 +153,11 @@ func testReceiveUDP(t *testing.T, s *stack.Stack, e *channel.Endpoint, src, dst 
 		DstAddr:           dst,
 	})
 
-	e.InjectInbound(ProtocolNumber, stack.NewPacketBuffer(stack.PacketBufferOptions{
-		Data: hdr.View().ToVectorisedView(),
-	}))
+	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
+		Payload: bufferv2.MakeWithData(hdr.View()),
+	})
+	e.InjectInbound(ProtocolNumber, pkt)
+	pkt.DecRef()
 
 	stat := s.Stats().UDP.PacketsReceived
 
@@ -153,24 +166,27 @@ func testReceiveUDP(t *testing.T, s *stack.Stack, e *channel.Endpoint, src, dst 
 	}
 }
 
-func compareFragments(packets []*stack.PacketBuffer, sourcePacket *stack.PacketBuffer, mtu uint32, wantFragments []fragmentInfo, proto tcpip.TransportProtocolNumber) error {
+func compareFragments(packets []stack.PacketBufferPtr, sourcePacket stack.PacketBufferPtr, mtu uint32, wantFragments []fragmentInfo, proto tcpip.TransportProtocolNumber) error {
 	// sourcePacket does not have its IP Header populated. Let's copy the one
 	// from the first fragment.
-	source := header.IPv6(packets[0].NetworkHeader().View())
+	source := header.IPv6(packets[0].NetworkHeader().Slice())
 	sourceIPHeadersLen := len(source)
-	vv := buffer.NewVectorisedView(sourcePacket.Size(), sourcePacket.Views())
-	source = append(source, vv.ToView()...)
+	view := sourcePacket.ToView()
+	defer view.Release()
+	source = append(source, view.AsSlice()...)
 
-	var reassembledPayload buffer.VectorisedView
+	var reassembledPayload bufferv2.Buffer
+	defer reassembledPayload.Release()
 	for i, fragment := range packets {
 		// Confirm that the packet is valid.
-		allBytes := buffer.NewVectorisedView(fragment.Size(), fragment.Views())
-		fragmentIPHeaders := header.IPv6(allBytes.ToView())
+		allBytes := fragment.ToBuffer()
+		defer allBytes.Release()
+		fragmentIPHeaders := header.IPv6(allBytes.Flatten())
 		if !fragmentIPHeaders.IsValid(len(fragmentIPHeaders)) {
 			return fmt.Errorf("fragment #%d: IP packet is invalid:\n%s", i, hex.Dump(fragmentIPHeaders))
 		}
 
-		fragmentIPHeadersLength := fragment.NetworkHeader().View().Size()
+		fragmentIPHeadersLength := len(fragment.NetworkHeader().Slice())
 		if fragmentIPHeadersLength != sourceIPHeadersLen {
 			return fmt.Errorf("fragment #%d: got fragmentIPHeadersLength = %d, want = %d", i, fragmentIPHeadersLength, sourceIPHeadersLen)
 		}
@@ -220,11 +236,11 @@ func compareFragments(packets []*stack.PacketBuffer, sourcePacket *stack.PacketB
 
 		// Store the reassembled payload as we parse each fragment. The payload
 		// includes the Transport header and everything after.
-		reassembledPayload.AppendView(fragment.TransportHeader().View())
-		reassembledPayload.AppendView(fragment.Data().AsRange().ToOwnedView())
+		reassembledPayload.Append(fragment.TransportHeader().View())
+		reassembledPayload.Append(fragment.Data().AsRange().ToView())
 	}
 
-	if diff := cmp.Diff(buffer.View(source[sourceIPHeadersLen:]), reassembledPayload.ToView()); diff != "" {
+	if diff := cmp.Diff([]byte(source[sourceIPHeadersLen:]), reassembledPayload.Flatten()); diff != "" {
 		return fmt.Errorf("reassembledPayload mismatch (-want +got):\n%s", diff)
 	}
 
@@ -235,21 +251,21 @@ func compareFragments(packets []*stack.PacketBuffer, sourcePacket *stack.PacketB
 // UDP packets destined to the IPv6 link-local all-nodes multicast address.
 func TestReceiveOnAllNodesMulticastAddr(t *testing.T) {
 	tests := []struct {
-		name            string
-		protocolFactory stack.TransportProtocolFactory
-		rxf             func(t *testing.T, s *stack.Stack, e *channel.Endpoint, src, dst tcpip.Address, want uint64)
+		name string
+		rxf  func(t *testing.T, s *stack.Stack, e *channel.Endpoint, src, dst tcpip.Address, want uint64)
 	}{
-		{"ICMP", icmp.NewProtocol6, testReceiveICMP},
-		{"UDP", udp.NewProtocol, testReceiveUDP},
+		{"ICMP", testReceiveICMP},
+		{"UDP", testReceiveUDP},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			s := stack.New(stack.Options{
-				NetworkProtocols:   []stack.NetworkProtocolFactory{NewProtocol},
-				TransportProtocols: []stack.TransportProtocolFactory{test.protocolFactory},
-			})
+			c := newTestContext()
+			defer c.cleanup()
+			s := c.s
+
 			e := channel.New(10, header.IPv6MinimumMTU, linkAddr1)
+			defer e.Close()
 			if err := s.CreateNIC(1, e); err != nil {
 				t.Fatalf("CreateNIC(_) = %s", err)
 			}
@@ -266,23 +282,23 @@ func TestReceiveOnAllNodesMulticastAddr(t *testing.T) {
 // address.
 func TestReceiveOnSolicitedNodeAddr(t *testing.T) {
 	tests := []struct {
-		name            string
-		protocolFactory stack.TransportProtocolFactory
-		rxf             func(t *testing.T, s *stack.Stack, e *channel.Endpoint, src, dst tcpip.Address, want uint64)
+		name string
+		rxf  func(t *testing.T, s *stack.Stack, e *channel.Endpoint, src, dst tcpip.Address, want uint64)
 	}{
-		{"ICMP", icmp.NewProtocol6, testReceiveICMP},
-		{"UDP", udp.NewProtocol, testReceiveUDP},
+		{"ICMP", testReceiveICMP},
+		{"UDP", testReceiveUDP},
 	}
 
 	snmc := header.SolicitedNodeAddr(addr2)
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			s := stack.New(stack.Options{
-				NetworkProtocols:   []stack.NetworkProtocolFactory{NewProtocol},
-				TransportProtocols: []stack.TransportProtocolFactory{test.protocolFactory},
-			})
+			c := newTestContext()
+			defer c.cleanup()
+			s := c.s
+
 			e := channel.New(1, header.IPv6MinimumMTU, linkAddr1)
+			defer e.Close()
 			if err := s.CreateNIC(nicID, e); err != nil {
 				t.Fatalf("CreateNIC(%d, _) = %s", nicID, err)
 			}
@@ -298,16 +314,24 @@ func TestReceiveOnSolicitedNodeAddr(t *testing.T) {
 			// addr2/addr3 yet as we haven't added those addresses.
 			test.rxf(t, s, e, addr1, snmc, 0)
 
-			if err := s.AddAddress(nicID, ProtocolNumber, addr2); err != nil {
-				t.Fatalf("AddAddress(%d, %d, %s) = %s", nicID, ProtocolNumber, addr2, err)
+			protocolAddr2 := tcpip.ProtocolAddress{
+				Protocol:          ProtocolNumber,
+				AddressWithPrefix: addr2.WithPrefix(),
+			}
+			if err := s.AddProtocolAddress(nicID, protocolAddr2, stack.AddressProperties{}); err != nil {
+				t.Fatalf("AddProtocolAddress(%d, %+v, {}): %s", nicID, protocolAddr2, err)
 			}
 
 			// Should receive a packet destined to the solicited node address of
 			// addr2/addr3 now that we have added added addr2.
 			test.rxf(t, s, e, addr1, snmc, 1)
 
-			if err := s.AddAddress(nicID, ProtocolNumber, addr3); err != nil {
-				t.Fatalf("AddAddress(%d, %d, %s) = %s", nicID, ProtocolNumber, addr3, err)
+			protocolAddr3 := tcpip.ProtocolAddress{
+				Protocol:          ProtocolNumber,
+				AddressWithPrefix: addr3.WithPrefix(),
+			}
+			if err := s.AddProtocolAddress(nicID, protocolAddr3, stack.AddressProperties{}); err != nil {
+				t.Fatalf("AddProtocolAddress(%d, %+v, {}): %s", nicID, protocolAddr3, err)
 			}
 
 			// Should still receive a packet destined to the solicited node address of
@@ -367,15 +391,20 @@ func TestAddIpv6Address(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			s := stack.New(stack.Options{
-				NetworkProtocols: []stack.NetworkProtocolFactory{NewProtocol},
-			})
+			c := newTestContext()
+			defer c.cleanup()
+			s := c.s
+
 			if err := s.CreateNIC(nicID, &stubLinkEndpoint{}); err != nil {
 				t.Fatalf("CreateNIC(%d, _) = %s", nicID, err)
 			}
 
-			if err := s.AddAddress(nicID, ProtocolNumber, test.addr); err != nil {
-				t.Fatalf("AddAddress(%d, %d, nil) = %s", nicID, ProtocolNumber, err)
+			protocolAddr := tcpip.ProtocolAddress{
+				Protocol:          ProtocolNumber,
+				AddressWithPrefix: test.addr.WithPrefix(),
+			}
+			if err := s.AddProtocolAddress(nicID, protocolAddr, stack.AddressProperties{}); err != nil {
+				t.Fatalf("AddProtocolAddress(%d, %+v, {}): %s", nicID, protocolAddr, err)
 			}
 
 			if addr, err := s.GetMainNICAddress(nicID, ProtocolNumber); err != nil {
@@ -890,16 +919,21 @@ func TestReceiveIPv6ExtHdrs(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			s := stack.New(stack.Options{
-				NetworkProtocols:   []stack.NetworkProtocolFactory{NewProtocol},
-				TransportProtocols: []stack.TransportProtocolFactory{udp.NewProtocol},
-			})
+			c := newTestContext()
+			defer c.cleanup()
+			s := c.s
+
 			e := channel.New(1, header.IPv6MinimumMTU, linkAddr1)
+			defer e.Close()
 			if err := s.CreateNIC(nicID, e); err != nil {
 				t.Fatalf("CreateNIC(%d, _) = %s", nicID, err)
 			}
-			if err := s.AddAddress(nicID, ProtocolNumber, addr2); err != nil {
-				t.Fatalf("AddAddress(%d, %d, %s) = %s", nicID, ProtocolNumber, addr2, err)
+			protocolAddr := tcpip.ProtocolAddress{
+				Protocol:          ProtocolNumber,
+				AddressWithPrefix: addr2.WithPrefix(),
+			}
+			if err := s.AddProtocolAddress(nicID, protocolAddr, stack.AddressProperties{}); err != nil {
+				t.Fatalf("AddProtocolAddress(%d, %+v, {}): %s", nicID, protocolAddr, err)
 			}
 
 			// Add a default route so that a return packet knows where to go.
@@ -911,8 +945,8 @@ func TestReceiveIPv6ExtHdrs(t *testing.T) {
 			})
 
 			wq := waiter.Queue{}
-			we, ch := waiter.NewChannelEntry(nil)
-			wq.EventRegister(&we, waiter.WritableEvents)
+			we, ch := waiter.NewChannelEntry(waiter.WritableEvents)
+			wq.EventRegister(&we)
 			defer wq.EventUnregister(&we)
 			defer close(ch)
 			ep, err := s.NewEndpoint(udp.ProtocolNumber, ProtocolNumber, &wq)
@@ -930,7 +964,7 @@ func TestReceiveIPv6ExtHdrs(t *testing.T) {
 			udpLength := header.UDPMinimumSize + len(udpPayload)
 			extHdrBytes, ipv6NextHdr := test.extHdr(uint8(header.UDPProtocolNumber))
 			extHdrLen := len(extHdrBytes)
-			hdr := buffer.NewPrependable(header.IPv6MinimumSize + extHdrLen + udpLength)
+			hdr := prependable.New(header.IPv6MinimumSize + extHdrLen + udpLength)
 
 			// Serialize UDP message.
 			u := header.UDP(hdr.Prepend(udpLength))
@@ -947,7 +981,7 @@ func TestReceiveIPv6ExtHdrs(t *testing.T) {
 			}
 
 			sum := header.PseudoHeaderChecksum(udp.ProtocolNumber, addr1, dstAddr, uint16(udpLength))
-			sum = header.Checksum(udpPayload, sum)
+			sum = checksum.Checksum(udpPayload, sum)
 			u.SetChecksum(^u.CalculateChecksum(sum))
 
 			// Copy extension header bytes between the UDP message and the IPv6
@@ -980,10 +1014,11 @@ func TestReceiveIPv6ExtHdrs(t *testing.T) {
 				}
 			}
 
-			e.InjectInbound(ProtocolNumber, stack.NewPacketBuffer(stack.PacketBufferOptions{
-				Data: hdr.View().ToVectorisedView(),
-			}))
-
+			pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
+				Payload: bufferv2.MakeWithData(hdr.View()),
+			})
+			e.InjectInbound(ProtocolNumber, pkt)
+			pkt.DecRef()
 			for i := range counters {
 				if got := counters[i].Value(); got != 1 {
 					t.Errorf("after writing packet: got test.countersToBeIncremented(&stats)[%d].Value() = %d, want = 1", i, got)
@@ -997,41 +1032,42 @@ func TestReceiveIPv6ExtHdrs(t *testing.T) {
 				}
 
 				if !test.expectICMP {
-					if p, ok := e.Read(); ok {
+					if p := e.Read(); !p.IsNil() {
 						t.Fatalf("unexpected packet received: %#v", p)
 					}
 					return
 				}
 
 				// ICMP required.
-				p, ok := e.Read()
-				if !ok {
+				p := e.Read()
+				if p.IsNil() {
 					t.Fatalf("expected packet wasn't written out")
 				}
+				defer p.DecRef()
 
-				// Pack the output packet into a single buffer.View as the checkers
+				// Pack the output packet into a single bufferv2.View as the checkers
 				// assume that.
-				vv := buffer.NewVectorisedView(p.Pkt.Size(), p.Pkt.Views())
-				pkt := vv.ToView()
+				v := p.ToView()
+				defer v.Release()
+				pkt := v.AsSlice()
 				if got, want := len(pkt), header.IPv6FixedHeaderSize+header.ICMPv6MinimumSize+hdr.UsedLength(); got != want {
 					t.Fatalf("got an ICMP packet of size = %d, want = %d", got, want)
 				}
 
-				ipHdr := header.IPv6(pkt)
-				checker.IPv6(t, ipHdr, checker.ICMPv6(
+				checker.IPv6(t, v, checker.ICMPv6(
 					checker.ICMPv6Type(test.ICMPType),
 					checker.ICMPv6Code(test.ICMPCode)))
 
 				// We know we are looking at no extension headers in the error ICMP
 				// packets.
-				icmpPkt := header.ICMPv6(ipHdr.Payload())
+				icm := header.ICMPv6(header.IPv6(pkt).Payload())
 				// We know we sent small packets that won't be truncated when reflected
 				// back to us.
-				originalPacket := icmpPkt.Payload()
-				if got, want := icmpPkt.TypeSpecific(), test.pointer; got != want {
+				originalPacket := icm.Payload()
+				if got, want := icm.TypeSpecific(), test.pointer; got != want {
 					t.Errorf("unexpected ICMPv6 pointer, got = %d, want = %d\n", got, want)
 				}
-				if diff := cmp.Diff(hdr.View(), buffer.View(originalPacket)); diff != "" {
+				if diff := cmp.Diff([]byte(hdr.View()), originalPacket); diff != "" {
 					t.Errorf("ICMPv6 payload mismatch (-want +got):\n%s", diff)
 				}
 				return
@@ -1070,7 +1106,7 @@ type fragmentData struct {
 	srcAddr tcpip.Address
 	dstAddr tcpip.Address
 	nextHdr uint8
-	data    buffer.VectorisedView
+	data    []byte
 }
 
 func TestReceiveIPv6Fragments(t *testing.T) {
@@ -1088,7 +1124,7 @@ func TestReceiveIPv6Fragments(t *testing.T) {
 		routingExtHdrLen = 8
 	)
 
-	udpGen := func(payload []byte, multiplier uint8, src, dst tcpip.Address) buffer.View {
+	udpGen := func(payload []byte, multiplier uint8, src, dst tcpip.Address) []byte {
 		payloadLen := len(payload)
 		for i := 0; i < payloadLen; i++ {
 			payload[i] = uint8(i) * multiplier
@@ -1096,7 +1132,7 @@ func TestReceiveIPv6Fragments(t *testing.T) {
 
 		udpLength := header.UDPMinimumSize + payloadLen
 
-		hdr := buffer.NewPrependable(udpLength)
+		hdr := prependable.New(udpLength)
 		u := header.UDP(hdr.Prepend(udpLength))
 		u.Encode(&header.UDPFields{
 			SrcPort: 5555,
@@ -1105,7 +1141,7 @@ func TestReceiveIPv6Fragments(t *testing.T) {
 		})
 		copy(u.Payload(), payload)
 		sum := header.PseudoHeaderChecksum(udp.ProtocolNumber, src, dst, uint16(udpLength))
-		sum = header.Checksum(payload, sum)
+		sum = checksum.Checksum(payload, sum)
 		u.SetChecksum(^u.CalculateChecksum(sum))
 		return hdr.View()
 	}
@@ -1143,7 +1179,7 @@ func TestReceiveIPv6Fragments(t *testing.T) {
 					srcAddr: addr1,
 					dstAddr: addr2,
 					nextHdr: uint8(header.UDPProtocolNumber),
-					data:    ipv6Payload1Addr1ToAddr2.ToVectorisedView(),
+					data:    ipv6Payload1Addr1ToAddr2,
 				},
 			},
 			expectedPayloads: [][]byte{udpPayload1Addr1ToAddr2},
@@ -1155,14 +1191,10 @@ func TestReceiveIPv6Fragments(t *testing.T) {
 					srcAddr: addr1,
 					dstAddr: addr2,
 					nextHdr: fragmentExtHdrID,
-					data: buffer.NewVectorisedView(
-						fragmentExtHdrLen+len(ipv6Payload1Addr1ToAddr2),
-						[]buffer.View{
-							// Fragment extension header.
-							[]byte{uint8(header.UDPProtocolNumber), 0, 0, 0, 0, 0, 0, 0},
-
-							ipv6Payload1Addr1ToAddr2,
-						},
+					data: append(
+						// Fragment extension header.
+						[]byte{uint8(header.UDPProtocolNumber), 0, 0, 0, 0, 0, 0, 0},
+						ipv6Payload1Addr1ToAddr2...,
 					),
 				},
 			},
@@ -1175,14 +1207,10 @@ func TestReceiveIPv6Fragments(t *testing.T) {
 					srcAddr: addr1,
 					dstAddr: addr2,
 					nextHdr: fragmentExtHdrID,
-					data: buffer.NewVectorisedView(
-						fragmentExtHdrLen+len(ipv6Payload3Addr1ToAddr2),
-						[]buffer.View{
-							// Fragment extension header.
-							[]byte{uint8(header.UDPProtocolNumber), 0, 0, 0, 0, 0, 0, 0},
-
-							ipv6Payload3Addr1ToAddr2,
-						},
+					data: append(
+						// Fragment extension header.
+						[]byte{uint8(header.UDPProtocolNumber), 0, 0, 0, 0, 0, 0, 0},
+						ipv6Payload3Addr1ToAddr2...,
 					),
 				},
 			},
@@ -1195,32 +1223,24 @@ func TestReceiveIPv6Fragments(t *testing.T) {
 					srcAddr: addr1,
 					dstAddr: addr2,
 					nextHdr: fragmentExtHdrID,
-					data: buffer.NewVectorisedView(
-						fragmentExtHdrLen+64,
-						[]buffer.View{
-							// Fragment extension header.
-							//
-							// Fragment offset = 0, More = true, ID = 1
-							[]byte{uint8(header.UDPProtocolNumber), 0, 0, 1, 0, 0, 0, 1},
-
-							ipv6Payload1Addr1ToAddr2[:64],
-						},
+					data: append(
+						// Fragment extension header.
+						//
+						// Fragment offset = 0, More = true, ID = 1
+						[]byte{uint8(header.UDPProtocolNumber), 0, 0, 1, 0, 0, 0, 1},
+						ipv6Payload1Addr1ToAddr2[:64]...,
 					),
 				},
 				{
 					srcAddr: addr1,
 					dstAddr: addr2,
 					nextHdr: fragmentExtHdrID,
-					data: buffer.NewVectorisedView(
-						fragmentExtHdrLen+len(ipv6Payload1Addr1ToAddr2)-64,
-						[]buffer.View{
-							// Fragment extension header.
-							//
-							// Fragment offset = 8, More = false, ID = 1
-							[]byte{uint8(header.UDPProtocolNumber), 0, 0, 64, 0, 0, 0, 1},
-
-							ipv6Payload1Addr1ToAddr2[64:],
-						},
+					data: append(
+						// Fragment extension header.
+						//
+						// Fragment offset = 8, More = false, ID = 1
+						[]byte{uint8(header.UDPProtocolNumber), 0, 0, 64, 0, 0, 0, 1},
+						ipv6Payload1Addr1ToAddr2[64:]...,
 					),
 				},
 			},
@@ -1233,32 +1253,24 @@ func TestReceiveIPv6Fragments(t *testing.T) {
 					srcAddr: addr1,
 					dstAddr: addr2,
 					nextHdr: fragmentExtHdrID,
-					data: buffer.NewVectorisedView(
-						fragmentExtHdrLen+len(ipv6Payload1Addr1ToAddr2)-64,
-						[]buffer.View{
-							// Fragment extension header.
-							//
-							// Fragment offset = 8, More = false, ID = 1
-							[]byte{uint8(header.UDPProtocolNumber), 0, 0, 64, 0, 0, 0, 1},
-
-							ipv6Payload1Addr1ToAddr2[64:],
-						},
+					data: append(
+						// Fragment extension header.
+						//
+						// Fragment offset = 8, More = false, ID = 1
+						[]byte{uint8(header.UDPProtocolNumber), 0, 0, 64, 0, 0, 0, 1},
+						ipv6Payload1Addr1ToAddr2[64:]...,
 					),
 				},
 				{
 					srcAddr: addr1,
 					dstAddr: addr2,
 					nextHdr: fragmentExtHdrID,
-					data: buffer.NewVectorisedView(
-						fragmentExtHdrLen+64,
-						[]buffer.View{
-							// Fragment extension header.
-							//
-							// Fragment offset = 0, More = true, ID = 1
-							[]byte{uint8(header.UDPProtocolNumber), 0, 0, 1, 0, 0, 0, 1},
-
-							ipv6Payload1Addr1ToAddr2[:64],
-						},
+					data: append(
+						// Fragment extension header.
+						//
+						// Fragment offset = 0, More = true, ID = 1
+						[]byte{uint8(header.UDPProtocolNumber), 0, 0, 1, 0, 0, 0, 1},
+						ipv6Payload1Addr1ToAddr2[:64]...,
 					),
 				},
 			},
@@ -1271,34 +1283,26 @@ func TestReceiveIPv6Fragments(t *testing.T) {
 					srcAddr: addr1,
 					dstAddr: addr2,
 					nextHdr: fragmentExtHdrID,
-					data: buffer.NewVectorisedView(
-						fragmentExtHdrLen+64,
-						[]buffer.View{
-							// Fragment extension header.
-							//
-							// Fragment offset = 0, More = true, ID = 1
-							[]byte{uint8(header.UDPProtocolNumber), 0, 0, 1, 0, 0, 0, 1},
-
-							ipv6Payload1Addr1ToAddr2[:64],
-						},
+					data: append(
+						// Fragment extension header.
+						//
+						// Fragment offset = 0, More = true, ID = 1
+						[]byte{uint8(header.UDPProtocolNumber), 0, 0, 1, 0, 0, 0, 1},
+						ipv6Payload1Addr1ToAddr2[:64]...,
 					),
 				},
 				{
 					srcAddr: addr1,
 					dstAddr: addr2,
 					nextHdr: fragmentExtHdrID,
-					data: buffer.NewVectorisedView(
-						fragmentExtHdrLen+len(ipv6Payload1Addr1ToAddr2)-64,
-						[]buffer.View{
-							// Fragment extension header.
-							//
-							// Fragment offset = 8, More = false, ID = 1
-							// NextHeader value is different than the one in the first fragment, so
-							// this NextHeader should be ignored.
-							[]byte{uint8(header.IPv6NoNextHeaderIdentifier), 0, 0, 64, 0, 0, 0, 1},
-
-							ipv6Payload1Addr1ToAddr2[64:],
-						},
+					data: append(
+						// Fragment extension header.
+						//
+						// Fragment offset = 8, More = false, ID = 1
+						// NextHeader value is different than the one in the first fragment, so
+						// this NextHeader should be ignored.
+						[]byte{uint8(header.IPv6NoNextHeaderIdentifier), 0, 0, 64, 0, 0, 0, 1},
+						ipv6Payload1Addr1ToAddr2[64:]...,
 					),
 				},
 			},
@@ -1311,32 +1315,24 @@ func TestReceiveIPv6Fragments(t *testing.T) {
 					srcAddr: addr1,
 					dstAddr: addr2,
 					nextHdr: fragmentExtHdrID,
-					data: buffer.NewVectorisedView(
-						fragmentExtHdrLen+64,
-						[]buffer.View{
-							// Fragment extension header.
-							//
-							// Fragment offset = 0, More = true, ID = 1
-							[]byte{uint8(header.UDPProtocolNumber), 0, 0, 1, 0, 0, 0, 1},
-
-							ipv6Payload3Addr1ToAddr2[:64],
-						},
+					data: append(
+						// Fragment extension header.
+						//
+						// Fragment offset = 0, More = true, ID = 1
+						[]byte{uint8(header.UDPProtocolNumber), 0, 0, 1, 0, 0, 0, 1},
+						ipv6Payload3Addr1ToAddr2[:64]...,
 					),
 				},
 				{
 					srcAddr: addr1,
 					dstAddr: addr2,
 					nextHdr: fragmentExtHdrID,
-					data: buffer.NewVectorisedView(
-						fragmentExtHdrLen+len(ipv6Payload3Addr1ToAddr2)-64,
-						[]buffer.View{
-							// Fragment extension header.
-							//
-							// Fragment offset = 8, More = false, ID = 1
-							[]byte{uint8(header.UDPProtocolNumber), 0, 0, 64, 0, 0, 0, 1},
-
-							ipv6Payload3Addr1ToAddr2[64:],
-						},
+					data: append(
+						// Fragment extension header.
+						//
+						// Fragment offset = 8, More = false, ID = 1
+						[]byte{uint8(header.UDPProtocolNumber), 0, 0, 64, 0, 0, 0, 1},
+						ipv6Payload3Addr1ToAddr2[64:]...,
 					),
 				},
 			},
@@ -1349,32 +1345,24 @@ func TestReceiveIPv6Fragments(t *testing.T) {
 					srcAddr: addr1,
 					dstAddr: addr2,
 					nextHdr: fragmentExtHdrID,
-					data: buffer.NewVectorisedView(
-						fragmentExtHdrLen+63,
-						[]buffer.View{
-							// Fragment extension header.
-							//
-							// Fragment offset = 0, More = true, ID = 1
-							[]byte{uint8(header.UDPProtocolNumber), 0, 0, 1, 0, 0, 0, 1},
-
-							ipv6Payload3Addr1ToAddr2[:63],
-						},
+					data: append(
+						// Fragment extension header.
+						//
+						// Fragment offset = 0, More = true, ID = 1
+						[]byte{uint8(header.UDPProtocolNumber), 0, 0, 1, 0, 0, 0, 1},
+						ipv6Payload3Addr1ToAddr2[:63]...,
 					),
 				},
 				{
 					srcAddr: addr1,
 					dstAddr: addr2,
 					nextHdr: fragmentExtHdrID,
-					data: buffer.NewVectorisedView(
-						fragmentExtHdrLen+len(ipv6Payload3Addr1ToAddr2)-63,
-						[]buffer.View{
-							// Fragment extension header.
-							//
-							// Fragment offset = 8, More = false, ID = 1
-							[]byte{uint8(header.UDPProtocolNumber), 0, 0, 64, 0, 0, 0, 1},
-
-							ipv6Payload3Addr1ToAddr2[63:],
-						},
+					data: append(
+						// Fragment extension header.
+						//
+						// Fragment offset = 8, More = false, ID = 1
+						[]byte{uint8(header.UDPProtocolNumber), 0, 0, 64, 0, 0, 0, 1},
+						ipv6Payload3Addr1ToAddr2[63:]...,
 					),
 				},
 			},
@@ -1387,32 +1375,24 @@ func TestReceiveIPv6Fragments(t *testing.T) {
 					srcAddr: addr1,
 					dstAddr: addr2,
 					nextHdr: fragmentExtHdrID,
-					data: buffer.NewVectorisedView(
-						fragmentExtHdrLen+64,
-						[]buffer.View{
-							// Fragment extension header.
-							//
-							// Fragment offset = 0, More = true, ID = 1
-							[]byte{uint8(header.UDPProtocolNumber), 0, 0, 1, 0, 0, 0, 1},
-
-							ipv6Payload1Addr1ToAddr2[:64],
-						},
+					data: append(
+						// Fragment extension header.
+						//
+						// Fragment offset = 0, More = true, ID = 1
+						[]byte{uint8(header.UDPProtocolNumber), 0, 0, 1, 0, 0, 0, 1},
+						ipv6Payload1Addr1ToAddr2[:64]...,
 					),
 				},
 				{
 					srcAddr: addr1,
 					dstAddr: addr2,
 					nextHdr: fragmentExtHdrID,
-					data: buffer.NewVectorisedView(
-						fragmentExtHdrLen+len(ipv6Payload1Addr1ToAddr2)-64,
-						[]buffer.View{
-							// Fragment extension header.
-							//
-							// Fragment offset = 8, More = false, ID = 2
-							[]byte{uint8(header.UDPProtocolNumber), 0, 0, 64, 0, 0, 0, 2},
-
-							ipv6Payload1Addr1ToAddr2[64:],
-						},
+					data: append(
+						// Fragment extension header.
+						//
+						// Fragment offset = 8, More = false, ID = 2
+						[]byte{uint8(header.UDPProtocolNumber), 0, 0, 64, 0, 0, 0, 2},
+						ipv6Payload1Addr1ToAddr2[64:]...,
 					),
 				},
 			},
@@ -1425,35 +1405,27 @@ func TestReceiveIPv6Fragments(t *testing.T) {
 					srcAddr: addr1,
 					dstAddr: addr2,
 					nextHdr: fragmentExtHdrID,
-					data: buffer.NewVectorisedView(
-						fragmentExtHdrLen+udpMaximumSizeMinus15,
-						[]buffer.View{
-							// Fragment extension header.
-							//
-							// Fragment offset = 0, More = true, ID = 1
-							[]byte{uint8(header.UDPProtocolNumber), 0, 0, 1, 0, 0, 0, 1},
-
-							ipv6Payload4Addr1ToAddr2[:udpMaximumSizeMinus15],
-						},
+					data: append(
+						// Fragment extension header.
+						//
+						// Fragment offset = 0, More = true, ID = 1
+						[]byte{uint8(header.UDPProtocolNumber), 0, 0, 1, 0, 0, 0, 1},
+						ipv6Payload4Addr1ToAddr2[:udpMaximumSizeMinus15]...,
 					),
 				},
 				{
 					srcAddr: addr1,
 					dstAddr: addr2,
 					nextHdr: fragmentExtHdrID,
-					data: buffer.NewVectorisedView(
-						fragmentExtHdrLen+len(ipv6Payload4Addr1ToAddr2)-udpMaximumSizeMinus15,
-						[]buffer.View{
-							// Fragment extension header.
-							//
-							// Fragment offset = udpMaximumSizeMinus15/8, More = false, ID = 1
-							[]byte{uint8(header.UDPProtocolNumber), 0,
-								udpMaximumSizeMinus15 >> 8,
-								udpMaximumSizeMinus15 & 0xff,
-								0, 0, 0, 1},
-
-							ipv6Payload4Addr1ToAddr2[udpMaximumSizeMinus15:],
-						},
+					data: append(
+						// Fragment extension header.
+						//
+						// Fragment offset = udpMaximumSizeMinus15/8, More = false, ID = 1
+						[]byte{uint8(header.UDPProtocolNumber), 0,
+							udpMaximumSizeMinus15 >> 8,
+							udpMaximumSizeMinus15 & 0xff,
+							0, 0, 0, 1},
+						ipv6Payload4Addr1ToAddr2[udpMaximumSizeMinus15:]...,
 					),
 				},
 			},
@@ -1466,35 +1438,28 @@ func TestReceiveIPv6Fragments(t *testing.T) {
 					srcAddr: addr1,
 					dstAddr: addr2,
 					nextHdr: fragmentExtHdrID,
-					data: buffer.NewVectorisedView(
-						fragmentExtHdrLen+udpMaximumSizeMinus15,
-						[]buffer.View{
-							// Fragment extension header.
-							//
-							// Fragment offset = 0, More = true, ID = 1
-							[]byte{uint8(header.UDPProtocolNumber), 0, 0, 1, 0, 0, 0, 1},
-
-							ipv6Payload4Addr1ToAddr2[:udpMaximumSizeMinus15],
-						},
+					data: append(
+						// Fragment extension header.
+						//
+						// Fragment offset = 0, More = true, ID = 1
+						[]byte{uint8(header.UDPProtocolNumber), 0, 0, 1, 0, 0, 0, 1},
+						ipv6Payload4Addr1ToAddr2[:udpMaximumSizeMinus15]...,
 					),
 				},
 				{
 					srcAddr: addr1,
 					dstAddr: addr2,
 					nextHdr: fragmentExtHdrID,
-					data: buffer.NewVectorisedView(
-						fragmentExtHdrLen+len(ipv6Payload4Addr1ToAddr2)-udpMaximumSizeMinus15,
-						[]buffer.View{
-							// Fragment extension header.
-							//
-							// Fragment offset = udpMaximumSizeMinus15/8, More = true, ID = 1
-							[]byte{uint8(header.UDPProtocolNumber), 0,
-								udpMaximumSizeMinus15 >> 8,
-								(udpMaximumSizeMinus15 & 0xff) + 1,
-								0, 0, 0, 1},
+					data: append(
+						// Fragment extension header.
+						//
+						// Fragment offset = udpMaximumSizeMinus15/8, More = true, ID = 1
+						[]byte{uint8(header.UDPProtocolNumber), 0,
+							udpMaximumSizeMinus15 >> 8,
+							(udpMaximumSizeMinus15 & 0xff) + 1,
+							0, 0, 0, 1},
 
-							ipv6Payload4Addr1ToAddr2[udpMaximumSizeMinus15:],
-						},
+						ipv6Payload4Addr1ToAddr2[udpMaximumSizeMinus15:]...,
 					),
 				},
 			},
@@ -1507,42 +1472,36 @@ func TestReceiveIPv6Fragments(t *testing.T) {
 					srcAddr: addr1,
 					dstAddr: addr2,
 					nextHdr: routingExtHdrID,
-					data: buffer.NewVectorisedView(
-						routingExtHdrLen+fragmentExtHdrLen+64,
-						[]buffer.View{
-							// Routing extension header.
-							//
-							// Segments left = 0.
-							[]byte{fragmentExtHdrID, 0, 1, 0, 2, 3, 4, 5},
-
+					data: append(
+						// Routing extension header.
+						//
+						// Segments left = 0.
+						[]byte{fragmentExtHdrID, 0, 1, 0, 2, 3, 4, 5},
+						append(
 							// Fragment extension header.
 							//
 							// Fragment offset = 0, More = true, ID = 1
 							[]byte{uint8(header.UDPProtocolNumber), 0, 0, 1, 0, 0, 0, 1},
-
-							ipv6Payload1Addr1ToAddr2[:64],
-						},
+							ipv6Payload1Addr1ToAddr2[:64]...,
+						)...,
 					),
 				},
 				{
 					srcAddr: addr1,
 					dstAddr: addr2,
 					nextHdr: routingExtHdrID,
-					data: buffer.NewVectorisedView(
-						routingExtHdrLen+fragmentExtHdrLen+len(ipv6Payload1Addr1ToAddr2)-64,
-						[]buffer.View{
-							// Routing extension header.
-							//
-							// Segments left = 0.
-							[]byte{fragmentExtHdrID, 0, 1, 0, 2, 3, 4, 5},
-
+					data: append(
+						// Routing extension header.
+						//
+						// Segments left = 0.
+						[]byte{fragmentExtHdrID, 0, 1, 0, 2, 3, 4, 5},
+						append(
 							// Fragment extension header.
 							//
 							// Fragment offset = 8, More = false, ID = 1
 							[]byte{uint8(header.UDPProtocolNumber), 0, 0, 64, 0, 0, 0, 1},
-
-							ipv6Payload1Addr1ToAddr2[64:],
-						},
+							ipv6Payload1Addr1ToAddr2[64:]...,
+						)...,
 					),
 				},
 			},
@@ -1555,42 +1514,37 @@ func TestReceiveIPv6Fragments(t *testing.T) {
 					srcAddr: addr1,
 					dstAddr: addr2,
 					nextHdr: routingExtHdrID,
-					data: buffer.NewVectorisedView(
-						routingExtHdrLen+fragmentExtHdrLen+64,
-						[]buffer.View{
-							// Routing extension header.
-							//
-							// Segments left = 1.
-							[]byte{fragmentExtHdrID, 0, 1, 1, 2, 3, 4, 5},
-
+					data: append(
+						// Routing extension header.
+						//
+						// Segments left = 1.
+						[]byte{fragmentExtHdrID, 0, 1, 1, 2, 3, 4, 5},
+						append(
 							// Fragment extension header.
 							//
 							// Fragment offset = 0, More = true, ID = 1
 							[]byte{uint8(header.UDPProtocolNumber), 0, 0, 1, 0, 0, 0, 1},
-
-							ipv6Payload1Addr1ToAddr2[:64],
-						},
+							ipv6Payload1Addr1ToAddr2[:64]...,
+						)...,
 					),
 				},
 				{
 					srcAddr: addr1,
 					dstAddr: addr2,
 					nextHdr: routingExtHdrID,
-					data: buffer.NewVectorisedView(
-						routingExtHdrLen+fragmentExtHdrLen+len(ipv6Payload1Addr1ToAddr2)-64,
-						[]buffer.View{
-							// Routing extension header.
-							//
-							// Segments left = 1.
-							[]byte{fragmentExtHdrID, 0, 1, 1, 2, 3, 4, 5},
+					data: append(
+						// Routing extension header.
+						//
+						// Segments left = 1.
+						[]byte{fragmentExtHdrID, 0, 1, 1, 2, 3, 4, 5},
 
+						append(
 							// Fragment extension header.
 							//
 							// Fragment offset = 9, More = false, ID = 1
 							[]byte{uint8(header.UDPProtocolNumber), 0, 0, 72, 0, 0, 0, 1},
-
-							ipv6Payload1Addr1ToAddr2[64:],
-						},
+							ipv6Payload1Addr1ToAddr2[64:]...,
+						)...,
 					),
 				},
 			},
@@ -1603,37 +1557,31 @@ func TestReceiveIPv6Fragments(t *testing.T) {
 					srcAddr: addr1,
 					dstAddr: addr2,
 					nextHdr: fragmentExtHdrID,
-					data: buffer.NewVectorisedView(
-						routingExtHdrLen+fragmentExtHdrLen+64,
-						[]buffer.View{
-							// Fragment extension header.
-							//
-							// Fragment offset = 0, More = true, ID = 1
-							[]byte{routingExtHdrID, 0, 0, 1, 0, 0, 0, 1},
-
+					data: append(
+						// Fragment extension header.
+						//
+						// Fragment offset = 0, More = true, ID = 1
+						[]byte{routingExtHdrID, 0, 0, 1, 0, 0, 0, 1},
+						append(
 							// Routing extension header.
 							//
 							// Segments left = 0.
 							[]byte{uint8(header.UDPProtocolNumber), 0, 1, 0, 2, 3, 4, 5},
-
-							ipv6Payload1Addr1ToAddr2[:64],
-						},
+							ipv6Payload1Addr1ToAddr2[:64]...,
+						)...,
 					),
 				},
 				{
 					srcAddr: addr1,
 					dstAddr: addr2,
 					nextHdr: fragmentExtHdrID,
-					data: buffer.NewVectorisedView(
-						fragmentExtHdrLen+len(ipv6Payload1Addr1ToAddr2)-64,
-						[]buffer.View{
-							// Fragment extension header.
-							//
-							// Fragment offset = 9, More = false, ID = 1
-							[]byte{routingExtHdrID, 0, 0, 72, 0, 0, 0, 1},
+					data: append(
+						// Fragment extension header.
+						//
+						// Fragment offset = 9, More = false, ID = 1
+						[]byte{routingExtHdrID, 0, 0, 72, 0, 0, 0, 1},
 
-							ipv6Payload1Addr1ToAddr2[64:],
-						},
+						ipv6Payload1Addr1ToAddr2[64:]...,
 					),
 				},
 			},
@@ -1646,37 +1594,30 @@ func TestReceiveIPv6Fragments(t *testing.T) {
 					srcAddr: addr1,
 					dstAddr: addr2,
 					nextHdr: fragmentExtHdrID,
-					data: buffer.NewVectorisedView(
-						routingExtHdrLen+fragmentExtHdrLen+64,
-						[]buffer.View{
-							// Fragment extension header.
-							//
-							// Fragment offset = 0, More = true, ID = 1
-							[]byte{routingExtHdrID, 0, 0, 1, 0, 0, 0, 1},
-
+					data: append(
+						// Fragment extension header.
+						//
+						// Fragment offset = 0, More = true, ID = 1
+						[]byte{routingExtHdrID, 0, 0, 1, 0, 0, 0, 1},
+						append(
 							// Routing extension header.
 							//
 							// Segments left = 1.
 							[]byte{uint8(header.UDPProtocolNumber), 0, 1, 1, 2, 3, 4, 5},
-
-							ipv6Payload1Addr1ToAddr2[:64],
-						},
+							ipv6Payload1Addr1ToAddr2[:64]...,
+						)...,
 					),
 				},
 				{
 					srcAddr: addr1,
 					dstAddr: addr2,
 					nextHdr: fragmentExtHdrID,
-					data: buffer.NewVectorisedView(
-						fragmentExtHdrLen+len(ipv6Payload1Addr1ToAddr2)-64,
-						[]buffer.View{
-							// Fragment extension header.
-							//
-							// Fragment offset = 9, More = false, ID = 1
-							[]byte{routingExtHdrID, 0, 0, 72, 0, 0, 0, 1},
-
-							ipv6Payload1Addr1ToAddr2[64:],
-						},
+					data: append(
+						// Fragment extension header.
+						//
+						// Fragment offset = 9, More = false, ID = 1
+						[]byte{routingExtHdrID, 0, 0, 72, 0, 0, 0, 1},
+						ipv6Payload1Addr1ToAddr2[64:]...,
 					),
 				},
 			},
@@ -1689,44 +1630,29 @@ func TestReceiveIPv6Fragments(t *testing.T) {
 					srcAddr: addr1,
 					dstAddr: addr2,
 					nextHdr: fragmentExtHdrID,
-					data: buffer.NewVectorisedView(
-						// The length of this payload is fragmentExtHdrLen+8 because the
-						// first 8 bytes of the 16 byte routing extension header is in
-						// this fragment.
-						fragmentExtHdrLen+8,
-						[]buffer.View{
-							// Fragment extension header.
-							//
-							// Fragment offset = 0, More = true, ID = 1
-							[]byte{routingExtHdrID, 0, 0, 1, 0, 0, 0, 1},
-
-							// Routing extension header (part 1)
-							//
-							// Segments left = 0.
-							[]byte{uint8(header.UDPProtocolNumber), 1, 1, 0, 2, 3, 4, 5},
-						},
+					data: append(
+						// Fragment offset = 0, More = true, ID = 1
+						[]byte{routingExtHdrID, 0, 0, 1, 0, 0, 0, 1},
+						// Routing extension header (part 1)
+						//
+						// Segments left = 0.
+						[]byte{uint8(header.UDPProtocolNumber), 1, 1, 0, 2, 3, 4, 5}...,
 					),
 				},
 				{
 					srcAddr: addr1,
 					dstAddr: addr2,
 					nextHdr: fragmentExtHdrID,
-					data: buffer.NewVectorisedView(
-						// The length of this payload is
-						// fragmentExtHdrLen+8+len(ipv6Payload1Addr1ToAddr2) because the last 8 bytes of
-						// the 16 byte routing extension header is in this fagment.
-						fragmentExtHdrLen+8+len(ipv6Payload1Addr1ToAddr2),
-						[]buffer.View{
-							// Fragment extension header.
-							//
-							// Fragment offset = 1, More = false, ID = 1
-							[]byte{routingExtHdrID, 0, 0, 8, 0, 0, 0, 1},
-
+					data: append(
+						// Fragment extension header.
+						//
+						// Fragment offset = 1, More = false, ID = 1
+						[]byte{routingExtHdrID, 0, 0, 8, 0, 0, 0, 1},
+						append(
 							// Routing extension header (part 2)
 							[]byte{6, 7, 8, 9, 10, 11, 12, 13},
-
-							ipv6Payload1Addr1ToAddr2,
-						},
+							ipv6Payload1Addr1ToAddr2...,
+						)...,
 					),
 				},
 			},
@@ -1739,44 +1665,32 @@ func TestReceiveIPv6Fragments(t *testing.T) {
 					srcAddr: addr1,
 					dstAddr: addr2,
 					nextHdr: fragmentExtHdrID,
-					data: buffer.NewVectorisedView(
-						// The length of this payload is fragmentExtHdrLen+8 because the
-						// first 8 bytes of the 16 byte routing extension header is in
-						// this fragment.
-						fragmentExtHdrLen+8,
-						[]buffer.View{
-							// Fragment extension header.
-							//
-							// Fragment offset = 0, More = true, ID = 1
-							[]byte{routingExtHdrID, 0, 0, 1, 0, 0, 0, 1},
+					data: append(
+						// Fragment extension header.
+						//
+						// Fragment offset = 0, More = true, ID = 1
+						[]byte{routingExtHdrID, 0, 0, 1, 0, 0, 0, 1},
 
-							// Routing extension header (part 1)
-							//
-							// Segments left = 1.
-							[]byte{uint8(header.UDPProtocolNumber), 1, 1, 1, 2, 3, 4, 5},
-						},
+						// Routing extension header (part 1)
+						//
+						// Segments left = 1.
+						[]byte{uint8(header.UDPProtocolNumber), 1, 1, 1, 2, 3, 4, 5}...,
 					),
 				},
 				{
 					srcAddr: addr1,
 					dstAddr: addr2,
 					nextHdr: fragmentExtHdrID,
-					data: buffer.NewVectorisedView(
-						// The length of this payload is
-						// fragmentExtHdrLen+8+len(ipv6Payload1Addr1ToAddr2) because the last 8 bytes of
-						// the 16 byte routing extension header is in this fagment.
-						fragmentExtHdrLen+8+len(ipv6Payload1Addr1ToAddr2),
-						[]buffer.View{
-							// Fragment extension header.
-							//
-							// Fragment offset = 1, More = false, ID = 1
-							[]byte{routingExtHdrID, 0, 0, 8, 0, 0, 0, 1},
-
+					data: append(
+						// Fragment extension header.
+						//
+						// Fragment offset = 1, More = false, ID = 1
+						[]byte{routingExtHdrID, 0, 0, 8, 0, 0, 0, 1},
+						append(
 							// Routing extension header (part 2)
 							[]byte{6, 7, 8, 9, 10, 11, 12, 13},
-
-							ipv6Payload1Addr1ToAddr2,
-						},
+							ipv6Payload1Addr1ToAddr2...,
+						)...,
 					),
 				},
 			},
@@ -1791,16 +1705,12 @@ func TestReceiveIPv6Fragments(t *testing.T) {
 					srcAddr: addr1,
 					dstAddr: addr2,
 					nextHdr: fragmentExtHdrID,
-					data: buffer.NewVectorisedView(
-						fragmentExtHdrLen+64,
-						[]buffer.View{
-							// Fragment extension header.
-							//
-							// Fragment offset = 0, More = true, ID = 1
-							[]byte{uint8(header.UDPProtocolNumber), 0, 0, 1, 0, 0, 0, 1},
-
-							ipv6Payload1Addr1ToAddr2[:64],
-						},
+					data: append(
+						// Fragment extension header.
+						//
+						// Fragment offset = 0, More = true, ID = 1
+						[]byte{uint8(header.UDPProtocolNumber), 0, 0, 1, 0, 0, 0, 1},
+						ipv6Payload1Addr1ToAddr2[:64]...,
 					),
 				},
 				// This fragment has the same ID as the other fragments but is an atomic
@@ -1809,32 +1719,25 @@ func TestReceiveIPv6Fragments(t *testing.T) {
 					srcAddr: addr1,
 					dstAddr: addr2,
 					nextHdr: fragmentExtHdrID,
-					data: buffer.NewVectorisedView(
-						fragmentExtHdrLen+len(ipv6Payload2Addr1ToAddr2),
-						[]buffer.View{
-							// Fragment extension header.
-							//
-							// Fragment offset = 0, More = false, ID = 1
-							[]byte{uint8(header.UDPProtocolNumber), 0, 0, 0, 0, 0, 0, 1},
-
-							ipv6Payload2Addr1ToAddr2,
-						},
+					data: append(
+						// Fragment extension header.
+						//
+						// Fragment offset = 0, More = false, ID = 1
+						[]byte{uint8(header.UDPProtocolNumber), 0, 0, 0, 0, 0, 0, 1},
+						ipv6Payload2Addr1ToAddr2...,
 					),
 				},
 				{
 					srcAddr: addr1,
 					dstAddr: addr2,
 					nextHdr: fragmentExtHdrID,
-					data: buffer.NewVectorisedView(
-						fragmentExtHdrLen+len(ipv6Payload1Addr1ToAddr2)-64,
-						[]buffer.View{
-							// Fragment extension header.
-							//
-							// Fragment offset = 8, More = false, ID = 1
-							[]byte{uint8(header.UDPProtocolNumber), 0, 0, 64, 0, 0, 0, 1},
+					data: append(
+						// Fragment extension header.
+						//
+						// Fragment offset = 8, More = false, ID = 1
+						[]byte{uint8(header.UDPProtocolNumber), 0, 0, 64, 0, 0, 0, 1},
 
-							ipv6Payload1Addr1ToAddr2[64:],
-						},
+						ipv6Payload1Addr1ToAddr2[64:]...,
 					),
 				},
 			},
@@ -1847,64 +1750,48 @@ func TestReceiveIPv6Fragments(t *testing.T) {
 					srcAddr: addr1,
 					dstAddr: addr2,
 					nextHdr: fragmentExtHdrID,
-					data: buffer.NewVectorisedView(
-						fragmentExtHdrLen+64,
-						[]buffer.View{
-							// Fragment extension header.
-							//
-							// Fragment offset = 0, More = true, ID = 1
-							[]byte{uint8(header.UDPProtocolNumber), 0, 0, 1, 0, 0, 0, 1},
-
-							ipv6Payload1Addr1ToAddr2[:64],
-						},
+					data: append(
+						// Fragment extension header.
+						//
+						// Fragment offset = 0, More = true, ID = 1
+						[]byte{uint8(header.UDPProtocolNumber), 0, 0, 1, 0, 0, 0, 1},
+						ipv6Payload1Addr1ToAddr2[:64]...,
 					),
 				},
 				{
 					srcAddr: addr1,
 					dstAddr: addr2,
 					nextHdr: fragmentExtHdrID,
-					data: buffer.NewVectorisedView(
-						fragmentExtHdrLen+32,
-						[]buffer.View{
-							// Fragment extension header.
-							//
-							// Fragment offset = 0, More = true, ID = 2
-							[]byte{uint8(header.UDPProtocolNumber), 0, 0, 1, 0, 0, 0, 2},
-
-							ipv6Payload2Addr1ToAddr2[:32],
-						},
+					data: append(
+						// Fragment extension header.
+						//
+						// Fragment offset = 0, More = true, ID = 2
+						[]byte{uint8(header.UDPProtocolNumber), 0, 0, 1, 0, 0, 0, 2},
+						ipv6Payload2Addr1ToAddr2[:32]...,
 					),
 				},
 				{
 					srcAddr: addr1,
 					dstAddr: addr2,
 					nextHdr: fragmentExtHdrID,
-					data: buffer.NewVectorisedView(
-						fragmentExtHdrLen+len(ipv6Payload1Addr1ToAddr2)-64,
-						[]buffer.View{
-							// Fragment extension header.
-							//
-							// Fragment offset = 8, More = false, ID = 1
-							[]byte{uint8(header.UDPProtocolNumber), 0, 0, 64, 0, 0, 0, 1},
-
-							ipv6Payload1Addr1ToAddr2[64:],
-						},
+					data: append(
+						// Fragment extension header.
+						//
+						// Fragment offset = 8, More = false, ID = 1
+						[]byte{uint8(header.UDPProtocolNumber), 0, 0, 64, 0, 0, 0, 1},
+						ipv6Payload1Addr1ToAddr2[64:]...,
 					),
 				},
 				{
 					srcAddr: addr1,
 					dstAddr: addr2,
 					nextHdr: fragmentExtHdrID,
-					data: buffer.NewVectorisedView(
-						fragmentExtHdrLen+len(ipv6Payload2Addr1ToAddr2)-32,
-						[]buffer.View{
-							// Fragment extension header.
-							//
-							// Fragment offset = 4, More = false, ID = 2
-							[]byte{uint8(header.UDPProtocolNumber), 0, 0, 32, 0, 0, 0, 2},
-
-							ipv6Payload2Addr1ToAddr2[32:],
-						},
+					data: append(
+						// Fragment extension header.
+						//
+						// Fragment offset = 4, More = false, ID = 2
+						[]byte{uint8(header.UDPProtocolNumber), 0, 0, 32, 0, 0, 0, 2},
+						ipv6Payload2Addr1ToAddr2[32:]...,
 					),
 				},
 			},
@@ -1917,64 +1804,49 @@ func TestReceiveIPv6Fragments(t *testing.T) {
 					srcAddr: addr1,
 					dstAddr: addr2,
 					nextHdr: fragmentExtHdrID,
-					data: buffer.NewVectorisedView(
-						fragmentExtHdrLen+64,
-						[]buffer.View{
-							// Fragment extension header.
-							//
-							// Fragment offset = 0, More = true, ID = 1
-							[]byte{uint8(header.UDPProtocolNumber), 0, 0, 1, 0, 0, 0, 1},
+					data: append(
+						// Fragment extension header.
+						//
+						// Fragment offset = 0, More = true, ID = 1
+						[]byte{uint8(header.UDPProtocolNumber), 0, 0, 1, 0, 0, 0, 1},
 
-							ipv6Payload1Addr1ToAddr2[:64],
-						},
+						ipv6Payload1Addr1ToAddr2[:64]...,
 					),
 				},
 				{
 					srcAddr: addr3,
 					dstAddr: addr2,
 					nextHdr: fragmentExtHdrID,
-					data: buffer.NewVectorisedView(
-						fragmentExtHdrLen+32,
-						[]buffer.View{
-							// Fragment extension header.
-							//
-							// Fragment offset = 0, More = true, ID = 1
-							[]byte{uint8(header.UDPProtocolNumber), 0, 0, 1, 0, 0, 0, 1},
-
-							ipv6Payload1Addr3ToAddr2[:32],
-						},
+					data: append(
+						// Fragment extension header.
+						//
+						// Fragment offset = 0, More = true, ID = 1
+						[]byte{uint8(header.UDPProtocolNumber), 0, 0, 1, 0, 0, 0, 1},
+						ipv6Payload1Addr3ToAddr2[:32]...,
 					),
 				},
 				{
 					srcAddr: addr1,
 					dstAddr: addr2,
 					nextHdr: fragmentExtHdrID,
-					data: buffer.NewVectorisedView(
-						fragmentExtHdrLen+len(ipv6Payload1Addr1ToAddr2)-64,
-						[]buffer.View{
-							// Fragment extension header.
-							//
-							// Fragment offset = 8, More = false, ID = 1
-							[]byte{uint8(header.UDPProtocolNumber), 0, 0, 64, 0, 0, 0, 1},
-
-							ipv6Payload1Addr1ToAddr2[64:],
-						},
+					data: append(
+						// Fragment extension header.
+						//
+						// Fragment offset = 8, More = false, ID = 1
+						[]byte{uint8(header.UDPProtocolNumber), 0, 0, 64, 0, 0, 0, 1},
+						ipv6Payload1Addr1ToAddr2[64:]...,
 					),
 				},
 				{
 					srcAddr: addr3,
 					dstAddr: addr2,
 					nextHdr: fragmentExtHdrID,
-					data: buffer.NewVectorisedView(
-						fragmentExtHdrLen+len(ipv6Payload1Addr1ToAddr2)-32,
-						[]buffer.View{
-							// Fragment extension header.
-							//
-							// Fragment offset = 4, More = false, ID = 1
-							[]byte{uint8(header.UDPProtocolNumber), 0, 0, 32, 0, 0, 0, 1},
-
-							ipv6Payload1Addr3ToAddr2[32:],
-						},
+					data: append(
+						// Fragment extension header.
+						//
+						// Fragment offset = 4, More = false, ID = 1
+						[]byte{uint8(header.UDPProtocolNumber), 0, 0, 32, 0, 0, 0, 1},
+						ipv6Payload1Addr3ToAddr2[32:]...,
 					),
 				},
 			},
@@ -1984,21 +1856,26 @@ func TestReceiveIPv6Fragments(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			s := stack.New(stack.Options{
-				NetworkProtocols:   []stack.NetworkProtocolFactory{NewProtocol},
-				TransportProtocols: []stack.TransportProtocolFactory{udp.NewProtocol},
-			})
+			c := newTestContext()
+			defer c.cleanup()
+			s := c.s
+
 			e := channel.New(0, header.IPv6MinimumMTU, linkAddr1)
+			defer e.Close()
 			if err := s.CreateNIC(nicID, e); err != nil {
 				t.Fatalf("CreateNIC(%d, _) = %s", nicID, err)
 			}
-			if err := s.AddAddress(nicID, ProtocolNumber, addr2); err != nil {
-				t.Fatalf("AddAddress(%d, %d, %s) = %s", nicID, ProtocolNumber, addr2, err)
+			protocolAddr := tcpip.ProtocolAddress{
+				Protocol:          ProtocolNumber,
+				AddressWithPrefix: addr2.WithPrefix(),
+			}
+			if err := s.AddProtocolAddress(nicID, protocolAddr, stack.AddressProperties{}); err != nil {
+				t.Fatalf("AddProtocolAddress(%d, %+v, {}): %s", nicID, protocolAddr, err)
 			}
 
 			wq := waiter.Queue{}
-			we, ch := waiter.NewChannelEntry(nil)
-			wq.EventRegister(&we, waiter.ReadableEvents)
+			we, ch := waiter.NewChannelEntry(waiter.ReadableEvents)
+			wq.EventRegister(&we)
 			defer wq.EventUnregister(&we)
 			defer close(ch)
 			ep, err := s.NewEndpoint(udp.ProtocolNumber, ProtocolNumber, &wq)
@@ -2013,12 +1890,12 @@ func TestReceiveIPv6Fragments(t *testing.T) {
 			}
 
 			for _, f := range test.fragments {
-				hdr := buffer.NewPrependable(header.IPv6MinimumSize)
+				hdr := prependable.New(header.IPv6MinimumSize)
 
 				// Serialize IPv6 fixed header.
 				ip := header.IPv6(hdr.Prepend(header.IPv6MinimumSize))
 				ip.Encode(&header.IPv6Fields{
-					PayloadLength: uint16(f.data.Size()),
+					PayloadLength: uint16(len(f.data)),
 					// We're lying about transport protocol here so that we can generate
 					// raw extension headers for the tests.
 					TransportProtocol: tcpip.TransportProtocolNumber(f.nextHdr),
@@ -2027,12 +1904,13 @@ func TestReceiveIPv6Fragments(t *testing.T) {
 					DstAddr:           f.dstAddr,
 				})
 
-				vv := hdr.View().ToVectorisedView()
-				vv.Append(f.data)
-
-				e.InjectInbound(ProtocolNumber, stack.NewPacketBuffer(stack.PacketBufferOptions{
-					Data: vv,
-				}))
+				buf := bufferv2.MakeWithData(hdr.View())
+				buf.Append(bufferv2.NewViewWithData(f.data))
+				pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
+					Payload: buf,
+				})
+				e.InjectInbound(ProtocolNumber, pkt)
+				pkt.DecRef()
 			}
 
 			if got, want := s.Stats().UDP.PacketsReceived.Value(), uint64(len(test.expectedPayloads)); got != want {
@@ -2060,8 +1938,8 @@ func TestReceiveIPv6Fragments(t *testing.T) {
 
 func TestInvalidIPv6Fragments(t *testing.T) {
 	const (
-		addr1     = "\x0a\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01"
-		addr2     = "\x0a\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02"
+		addr1     = tcpip.Address("\x0a\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01")
+		addr2     = tcpip.Address("\x0a\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02")
 		linkAddr1 = tcpip.LinkAddress("\x0a\x0b\x0c\x0d\x0e\x0e")
 		nicID     = 1
 		hoplimit  = 255
@@ -2141,44 +2019,49 @@ func TestInvalidIPv6Fragments(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			s := stack.New(stack.Options{
-				NetworkProtocols: []stack.NetworkProtocolFactory{
-					NewProtocol,
-				},
-			})
+			c := newTestContext()
+			defer c.cleanup()
+			s := c.s
+
 			e := channel.New(1, 1500, linkAddr1)
+			defer e.Close()
 			if err := s.CreateNIC(nicID, e); err != nil {
 				t.Fatalf("CreateNIC(%d, _) = %s", nicID, err)
 			}
-			if err := s.AddAddress(nicID, ProtocolNumber, addr2); err != nil {
-				t.Fatalf("AddAddress(%d, %d, %s) = %s", nicID, ProtocolNumber, addr2, err)
+			protocolAddr := tcpip.ProtocolAddress{
+				Protocol:          ProtocolNumber,
+				AddressWithPrefix: addr2.WithPrefix(),
+			}
+			if err := s.AddProtocolAddress(nicID, protocolAddr, stack.AddressProperties{}); err != nil {
+				t.Fatalf("AddProtocolAddress(%d, %+v, {}): %s", nicID, protocolAddr, err)
 			}
 			s.SetRouteTable([]tcpip.Route{{
 				Destination: header.IPv6EmptySubnet,
 				NIC:         nicID,
 			}})
 
-			var expectICMPPayload buffer.View
+			var expectICMPPayload []byte
 			for _, f := range test.fragments {
-				hdr := buffer.NewPrependable(header.IPv6MinimumSize + header.IPv6FragmentHeaderSize)
+				hdr := prependable.New(header.IPv6MinimumSize + header.IPv6FragmentHeaderSize)
 
 				ip := header.IPv6(hdr.Prepend(header.IPv6MinimumSize + header.IPv6FragmentHeaderSize))
 				encodeArgs := f.ipv6Fields
 				encodeArgs.ExtensionHeaders = append(encodeArgs.ExtensionHeaders, &f.ipv6FragmentFields)
 				ip.Encode(&encodeArgs)
 
-				vv := hdr.View().ToVectorisedView()
-				vv.AppendView(f.payload)
-
+				buf := bufferv2.MakeWithData(append(hdr.View(), f.payload...))
 				pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
-					Data: vv,
+					Payload: buf,
 				})
 
 				if test.expectICMP {
-					expectICMPPayload = stack.PayloadSince(pkt.NetworkHeader())
+					payload := stack.PayloadSince(pkt.NetworkHeader())
+					defer payload.Release()
+					expectICMPPayload = payload.AsSlice()
 				}
 
 				e.InjectInbound(ProtocolNumber, pkt)
+				pkt.DecRef()
 			}
 
 			if got, want := s.Stats().IP.MalformedPacketsReceived.Value(), test.wantMalformedIPPackets; got != want {
@@ -2188,21 +2071,23 @@ func TestInvalidIPv6Fragments(t *testing.T) {
 				t.Errorf("got Stats.IP.MalformedFragmentsReceived = %d, want = %d", got, want)
 			}
 
-			reply, ok := e.Read()
+			reply := e.Read()
 			if !test.expectICMP {
-				if ok {
+				if !reply.IsNil() {
 					t.Fatalf("unexpected ICMP error message received: %#v", reply)
 				}
 				return
 			}
-			if !ok {
+			if reply.IsNil() {
 				t.Fatal("expected ICMP error message missing")
 			}
 
-			checker.IPv6(t, stack.PayloadSince(reply.Pkt.NetworkHeader()),
+			payload := stack.PayloadSince(reply.NetworkHeader())
+			defer payload.Release()
+			checker.IPv6(t, payload,
 				checker.SrcAddr(addr2),
 				checker.DstAddr(addr1),
-				checker.IPFullLength(uint16(header.IPv6MinimumSize+header.ICMPv6MinimumSize+expectICMPPayload.Size())),
+				checker.IPFullLength(uint16(header.IPv6MinimumSize+header.ICMPv6MinimumSize+len(expectICMPPayload))),
 				checker.ICMPv6(
 					checker.ICMPv6Type(test.expectICMPType),
 					checker.ICMPv6Code(test.expectICMPCode),
@@ -2210,14 +2095,15 @@ func TestInvalidIPv6Fragments(t *testing.T) {
 					checker.ICMPv6Payload(expectICMPPayload),
 				),
 			)
+			reply.DecRef()
 		})
 	}
 }
 
 func TestFragmentReassemblyTimeout(t *testing.T) {
 	const (
-		addr1     = "\x0a\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01"
-		addr2     = "\x0a\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02"
+		addr1     = tcpip.Address("\x0a\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01")
+		addr2     = tcpip.Address("\x0a\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02")
 		linkAddr1 = tcpip.LinkAddress("\x0a\x0b\x0c\x0d\x0e\x0e")
 		nicID     = 1
 		hoplimit  = 255
@@ -2390,29 +2276,30 @@ func TestFragmentReassemblyTimeout(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			clock := faketime.NewManualClock()
-			s := stack.New(stack.Options{
-				NetworkProtocols: []stack.NetworkProtocolFactory{
-					NewProtocol,
-				},
-				Clock: clock,
-			})
+			c := newTestContext()
+			defer c.cleanup()
+			s := c.s
 
 			e := channel.New(1, 1500, linkAddr1)
+			defer e.Close()
 			if err := s.CreateNIC(nicID, e); err != nil {
 				t.Fatalf("CreateNIC(%d, _) = %s", nicID, err)
 			}
-			if err := s.AddAddress(nicID, ProtocolNumber, addr2); err != nil {
-				t.Fatalf("AddAddress(%d, %d, %s) = %s", nicID, header.IPv6ProtocolNumber, addr2, err)
+			protocolAddr := tcpip.ProtocolAddress{
+				Protocol:          ProtocolNumber,
+				AddressWithPrefix: addr2.WithPrefix(),
+			}
+			if err := s.AddProtocolAddress(nicID, protocolAddr, stack.AddressProperties{}); err != nil {
+				t.Fatalf("AddProtocolAddress(%d, %+v, {}): %s", nicID, protocolAddr, err)
 			}
 			s.SetRouteTable([]tcpip.Route{{
 				Destination: header.IPv6EmptySubnet,
 				NIC:         nicID,
 			}})
 
-			var firstFragmentSent buffer.View
+			var firstFragmentSent []byte
 			for _, f := range test.fragments {
-				hdr := buffer.NewPrependable(header.IPv6MinimumSize + header.IPv6FragmentHeaderSize)
+				hdr := prependable.New(header.IPv6MinimumSize + header.IPv6FragmentHeaderSize)
 
 				ip := header.IPv6(hdr.Prepend(header.IPv6MinimumSize + header.IPv6FragmentHeaderSize))
 				encodeArgs := f.ipv6Fields
@@ -2421,46 +2308,50 @@ func TestFragmentReassemblyTimeout(t *testing.T) {
 
 				fragHDR := header.IPv6Fragment(hdr.View()[header.IPv6MinimumSize:])
 
-				vv := hdr.View().ToVectorisedView()
-				vv.AppendView(f.payload)
-
+				buf := bufferv2.MakeWithData(append(hdr.View(), f.payload...))
 				pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
-					Data: vv,
+					Payload: buf,
 				})
 
 				if firstFragmentSent == nil && fragHDR.FragmentOffset() == 0 {
-					firstFragmentSent = stack.PayloadSince(pkt.NetworkHeader())
+					payload := stack.PayloadSince(pkt.NetworkHeader())
+					defer payload.Release()
+					firstFragmentSent = payload.AsSlice()
 				}
 
 				e.InjectInbound(ProtocolNumber, pkt)
+				pkt.DecRef()
 			}
 
-			clock.Advance(ReassembleTimeout)
+			c.clock.Advance(ReassembleTimeout)
 
-			reply, ok := e.Read()
+			reply := e.Read()
 			if !test.expectICMP {
-				if ok {
+				if !reply.IsNil() {
 					t.Fatalf("unexpected ICMP error message received: %#v", reply)
 				}
 				return
 			}
-			if !ok {
+			if reply.IsNil() {
 				t.Fatal("expected ICMP error message missing")
 			}
 			if firstFragmentSent == nil {
 				t.Fatalf("unexpected ICMP error message received: %#v", reply)
 			}
 
-			checker.IPv6(t, stack.PayloadSince(reply.Pkt.NetworkHeader()),
+			payload := stack.PayloadSince(reply.NetworkHeader())
+			defer payload.Release()
+			checker.IPv6(t, payload,
 				checker.SrcAddr(addr2),
 				checker.DstAddr(addr1),
-				checker.IPFullLength(uint16(header.IPv6MinimumSize+header.ICMPv6MinimumSize+firstFragmentSent.Size())),
+				checker.IPFullLength(uint16(header.IPv6MinimumSize+header.ICMPv6MinimumSize+len(firstFragmentSent))),
 				checker.ICMPv6(
 					checker.ICMPv6Type(header.ICMPv6TimeExceeded),
 					checker.ICMPv6Code(header.ICMPv6ReassemblyTimeout),
 					checker.ICMPv6Payload(firstFragmentSent),
 				),
 			)
+			reply.DecRef()
 		})
 	}
 }
@@ -2502,9 +2393,7 @@ func TestWriteStats(t *testing.T) {
 				filter := ipt.GetTable(stack.FilterID, true /* ipv6 */)
 				ruleIdx := filter.BuiltinChains[stack.Output]
 				filter.Rules[ruleIdx].Target = &stack.DropTarget{}
-				if err := ipt.ReplaceTable(stack.FilterID, filter, true /* ipv6 */); err != nil {
-					t.Fatalf("failed to replace table: %v", err)
-				}
+				ipt.ReplaceTable(stack.FilterID, filter, true /* ipv6 */)
 			},
 			allowPackets:             math.MaxInt32,
 			expectSent:               0,
@@ -2519,9 +2408,7 @@ func TestWriteStats(t *testing.T) {
 				filter := ipt.GetTable(stack.NATID, true /* ipv6 */)
 				ruleIdx := filter.BuiltinChains[stack.Postrouting]
 				filter.Rules[ruleIdx].Target = &stack.DropTarget{}
-				if err := ipt.ReplaceTable(stack.NATID, filter, true /* ipv6 */); err != nil {
-					t.Fatalf("failed to replace table: %v", err)
-				}
+				ipt.ReplaceTable(stack.NATID, filter, true /* ipv6 */)
 			},
 			allowPackets:             math.MaxInt32,
 			expectSent:               0,
@@ -2541,9 +2428,7 @@ func TestWriteStats(t *testing.T) {
 				filter.Rules[ruleIdx].Matchers = []stack.Matcher{&limitedMatcher{nPackets - 1}}
 				// Make sure the next rule is ACCEPT.
 				filter.Rules[ruleIdx+1].Target = &stack.AcceptTarget{}
-				if err := ipt.ReplaceTable(stack.FilterID, filter, true /* ipv6 */); err != nil {
-					t.Fatalf("failed to replace table: %v", err)
-				}
+				ipt.ReplaceTable(stack.FilterID, filter, true /* ipv6 */)
 			},
 			allowPackets:             math.MaxInt32,
 			expectSent:               nPackets - 1,
@@ -2563,9 +2448,7 @@ func TestWriteStats(t *testing.T) {
 				filter.Rules[ruleIdx].Matchers = []stack.Matcher{&limitedMatcher{nPackets - 1}}
 				// Make sure the next rule is ACCEPT.
 				filter.Rules[ruleIdx+1].Target = &stack.AcceptTarget{}
-				if err := ipt.ReplaceTable(stack.NATID, filter, true /* ipv6 */); err != nil {
-					t.Fatalf("failed to replace table: %v", err)
-				}
+				ipt.ReplaceTable(stack.NATID, filter, true /* ipv6 */)
 			},
 			allowPackets:             math.MaxInt32,
 			expectSent:               nPackets - 1,
@@ -2575,81 +2458,62 @@ func TestWriteStats(t *testing.T) {
 		},
 	}
 
-	writers := []struct {
-		name         string
-		writePackets func(*stack.Route, stack.PacketBufferList) (int, tcpip.Error)
-	}{
-		{
-			name: "WritePacket",
-			writePackets: func(rt *stack.Route, pkts stack.PacketBufferList) (int, tcpip.Error) {
-				nWritten := 0
-				for pkt := pkts.Front(); pkt != nil; pkt = pkt.Next() {
-					if err := rt.WritePacket(stack.NetworkHeaderParams{}, pkt); err != nil {
-						return nWritten, err
-					}
-					nWritten++
-				}
-				return nWritten, nil
-			},
-		}, {
-			name: "WritePackets",
-			writePackets: func(rt *stack.Route, pkts stack.PacketBufferList) (int, tcpip.Error) {
-				return rt.WritePackets(pkts, stack.NetworkHeaderParams{})
-			},
-		},
-	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			c := newTestContext()
+			defer c.cleanup()
 
-	for _, writer := range writers {
-		t.Run(writer.name, func(t *testing.T) {
-			for _, test := range tests {
-				t.Run(test.name, func(t *testing.T) {
-					ep := iptestutil.NewMockLinkEndpoint(header.IPv6MinimumMTU, &tcpip.ErrInvalidEndpointState{}, test.allowPackets)
-					rt := buildRoute(t, ep)
-					var pkts stack.PacketBufferList
-					for i := 0; i < nPackets; i++ {
-						pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
-							ReserveHeaderBytes: header.UDPMinimumSize + int(rt.MaxHeaderLength()),
-							Data:               buffer.NewView(0).ToVectorisedView(),
-						})
-						pkt.TransportHeader().Push(header.UDPMinimumSize)
-						pkts.PushBack(pkt)
-					}
+			ep := iptestutil.NewMockLinkEndpoint(header.IPv6MinimumMTU, &tcpip.ErrInvalidEndpointState{}, test.allowPackets)
+			defer ep.Close()
 
-					test.setup(t, rt.Stack())
+			rt := buildRoute(t, c, ep)
+			test.setup(t, rt.Stack())
 
-					nWritten, _ := writer.writePackets(rt, pkts)
-
-					if got := int(rt.Stats().IP.PacketsSent.Value()); got != test.expectSent {
-						t.Errorf("got rt.Stats().IP.PacketsSent.Value() = %d, want = %d", got, test.expectSent)
-					}
-					if got := int(rt.Stats().IP.IPTablesOutputDropped.Value()); got != test.expectOutputDropped {
-						t.Errorf("got rt.Stats().IP.IPTablesOutputDropped.Value() = %d, want = %d", got, test.expectOutputDropped)
-					}
-					if got := int(rt.Stats().IP.IPTablesPostroutingDropped.Value()); got != test.expectPostroutingDropped {
-						t.Errorf("got r.Stats().IP.IPTablesPostroutingDropped.Value() = %d, want = %d", got, test.expectPostroutingDropped)
-					}
-					if nWritten != test.expectWritten {
-						t.Errorf("got nWritten = %d, want = %d", nWritten, test.expectWritten)
-					}
+			nWritten := 0
+			for i := 0; i < nPackets; i++ {
+				pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
+					ReserveHeaderBytes: header.UDPMinimumSize + int(rt.MaxHeaderLength()),
+					Payload:            bufferv2.Buffer{},
 				})
+				defer pkt.DecRef()
+				pkt.TransportHeader().Push(header.UDPMinimumSize)
+				if err := rt.WritePacket(stack.NetworkHeaderParams{}, pkt); err != nil {
+					break
+				}
+				nWritten++
+			}
+
+			if got := int(rt.Stats().IP.PacketsSent.Value()); got != test.expectSent {
+				t.Errorf("got rt.Stats().IP.PacketsSent.Value() = %d, want = %d", got, test.expectSent)
+			}
+			if got := int(rt.Stats().IP.IPTablesOutputDropped.Value()); got != test.expectOutputDropped {
+				t.Errorf("got rt.Stats().IP.IPTablesOutputDropped.Value() = %d, want = %d", got, test.expectOutputDropped)
+			}
+			if got := int(rt.Stats().IP.IPTablesPostroutingDropped.Value()); got != test.expectPostroutingDropped {
+				t.Errorf("got r.Stats().IP.IPTablesPostroutingDropped.Value() = %d, want = %d", got, test.expectPostroutingDropped)
+			}
+			if nWritten != test.expectWritten {
+				t.Errorf("got nWritten = %d, want = %d", nWritten, test.expectWritten)
 			}
 		})
 	}
 }
 
-func buildRoute(t *testing.T, ep stack.LinkEndpoint) *stack.Route {
-	s := stack.New(stack.Options{
-		NetworkProtocols: []stack.NetworkProtocolFactory{NewProtocol},
-	})
+func buildRoute(t *testing.T, c testContext, ep stack.LinkEndpoint) *stack.Route {
+	s := c.s
 	if err := s.CreateNIC(1, ep); err != nil {
 		t.Fatalf("CreateNIC(1, _) failed: %s", err)
 	}
 	const (
-		src = "\xfc\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01"
-		dst = "\xfc\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02"
+		src = tcpip.Address("\xfc\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01")
+		dst = tcpip.Address("\xfc\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02")
 	)
-	if err := s.AddAddress(1, ProtocolNumber, src); err != nil {
-		t.Fatalf("AddAddress(1, %d, %s) failed: %s", ProtocolNumber, src, err)
+	protocolAddr := tcpip.ProtocolAddress{
+		Protocol:          ProtocolNumber,
+		AddressWithPrefix: src.WithPrefix(),
+	}
+	if err := s.AddProtocolAddress(1, protocolAddr, stack.AddressProperties{}); err != nil {
+		t.Fatalf("AddProtocolAddress(%d, %+v, {}): %s", 1, protocolAddr, err)
 	}
 	{
 		mask := tcpip.AddressMask("\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff")
@@ -2681,7 +2545,7 @@ func (*limitedMatcher) Name() string {
 }
 
 // Match implements Matcher.Match.
-func (lm *limitedMatcher) Match(stack.Hook, *stack.PacketBuffer, string, string) (bool, bool) {
+func (lm *limitedMatcher) Match(stack.Hook, stack.PacketBufferPtr, string, string) (bool, bool) {
 	if lm.limit == 0 {
 		return true, false
 	}
@@ -2700,9 +2564,10 @@ func knownNICIDs(proto *protocol) []tcpip.NICID {
 }
 
 func TestClearEndpointFromProtocolOnClose(t *testing.T) {
-	s := stack.New(stack.Options{
-		NetworkProtocols: []stack.NetworkProtocolFactory{NewProtocol},
-	})
+	c := newTestContext()
+	defer c.cleanup()
+	s := c.s
+
 	proto := s.NetworkProtocolInstance(ProtocolNumber).(*protocol)
 	var nic testInterface
 	ep := proto.NewEndpoint(&nic, nil).(*endpoint)
@@ -2798,10 +2663,18 @@ func TestFragmentationWritePacket(t *testing.T) {
 
 	for _, ft := range fragmentationTests {
 		t.Run(ft.description, func(t *testing.T) {
+			c := newTestContext()
+			defer c.cleanup()
+
 			pkt := iptestutil.MakeRandPkt(ft.transHdrLen, extraHeaderReserve+header.IPv6MinimumSize, []int{ft.payloadSize}, header.IPv6ProtocolNumber)
+			defer pkt.DecRef()
 			source := pkt.Clone()
+			defer source.DecRef()
+
 			ep := iptestutil.NewMockLinkEndpoint(ft.mtu, nil, math.MaxInt32)
-			r := buildRoute(t, ep)
+			defer ep.Close()
+
+			r := buildRoute(t, c, ep)
 			err := r.WritePacket(stack.NetworkHeaderParams{
 				Protocol: tcp.ProtocolNumber,
 				TTL:      ttl,
@@ -2821,87 +2694,6 @@ func TestFragmentationWritePacket(t *testing.T) {
 			}
 			if err := compareFragments(ep.WrittenPackets, source, ft.mtu, ft.wantFragments, tcp.ProtocolNumber); err != nil {
 				t.Error(err)
-			}
-		})
-	}
-}
-
-func TestFragmentationWritePackets(t *testing.T) {
-	const ttl = 42
-	tests := []struct {
-		description  string
-		insertBefore int
-		insertAfter  int
-	}{
-		{
-			description:  "Single packet",
-			insertBefore: 0,
-			insertAfter:  0,
-		},
-		{
-			description:  "With packet before",
-			insertBefore: 1,
-			insertAfter:  0,
-		},
-		{
-			description:  "With packet after",
-			insertBefore: 0,
-			insertAfter:  1,
-		},
-		{
-			description:  "With packet before and after",
-			insertBefore: 1,
-			insertAfter:  1,
-		},
-	}
-	tinyPacket := iptestutil.MakeRandPkt(header.TCPMinimumSize, extraHeaderReserve+header.IPv6MinimumSize, []int{1}, header.IPv6ProtocolNumber)
-
-	for _, test := range tests {
-		t.Run(test.description, func(t *testing.T) {
-			for _, ft := range fragmentationTests {
-				t.Run(ft.description, func(t *testing.T) {
-					var pkts stack.PacketBufferList
-					for i := 0; i < test.insertBefore; i++ {
-						pkts.PushBack(tinyPacket.Clone())
-					}
-					pkt := iptestutil.MakeRandPkt(ft.transHdrLen, extraHeaderReserve+header.IPv6MinimumSize, []int{ft.payloadSize}, header.IPv6ProtocolNumber)
-					source := pkt
-					pkts.PushBack(pkt.Clone())
-					for i := 0; i < test.insertAfter; i++ {
-						pkts.PushBack(tinyPacket.Clone())
-					}
-
-					ep := iptestutil.NewMockLinkEndpoint(ft.mtu, nil, math.MaxInt32)
-					r := buildRoute(t, ep)
-
-					wantTotalPackets := len(ft.wantFragments) + test.insertBefore + test.insertAfter
-					n, err := r.WritePackets(pkts, stack.NetworkHeaderParams{
-						Protocol: tcp.ProtocolNumber,
-						TTL:      ttl,
-						TOS:      stack.DefaultTOS,
-					})
-					if n != wantTotalPackets || err != nil {
-						t.Errorf("got WritePackets(_, _, _) = (%d, %s), want = (%d, nil)", n, err, wantTotalPackets)
-					}
-					if got := len(ep.WrittenPackets); got != wantTotalPackets {
-						t.Errorf("got len(ep.WrittenPackets) = %d, want = %d", got, wantTotalPackets)
-					}
-					if got := int(r.Stats().IP.PacketsSent.Value()); got != wantTotalPackets {
-						t.Errorf("got c.Route.Stats().IP.PacketsSent.Value() = %d, want = %d", got, wantTotalPackets)
-					}
-					if got := r.Stats().IP.OutgoingPacketErrors.Value(); got != 0 {
-						t.Errorf("got r.Stats().IP.OutgoingPacketErrors.Value() = %d, want = 0", got)
-					}
-
-					if wantTotalPackets == 0 {
-						return
-					}
-
-					fragments := ep.WrittenPackets[test.insertBefore : len(ft.wantFragments)+test.insertBefore]
-					if err := compareFragments(fragments, source, ft.mtu, ft.wantFragments, tcp.ProtocolNumber); err != nil {
-						t.Error(err)
-					}
-				})
 			}
 		})
 	}
@@ -2976,9 +2768,15 @@ func TestFragmentationErrors(t *testing.T) {
 
 	for _, ft := range tests {
 		t.Run(ft.description, func(t *testing.T) {
+			c := newTestContext()
+			defer c.cleanup()
+
 			pkt := iptestutil.MakeRandPkt(ft.transHdrLen, extraHeaderReserve+header.IPv6MinimumSize, []int{ft.payloadSize}, header.IPv6ProtocolNumber)
+			defer pkt.DecRef()
 			ep := iptestutil.NewMockLinkEndpoint(ft.mtu, ft.mockError, ft.allowPackets)
-			r := buildRoute(t, ep)
+			defer ep.Close()
+
+			r := buildRoute(t, c, ep)
 			err := r.WritePacket(stack.NetworkHeaderParams{
 				Protocol: tcp.ProtocolNumber,
 				TTL:      ttl,
@@ -2997,125 +2795,137 @@ func TestFragmentationErrors(t *testing.T) {
 	}
 }
 
-func TestForwarding(t *testing.T) {
-	const (
-		incomingNICID  = 1
-		outgoingNICID  = 2
-		randomSequence = 123
-		randomIdent    = 42
-	)
+type icmpError struct {
+	icmpType header.ICMPv6Type
+	icmpCode header.ICMPv6Code
+}
 
-	incomingIPv6Addr := tcpip.AddressWithPrefix{
+const (
+	incomingNICID  = 1
+	outgoingNICID  = 2
+	randomSequence = 123
+	randomIdent    = 42
+)
+
+var (
+	incomingIPv6Addr = tcpip.AddressWithPrefix{
 		Address:   tcpip.Address(net.ParseIP("10::1").To16()),
 		PrefixLen: 64,
 	}
-	outgoingIPv6Addr := tcpip.AddressWithPrefix{
+	outgoingIPv6Addr = tcpip.AddressWithPrefix{
 		Address:   tcpip.Address(net.ParseIP("11::1").To16()),
 		PrefixLen: 64,
 	}
-	multicastIPv6Addr := tcpip.AddressWithPrefix{
+	multicastIPv6Addr = tcpip.AddressWithPrefix{
 		Address:   tcpip.Address(net.ParseIP("ff00::").To16()),
 		PrefixLen: 64,
 	}
+	remoteIPv6Addr1        = tcpip.Address(net.ParseIP("10::2").To16())
+	remoteIPv6Addr2        = tcpip.Address(net.ParseIP("11::2").To16())
+	unreachableIPv6Addr    = tcpip.Address(net.ParseIP("12::2").To16())
+	linkLocalIPv6Addr      = tcpip.Address(net.ParseIP("fe80::").To16())
+	defaultEndpointConfigs = map[tcpip.NICID]tcpip.AddressWithPrefix{
+		incomingNICID: incomingIPv6Addr,
+		outgoingNICID: outgoingIPv6Addr,
+	}
+)
 
-	remoteIPv6Addr1 := tcpip.Address(net.ParseIP("10::2").To16())
-	remoteIPv6Addr2 := tcpip.Address(net.ParseIP("11::2").To16())
-	unreachableIPv6Addr := tcpip.Address(net.ParseIP("12::2").To16())
-	linkLocalIPv6Addr := tcpip.Address(net.ParseIP("fe80::").To16())
-
+func TestForwarding(t *testing.T) {
 	tests := []struct {
-		name                         string
-		extHdr                       func(nextHdr uint8) ([]byte, uint8, checker.NetworkChecker)
-		TTL                          uint8
-		expectErrorICMP              bool
-		expectPacketForwarded        bool
-		payloadLength                int
-		countUnrouteablePackets      uint64
-		sourceAddr                   tcpip.Address
-		destAddr                     tcpip.Address
-		icmpType                     header.ICMPv6Type
-		icmpCode                     header.ICMPv6Code
-		expectPacketUnrouteableError bool
-		expectLinkLocalSourceError   bool
-		expectLinkLocalDestError     bool
-		expectExtensionHeaderError   bool
+		name                            string
+		extHdr                          func(nextHdr uint8) ([]byte, uint8, checker.NetworkChecker)
+		TTL                             uint8
+		payloadLength                   int
+		srcAddr                         tcpip.Address
+		dstAddr                         tcpip.Address
+		expectedPacketUnrouteableErrors uint64
+		expectedLinkLocalSourceErrors   uint64
+		expectedLinkLocalDestErrors     uint64
+		expectedExtensionHeaderErrors   uint64
+		expectedPacketTooBigErrors      uint64
+		expectedExhaustedTTLErrors      uint64
+		expectPacketForwarded           bool
+		expectedFragmentsForwarded      []fragmentInfo
+		expectedICMPError               *icmpError
 	}{
 		{
-			name:            "TTL of zero",
-			TTL:             0,
-			expectErrorICMP: true,
-			sourceAddr:      remoteIPv6Addr1,
-			destAddr:        remoteIPv6Addr2,
-			icmpType:        header.ICMPv6TimeExceeded,
-			icmpCode:        header.ICMPv6HopLimitExceeded,
+			name:    "TTL of zero",
+			TTL:     0,
+			srcAddr: remoteIPv6Addr1,
+			dstAddr: remoteIPv6Addr2,
+			expectedICMPError: &icmpError{
+				icmpType: header.ICMPv6TimeExceeded,
+				icmpCode: header.ICMPv6HopLimitExceeded,
+			},
+			expectedExhaustedTTLErrors: 1,
+			expectPacketForwarded:      false,
 		},
 		{
-			name:            "TTL of one",
-			TTL:             1,
-			expectErrorICMP: true,
-			sourceAddr:      remoteIPv6Addr1,
-			destAddr:        remoteIPv6Addr2,
-			icmpType:        header.ICMPv6TimeExceeded,
-			icmpCode:        header.ICMPv6HopLimitExceeded,
+			name:    "TTL of one",
+			TTL:     1,
+			srcAddr: remoteIPv6Addr1,
+			dstAddr: remoteIPv6Addr2,
+			expectedICMPError: &icmpError{
+				icmpType: header.ICMPv6TimeExceeded,
+				icmpCode: header.ICMPv6HopLimitExceeded,
+			},
+			expectedExhaustedTTLErrors: 1,
+			expectPacketForwarded:      false,
 		},
 		{
 			name:                  "TTL of two",
 			TTL:                   2,
+			srcAddr:               remoteIPv6Addr1,
+			dstAddr:               remoteIPv6Addr2,
 			expectPacketForwarded: true,
-			sourceAddr:            remoteIPv6Addr1,
-			destAddr:              remoteIPv6Addr2,
 		},
 		{
 			name:                  "TTL of three",
 			TTL:                   3,
+			srcAddr:               remoteIPv6Addr1,
+			dstAddr:               remoteIPv6Addr2,
 			expectPacketForwarded: true,
-			sourceAddr:            remoteIPv6Addr1,
-			destAddr:              remoteIPv6Addr2,
 		},
 		{
 			name:                  "Max TTL",
 			TTL:                   math.MaxUint8,
+			srcAddr:               remoteIPv6Addr1,
+			dstAddr:               remoteIPv6Addr2,
 			expectPacketForwarded: true,
-			sourceAddr:            remoteIPv6Addr1,
-			destAddr:              remoteIPv6Addr2,
 		},
 		{
-			name:                         "Network unreachable",
-			TTL:                          2,
-			expectErrorICMP:              true,
-			sourceAddr:                   remoteIPv6Addr1,
-			destAddr:                     unreachableIPv6Addr,
-			icmpType:                     header.ICMPv6DstUnreachable,
-			icmpCode:                     header.ICMPv6NetworkUnreachable,
-			expectPacketUnrouteableError: true,
+			name:    "Network unreachable",
+			TTL:     2,
+			srcAddr: remoteIPv6Addr1,
+			dstAddr: unreachableIPv6Addr,
+			expectedICMPError: &icmpError{
+				icmpType: header.ICMPv6DstUnreachable,
+				icmpCode: header.ICMPv6NetworkUnreachable,
+			},
+			expectedPacketUnrouteableErrors: 1,
+			expectPacketForwarded:           false,
 		},
 		{
-			name:                    "Multicast destination",
-			TTL:                     2,
-			countUnrouteablePackets: 1,
-			sourceAddr:              remoteIPv6Addr1,
-			destAddr:                multicastIPv6Addr.Address,
-			expectPacketForwarded:   true,
+			name:                        "Link local destination",
+			TTL:                         2,
+			srcAddr:                     remoteIPv6Addr1,
+			dstAddr:                     linkLocalIPv6Addr,
+			expectedLinkLocalDestErrors: 1,
+			expectPacketForwarded:       false,
 		},
 		{
-			name:                     "Link local destination",
-			TTL:                      2,
-			sourceAddr:               remoteIPv6Addr1,
-			destAddr:                 linkLocalIPv6Addr,
-			expectLinkLocalDestError: true,
+			name:                          "Link local source",
+			TTL:                           2,
+			srcAddr:                       linkLocalIPv6Addr,
+			dstAddr:                       remoteIPv6Addr2,
+			expectedLinkLocalSourceErrors: 1,
+			expectPacketForwarded:         false,
 		},
 		{
-			name:                       "Link local source",
-			TTL:                        2,
-			sourceAddr:                 linkLocalIPv6Addr,
-			destAddr:                   remoteIPv6Addr2,
-			expectLinkLocalSourceError: true,
-		},
-		{
-			name:       "Hopbyhop with unknown option skippable action",
-			TTL:        2,
-			sourceAddr: remoteIPv6Addr1,
-			destAddr:   remoteIPv6Addr2,
+			name:    "Hopbyhop with unknown option skippable action",
+			TTL:     2,
+			srcAddr: remoteIPv6Addr1,
+			dstAddr: remoteIPv6Addr2,
 			extHdr: func(nextHdr uint8) ([]byte, uint8, checker.NetworkChecker) {
 				return []byte{
 					nextHdr, 1,
@@ -3130,10 +2940,10 @@ func TestForwarding(t *testing.T) {
 			expectPacketForwarded: true,
 		},
 		{
-			name:       "Hopbyhop with unknown option discard action",
-			TTL:        2,
-			sourceAddr: remoteIPv6Addr1,
-			destAddr:   remoteIPv6Addr2,
+			name:    "Hopbyhop with unknown option discard action",
+			TTL:     2,
+			srcAddr: remoteIPv6Addr1,
+			dstAddr: remoteIPv6Addr2,
 			extHdr: func(nextHdr uint8) ([]byte, uint8, checker.NetworkChecker) {
 				return []byte{
 					nextHdr, 1,
@@ -3145,13 +2955,14 @@ func TestForwarding(t *testing.T) {
 					127, 6, 1, 2, 3, 4, 5, 6,
 				}, hopByHopExtHdrID, nil
 			},
-			expectExtensionHeaderError: true,
+			expectedExtensionHeaderErrors: 1,
+			expectPacketForwarded:         false,
 		},
 		{
-			name:       "Hopbyhop with unknown option discard and send icmp action (unicast)",
-			TTL:        2,
-			sourceAddr: remoteIPv6Addr1,
-			destAddr:   remoteIPv6Addr2,
+			name:    "Hopbyhop with unknown option discard and send icmp action",
+			TTL:     2,
+			srcAddr: remoteIPv6Addr1,
+			dstAddr: remoteIPv6Addr2,
 			extHdr: func(nextHdr uint8) ([]byte, uint8, checker.NetworkChecker) {
 				return []byte{
 					nextHdr, 1,
@@ -3163,37 +2974,18 @@ func TestForwarding(t *testing.T) {
 					191, 6, 1, 2, 3, 4, 5, 6,
 				}, hopByHopExtHdrID, nil
 			},
-			expectErrorICMP:            true,
-			icmpType:                   header.ICMPv6ParamProblem,
-			icmpCode:                   header.ICMPv6UnknownOption,
-			expectExtensionHeaderError: true,
-		},
-		{
-			name:       "Hopbyhop with unknown option discard and send icmp action (multicast)",
-			TTL:        2,
-			sourceAddr: remoteIPv6Addr1,
-			destAddr:   multicastIPv6Addr.Address,
-			extHdr: func(nextHdr uint8) ([]byte, uint8, checker.NetworkChecker) {
-				return []byte{
-					nextHdr, 1,
-
-					// Skippable unknown.
-					63, 4, 1, 2, 3, 4,
-
-					// Discard & send ICMP if option is unknown.
-					191, 6, 1, 2, 3, 4, 5, 6,
-				}, hopByHopExtHdrID, nil
+			expectedICMPError: &icmpError{
+				icmpType: header.ICMPv6ParamProblem,
+				icmpCode: header.ICMPv6UnknownOption,
 			},
-			expectErrorICMP:            true,
-			icmpType:                   header.ICMPv6ParamProblem,
-			icmpCode:                   header.ICMPv6UnknownOption,
-			expectExtensionHeaderError: true,
+			expectedExtensionHeaderErrors: 1,
+			expectPacketForwarded:         false,
 		},
 		{
-			name:       "Hopbyhop with unknown option discard and send icmp action unless multicast dest (unicast)",
-			TTL:        2,
-			sourceAddr: remoteIPv6Addr1,
-			destAddr:   remoteIPv6Addr2,
+			name:    "Hopbyhop with unknown option discard and send icmp action",
+			TTL:     2,
+			srcAddr: remoteIPv6Addr1,
+			dstAddr: remoteIPv6Addr2,
 			extHdr: func(nextHdr uint8) ([]byte, uint8, checker.NetworkChecker) {
 				return []byte{
 					nextHdr, 1,
@@ -3206,35 +2998,18 @@ func TestForwarding(t *testing.T) {
 					255, 6, 1, 2, 3, 4, 5, 6,
 				}, hopByHopExtHdrID, nil
 			},
-			expectErrorICMP:            true,
-			icmpType:                   header.ICMPv6ParamProblem,
-			icmpCode:                   header.ICMPv6UnknownOption,
-			expectExtensionHeaderError: true,
-		},
-		{
-			name:       "Hopbyhop with unknown option discard and send icmp action unless multicast dest (multicast)",
-			TTL:        2,
-			sourceAddr: remoteIPv6Addr1,
-			destAddr:   multicastIPv6Addr.Address,
-			extHdr: func(nextHdr uint8) ([]byte, uint8, checker.NetworkChecker) {
-				return []byte{
-					nextHdr, 1,
-
-					// Skippable unknown.
-					63, 4, 1, 2, 3, 4,
-
-					// Discard & send ICMP unless packet is for multicast destination if
-					// option is unknown.
-					255, 6, 1, 2, 3, 4, 5, 6,
-				}, hopByHopExtHdrID, nil
+			expectedICMPError: &icmpError{
+				icmpType: header.ICMPv6ParamProblem,
+				icmpCode: header.ICMPv6UnknownOption,
 			},
-			expectExtensionHeaderError: true,
+			expectedExtensionHeaderErrors: 1,
+			expectPacketForwarded:         false,
 		},
 		{
-			name:       "Hopbyhop with router alert option",
-			TTL:        2,
-			sourceAddr: remoteIPv6Addr1,
-			destAddr:   remoteIPv6Addr2,
+			name:    "Hopbyhop with router alert option",
+			TTL:     2,
+			srcAddr: remoteIPv6Addr1,
+			dstAddr: remoteIPv6Addr2,
 			extHdr: func(nextHdr uint8) ([]byte, uint8, checker.NetworkChecker) {
 				return []byte{
 					nextHdr, 0,
@@ -3246,10 +3021,10 @@ func TestForwarding(t *testing.T) {
 			expectPacketForwarded: true,
 		},
 		{
-			name:       "Hopbyhop with two router alert options",
-			TTL:        2,
-			sourceAddr: remoteIPv6Addr1,
-			destAddr:   remoteIPv6Addr2,
+			name:    "Hopbyhop with two router alert options",
+			TTL:     2,
+			srcAddr: remoteIPv6Addr1,
+			dstAddr: remoteIPv6Addr2,
 			extHdr: func(nextHdr uint8) ([]byte, uint8, checker.NetworkChecker) {
 				return []byte{
 					nextHdr, 1,
@@ -3261,53 +3036,44 @@ func TestForwarding(t *testing.T) {
 					5, 2, 0, 0, 0, 0,
 				}, hopByHopExtHdrID, nil
 			},
-			expectExtensionHeaderError: true,
+			expectedExtensionHeaderErrors: 1,
+			expectPacketForwarded:         false,
 		},
 		{
-			name:            "Can't fragment",
-			TTL:             2,
-			payloadLength:   header.IPv6MinimumMTU + 1,
-			expectErrorICMP: true,
-			sourceAddr:      remoteIPv6Addr1,
-			destAddr:        remoteIPv6Addr2,
-			icmpType:        header.ICMPv6PacketTooBig,
-			icmpCode:        header.ICMPv6UnusedCode,
-		},
-		{
-			name:            "Can't fragment multicast",
-			TTL:             2,
-			payloadLength:   header.IPv6MinimumMTU + 1,
-			sourceAddr:      remoteIPv6Addr1,
-			destAddr:        multicastIPv6Addr.Address,
-			expectErrorICMP: true,
-			icmpType:        header.ICMPv6PacketTooBig,
-			icmpCode:        header.ICMPv6UnusedCode,
+			name:          "Can't fragment",
+			TTL:           2,
+			payloadLength: header.IPv6MinimumMTU + 1,
+			srcAddr:       remoteIPv6Addr1,
+			dstAddr:       remoteIPv6Addr2,
+			expectedICMPError: &icmpError{
+				icmpType: header.ICMPv6PacketTooBig,
+				icmpCode: header.ICMPv6UnusedCode,
+			},
+			expectedPacketTooBigErrors: 1,
+			expectPacketForwarded:      false,
 		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			s := stack.New(stack.Options{
-				NetworkProtocols:   []stack.NetworkProtocolFactory{NewProtocol},
-				TransportProtocols: []stack.TransportProtocolFactory{icmp.NewProtocol6},
-			})
-			// We expect at most a single packet in response to our ICMP Echo Request.
-			incomingEndpoint := channel.New(1, header.IPv6MinimumMTU, "")
-			if err := s.CreateNIC(incomingNICID, incomingEndpoint); err != nil {
-				t.Fatalf("CreateNIC(%d, _): %s", incomingNICID, err)
-			}
-			incomingIPv6ProtoAddr := tcpip.ProtocolAddress{Protocol: ProtocolNumber, AddressWithPrefix: incomingIPv6Addr}
-			if err := s.AddProtocolAddress(incomingNICID, incomingIPv6ProtoAddr); err != nil {
-				t.Fatalf("AddProtocolAddress(%d, %#v): %s", incomingNICID, incomingIPv6ProtoAddr, err)
-			}
+			c := newTestContext()
+			defer c.cleanup()
+			s := c.s
 
-			outgoingEndpoint := channel.New(1, header.IPv6MinimumMTU, "")
-			if err := s.CreateNIC(outgoingNICID, outgoingEndpoint); err != nil {
-				t.Fatalf("CreateNIC(%d, _): %s", outgoingNICID, err)
-			}
-			outgoingIPv6ProtoAddr := tcpip.ProtocolAddress{Protocol: ProtocolNumber, AddressWithPrefix: outgoingIPv6Addr}
-			if err := s.AddProtocolAddress(outgoingNICID, outgoingIPv6ProtoAddr); err != nil {
-				t.Fatalf("AddProtocolAddress(%d, %#v): %s", outgoingNICID, outgoingIPv6ProtoAddr, err)
+			endpoints := make(map[tcpip.NICID]*channel.Endpoint)
+			for nicID, addr := range defaultEndpointConfigs {
+				ep := channel.New(1, header.IPv6MinimumMTU, "")
+				defer ep.Close()
+
+				if err := s.CreateNIC(nicID, ep); err != nil {
+					t.Fatalf("s.CreateNIC(%d, _): %s", nicID, err)
+				}
+				addr := tcpip.ProtocolAddress{Protocol: ProtocolNumber, AddressWithPrefix: addr}
+				if err := s.AddProtocolAddress(nicID, addr, stack.AddressProperties{}); err != nil {
+					t.Fatalf("s.AddProtocolAddress(%d, %+v, {}): %s", nicID, addr, err)
+				}
+				s.SetNICMulticastForwarding(nicID, ProtocolNumber, true /* enabled */)
+				endpoints[nicID] = ep
 			}
 
 			s.SetRouteTable([]tcpip.Route{
@@ -3326,7 +3092,7 @@ func TestForwarding(t *testing.T) {
 			})
 
 			if err := s.SetForwardingDefaultAndAllNICs(ProtocolNumber, true); err != nil {
-				t.Fatalf("SetForwardingDefaultAndAllNICs(%d, true): %s", ProtocolNumber, err)
+				t.Fatalf("s.SetForwardingDefaultAndAllNICs(%d, true): %s", ProtocolNumber, err)
 			}
 
 			transportProtocol := header.ICMPv6ProtocolNumber
@@ -3341,8 +3107,9 @@ func TestForwarding(t *testing.T) {
 
 			ipHeaderLength := header.IPv6MinimumSize
 			icmpHeaderLength := header.ICMPv6MinimumSize
-			totalLength := ipHeaderLength + icmpHeaderLength + test.payloadLength + extHdrLen
-			hdr := buffer.NewPrependable(totalLength)
+			payloadLength := icmpHeaderLength + test.payloadLength + extHdrLen
+			totalLength := ipHeaderLength + payloadLength
+			hdr := prependable.New(totalLength)
 			hdr.Prepend(test.payloadLength)
 			icmpH := header.ICMPv6(hdr.Prepend(icmpHeaderLength))
 
@@ -3353,28 +3120,40 @@ func TestForwarding(t *testing.T) {
 			icmpH.SetChecksum(0)
 			icmpH.SetChecksum(header.ICMPv6Checksum(header.ICMPv6ChecksumParams{
 				Header: icmpH,
-				Src:    test.sourceAddr,
-				Dst:    test.destAddr,
+				Src:    test.srcAddr,
+				Dst:    test.dstAddr,
 			}))
 			copy(hdr.Prepend(extHdrLen), extHdrBytes)
 			ip := header.IPv6(hdr.Prepend(ipHeaderLength))
 			ip.Encode(&header.IPv6Fields{
-				PayloadLength:     uint16(header.ICMPv6MinimumSize + test.payloadLength),
+				PayloadLength:     uint16(payloadLength),
 				TransportProtocol: transportProtocol,
 				HopLimit:          test.TTL,
-				SrcAddr:           test.sourceAddr,
-				DstAddr:           test.destAddr,
+				SrcAddr:           test.srcAddr,
+				DstAddr:           test.dstAddr,
 			})
-			requestPkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
-				Data: hdr.View().ToVectorisedView(),
+			request := stack.NewPacketBuffer(stack.PacketBufferOptions{
+				Payload: bufferv2.MakeWithData(hdr.View()),
 			})
-			incomingEndpoint.InjectInbound(ProtocolNumber, requestPkt)
 
-			reply, ok := incomingEndpoint.Read()
+			incomingEndpoint, ok := endpoints[incomingNICID]
+			if !ok {
+				t.Fatalf("endpoints[%d] = (_, false), want (_, true)", incomingNICID)
+			}
 
-			if test.expectErrorICMP {
-				if !ok {
-					t.Fatalf("expected ICMP packet type %d through incoming NIC", test.icmpType)
+			incomingEndpoint.InjectInbound(ProtocolNumber, request)
+			request.DecRef()
+
+			reply := incomingEndpoint.Read()
+
+			outgoingEndpoint, ok := endpoints[outgoingNICID]
+			if !ok {
+				t.Fatalf("endpoints[%d] = (_, false), want (_, true)", outgoingNICID)
+			}
+
+			if test.expectedICMPError != nil {
+				if reply.IsNil() {
+					t.Fatalf("Expected ICMP packet type %d through incoming NIC", test.expectedICMPError.icmpType)
 				}
 
 				// As per RFC 4443, page 9:
@@ -3390,33 +3169,38 @@ func TestForwarding(t *testing.T) {
 					return len(hdr.View())
 				}
 
-				checker.IPv6(t, stack.PayloadSince(reply.Pkt.NetworkHeader()),
+				payload := stack.PayloadSince(reply.NetworkHeader())
+				defer payload.Release()
+				checker.IPv6(t, payload,
 					checker.SrcAddr(incomingIPv6Addr.Address),
-					checker.DstAddr(test.sourceAddr),
+					checker.DstAddr(test.srcAddr),
 					checker.TTL(DefaultTTL),
 					checker.ICMPv6(
-						checker.ICMPv6Type(test.icmpType),
-						checker.ICMPv6Code(test.icmpCode),
+						checker.ICMPv6Type(test.expectedICMPError.icmpType),
+						checker.ICMPv6Code(test.expectedICMPError.icmpCode),
 						checker.ICMPv6Payload(hdr.View()[:expectedICMPPayloadLength()]),
 					),
 				)
+				reply.DecRef()
 
 				if n := outgoingEndpoint.Drain(); n != 0 {
-					t.Fatalf("got e2.Drain() = %d, want = 0", n)
+					t.Fatalf("e2.Drain() = %d, want = 0", n)
 				}
-			} else if ok {
-				t.Fatalf("expected no ICMP packet through incoming NIC, instead found: %#v", reply)
+			} else if !reply.IsNil() {
+				t.Fatalf("Expected no ICMP packet through incoming NIC, instead found: %#v", reply)
 			}
 
-			reply, ok = outgoingEndpoint.Read()
+			reply = outgoingEndpoint.Read()
 			if test.expectPacketForwarded {
-				if !ok {
-					t.Fatal("expected ICMP Echo Request packet through outgoing NIC")
+				if reply.IsNil() {
+					t.Fatal("Expected ICMP Echo Request packet through outgoing NIC")
 				}
 
-				checker.IPv6WithExtHdr(t, stack.PayloadSince(reply.Pkt.NetworkHeader()),
-					checker.SrcAddr(test.sourceAddr),
-					checker.DstAddr(test.destAddr),
+				payload := stack.PayloadSince(reply.NetworkHeader())
+				defer payload.Release()
+				checker.IPv6WithExtHdr(t, payload,
+					checker.SrcAddr(test.srcAddr),
+					checker.DstAddr(test.dstAddr),
 					checker.TTL(test.TTL-1),
 					extHdrChecker,
 					checker.ICMPv6(
@@ -3425,56 +3209,367 @@ func TestForwarding(t *testing.T) {
 						checker.ICMPv6Payload(nil),
 					),
 				)
+				reply.DecRef()
 
 				if n := incomingEndpoint.Drain(); n != 0 {
-					t.Fatalf("got e1.Drain() = %d, want = 0", n)
+					t.Fatalf("e1.Drain() = %d, want = 0", n)
 				}
-			} else if ok {
-				t.Fatalf("expected no ICMP Echo packet through outgoing NIC, instead found: %#v", reply)
+			} else if !reply.IsNil() {
+				t.Fatalf("Expected no ICMP Echo packet through outgoing NIC, instead found: %#v", reply)
 			}
 
-			boolToInt := func(val bool) uint64 {
-				if val {
-					return 1
+			if got, want := s.Stats().IP.Forwarding.LinkLocalSource.Value(), test.expectedLinkLocalSourceErrors; got != want {
+				t.Errorf("s.Stats().IP.Forwarding.LinkLocalSource.Value() = %d, want = %d", got, want)
+			}
+
+			if got, want := s.Stats().IP.Forwarding.LinkLocalDestination.Value(), test.expectedLinkLocalDestErrors; got != want {
+				t.Errorf("s.Stats().IP.Forwarding.LinkLocalDestination.Value() = %d, want = %d", got, want)
+			}
+
+			if got, want := s.Stats().IP.Forwarding.ExhaustedTTL.Value(), test.expectedExhaustedTTLErrors; got != want {
+				t.Errorf("s.Stats().IP.Forwarding.ExhaustedTTL.Value() = %d, want = %d", got, want)
+			}
+
+			if got, want := s.Stats().IP.Forwarding.Unrouteable.Value(), test.expectedPacketUnrouteableErrors; got != want {
+				t.Errorf("s.Stats().IP.Forwarding.Unrouteable.Value() = %d, want = %d", got, want)
+			}
+
+			if got, want := s.Stats().IP.Forwarding.ExtensionHeaderProblem.Value(), test.expectedExtensionHeaderErrors; got != want {
+				t.Errorf("s.Stats().IP.Forwarding.ExtensionHeaderProblem.Value() = %d, want = %d", got, want)
+			}
+
+			if got, want := s.Stats().IP.Forwarding.PacketTooBig.Value(), test.expectedPacketTooBigErrors; got != want {
+				t.Errorf("s.Stats().IP.Forwarding.PacketTooBig.Value() = %d, want = %d", got, want)
+			}
+
+			totalExpectedErrors := test.expectedPacketUnrouteableErrors + test.expectedPacketTooBigErrors + test.expectedExtensionHeaderErrors + test.expectedLinkLocalSourceErrors + test.expectedLinkLocalDestErrors + test.expectedExhaustedTTLErrors
+			if got, want := s.Stats().IP.Forwarding.Errors.Value(), totalExpectedErrors; got != want {
+				t.Errorf("s.Stats().IP.Forwarding.Errors.Value() = %d, want = %d", got, want)
+			}
+		})
+	}
+}
+
+func TestMulticastForwarding(t *testing.T) {
+	const (
+		multicastRouteMinTTL = 2
+		packetTTL            = 2
+	)
+
+	tests := []struct {
+		name                          string
+		extHdr                        func(nextHdr uint8) ([]byte, uint8, checker.NetworkChecker)
+		payloadLength                 int
+		expectedExtensionHeaderErrors uint64
+		expectedPacketTooBigErrors    uint64
+		expectPacketForwarded         bool
+		expectedICMPError             *icmpError
+	}{
+		{
+			name: "Hopbyhop with unknown option skippable action",
+			extHdr: func(nextHdr uint8) ([]byte, uint8, checker.NetworkChecker) {
+				return []byte{
+					nextHdr, 1,
+
+					// Skippable unknown.
+					63, 4, 1, 2, 3, 4,
+
+					// Skippable unknown.
+					62, 6, 1, 2, 3, 4, 5, 6,
+				}, hopByHopExtHdrID, checker.IPv6ExtHdr(checker.IPv6HopByHopExtensionHeader(checker.IPv6UnknownOption(), checker.IPv6UnknownOption()))
+			},
+			expectPacketForwarded: true,
+		},
+		{
+			name: "Hopbyhop with unknown option discard action",
+			extHdr: func(nextHdr uint8) ([]byte, uint8, checker.NetworkChecker) {
+				return []byte{
+					nextHdr, 1,
+
+					// Skippable unknown.
+					63, 4, 1, 2, 3, 4,
+
+					// Discard unknown.
+					127, 6, 1, 2, 3, 4, 5, 6,
+				}, hopByHopExtHdrID, nil
+			},
+			expectedExtensionHeaderErrors: 1,
+			expectPacketForwarded:         false,
+		},
+		{
+			name: "Hopbyhop with unknown option discard and send icmp action",
+			extHdr: func(nextHdr uint8) ([]byte, uint8, checker.NetworkChecker) {
+				return []byte{
+					nextHdr, 1,
+
+					// Skippable unknown.
+					63, 4, 1, 2, 3, 4,
+
+					// Discard & send ICMP if option is unknown.
+					191, 6, 1, 2, 3, 4, 5, 6,
+				}, hopByHopExtHdrID, nil
+			},
+			expectedICMPError: &icmpError{
+				icmpType: header.ICMPv6ParamProblem,
+				icmpCode: header.ICMPv6UnknownOption,
+			},
+			expectedExtensionHeaderErrors: 1,
+			expectPacketForwarded:         false,
+		},
+		{
+			name: "Hopbyhop with unknown option discard and don't send icmp action for multicast",
+			extHdr: func(nextHdr uint8) ([]byte, uint8, checker.NetworkChecker) {
+				return []byte{
+					nextHdr, 1,
+
+					// Skippable unknown.
+					63, 4, 1, 2, 3, 4,
+
+					// Discard & send ICMP unless packet is for multicast destination if
+					// option is unknown.
+					255, 6, 1, 2, 3, 4, 5, 6,
+				}, hopByHopExtHdrID, nil
+			},
+			expectedExtensionHeaderErrors: 1,
+			expectPacketForwarded:         false,
+		},
+		{
+			name: "Hopbyhop with router alert option",
+			extHdr: func(nextHdr uint8) ([]byte, uint8, checker.NetworkChecker) {
+				return []byte{
+					nextHdr, 0,
+
+					// Router Alert option.
+					5, 2, 0, 0, 0, 0,
+				}, hopByHopExtHdrID, checker.IPv6ExtHdr(checker.IPv6HopByHopExtensionHeader(checker.IPv6RouterAlert(header.IPv6RouterAlertMLD)))
+			},
+			expectPacketForwarded: true,
+		},
+		{
+			name: "Hopbyhop with two router alert options",
+			extHdr: func(nextHdr uint8) ([]byte, uint8, checker.NetworkChecker) {
+				return []byte{
+					nextHdr, 1,
+
+					// Router Alert option.
+					5, 2, 0, 0, 0, 0,
+
+					// Router Alert option.
+					5, 2, 0, 0, 0, 0,
+				}, hopByHopExtHdrID, nil
+			},
+			expectedExtensionHeaderErrors: 1,
+			expectPacketForwarded:         false,
+		},
+		{
+			name:          "Can't fragment",
+			payloadLength: header.IPv6MinimumMTU + 1,
+			expectedICMPError: &icmpError{
+				icmpType: header.ICMPv6PacketTooBig,
+				icmpCode: header.ICMPv6UnusedCode,
+			},
+			expectedPacketTooBigErrors: 1,
+			expectPacketForwarded:      false,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			c := newTestContext()
+			defer c.cleanup()
+			s := c.s
+
+			if _, err := s.EnableMulticastForwardingForProtocol(ProtocolNumber, &fakeMulticastEventDispatcher{}); err != nil {
+				t.Fatalf("s.EnableMulticastForwardingForProtocol(%d, _): (_, %s)", ProtocolNumber, err)
+			}
+
+			endpoints := make(map[tcpip.NICID]*channel.Endpoint)
+			for nicID, addr := range defaultEndpointConfigs {
+				ep := channel.New(1, header.IPv6MinimumMTU, "")
+				defer ep.Close()
+
+				if err := s.CreateNIC(nicID, ep); err != nil {
+					t.Fatalf("s.CreateNIC(%d, _): %s", nicID, err)
 				}
-				return 0
+				addr := tcpip.ProtocolAddress{Protocol: ProtocolNumber, AddressWithPrefix: addr}
+				if err := s.AddProtocolAddress(nicID, addr, stack.AddressProperties{}); err != nil {
+					t.Fatalf("s.AddProtocolAddress(%d, %+v, {}): %s", nicID, addr, err)
+				}
+				s.SetNICMulticastForwarding(nicID, ProtocolNumber, true /* enabled */)
+				endpoints[nicID] = ep
 			}
 
-			if got, want := s.Stats().IP.Forwarding.LinkLocalSource.Value(), boolToInt(test.expectLinkLocalSourceError); got != want {
-				t.Errorf("got s.Stats().IP.Forwarding.LinkLocalSource.Value() = %d, want = %d", got, want)
+			s.SetRouteTable([]tcpip.Route{
+				{
+					Destination: header.IPv6EmptySubnet,
+					NIC:         incomingNICID,
+				},
+			})
+
+			srcAddr := remoteIPv6Addr1
+			dstAddr := multicastIPv6Addr.Address
+
+			outgoingInterfaces := []stack.MulticastRouteOutgoingInterface{
+				{ID: outgoingNICID, MinTTL: multicastRouteMinTTL},
+			}
+			addresses := stack.UnicastSourceAndMulticastDestination{
+				Source:      srcAddr,
+				Destination: multicastIPv6Addr.Address,
 			}
 
-			if got, want := s.Stats().IP.Forwarding.LinkLocalDestination.Value(), boolToInt(test.expectLinkLocalDestError); got != want {
-				t.Errorf("got s.Stats().IP.Forwarding.LinkLocalDestination.Value() = %d, want = %d", got, want)
+			route := stack.MulticastRoute{
+				ExpectedInputInterface: incomingNICID,
+				OutgoingInterfaces:     outgoingInterfaces,
 			}
 
-			if got, want := s.Stats().IP.Forwarding.ExhaustedTTL.Value(), boolToInt(test.TTL <= 1); got != want {
-				t.Errorf("got rt.Stats().IP.Forwarding.ExhaustedTTL.Value() = %d, want = %d", got, want)
+			if err := s.AddMulticastRoute(ProtocolNumber, addresses, route); err != nil {
+				t.Fatalf("s.AddMulticastRoute(%d, %#v, %#v): = %s", ProtocolNumber, addresses, route, err)
 			}
 
-			if got, want := s.Stats().IP.Forwarding.Unrouteable.Value(), boolToInt(test.expectPacketUnrouteableError); got != want {
-				t.Errorf("got s.Stats().IP.Forwarding.Unrouteable.Value() = %d, want = %d", got, want)
+			transportProtocol := header.ICMPv6ProtocolNumber
+			var extHdrBytes []byte
+			extHdrChecker := checker.IPv6ExtHdr()
+			if test.extHdr != nil {
+				nextHdrID := hopByHopExtHdrID
+				extHdrBytes, nextHdrID, extHdrChecker = test.extHdr(uint8(header.ICMPv6ProtocolNumber))
+				transportProtocol = tcpip.TransportProtocolNumber(nextHdrID)
+			}
+			extHdrLen := len(extHdrBytes)
+
+			ipHeaderLength := header.IPv6MinimumSize
+			icmpHeaderLength := header.ICMPv6MinimumSize
+			payloadLength := icmpHeaderLength + test.payloadLength + extHdrLen
+			totalLength := ipHeaderLength + payloadLength
+			hdr := prependable.New(totalLength)
+			hdr.Prepend(test.payloadLength)
+			icmpH := header.ICMPv6(hdr.Prepend(icmpHeaderLength))
+
+			icmpH.SetIdent(randomIdent)
+			icmpH.SetSequence(randomSequence)
+			icmpH.SetType(header.ICMPv6EchoRequest)
+			icmpH.SetCode(header.ICMPv6UnusedCode)
+			icmpH.SetChecksum(0)
+			icmpH.SetChecksum(header.ICMPv6Checksum(header.ICMPv6ChecksumParams{
+				Header: icmpH,
+				Src:    srcAddr,
+				Dst:    dstAddr,
+			}))
+			copy(hdr.Prepend(extHdrLen), extHdrBytes)
+			ip := header.IPv6(hdr.Prepend(ipHeaderLength))
+			ip.Encode(&header.IPv6Fields{
+				PayloadLength:     uint16(payloadLength),
+				TransportProtocol: transportProtocol,
+				HopLimit:          packetTTL,
+				SrcAddr:           srcAddr,
+				DstAddr:           dstAddr,
+			})
+			request := stack.NewPacketBuffer(stack.PacketBufferOptions{
+				Payload: bufferv2.MakeWithData(hdr.View()),
+			})
+
+			incomingEndpoint, ok := endpoints[incomingNICID]
+			if !ok {
+				t.Fatalf("endpoints[%d] = (_, false), want (_, true)", incomingNICID)
 			}
 
-			if got, want := s.Stats().IP.Forwarding.Errors.Value(), boolToInt(!test.expectPacketForwarded); got != want {
-				t.Errorf("got s.Stats().IP.Forwarding.Errors.Value() = %d, want = %d", got, want)
+			incomingEndpoint.InjectInbound(ProtocolNumber, request)
+			request.DecRef()
+
+			reply := incomingEndpoint.Read()
+
+			outgoingEndpoint, ok := endpoints[outgoingNICID]
+			if !ok {
+				t.Fatalf("endpoints[%d] = (_, false), want (_, true)", outgoingNICID)
 			}
 
-			if got, want := s.Stats().IP.Forwarding.ExtensionHeaderProblem.Value(), boolToInt(test.expectExtensionHeaderError); got != want {
-				t.Errorf("got s.Stats().IP.Forwarding.ExtensionHeaderProblem.Value() = %d, want = %d", got, want)
+			if test.expectedICMPError != nil {
+				if reply.IsNil() {
+					t.Fatalf("Expected ICMP packet type %d through incoming NIC", test.expectedICMPError.icmpType)
+				}
+
+				// As per RFC 4443, page 9:
+				//
+				//   The returned ICMP packet will contain as much of invoking packet
+				//   as possible without the ICMPv6 packet exceeding the minimum IPv6
+				//   MTU.
+				expectedICMPPayloadLength := func() int {
+					maxICMPPayloadLength := header.IPv6MinimumMTU - ipHeaderLength - icmpHeaderLength
+					if len(hdr.View()) > maxICMPPayloadLength {
+						return maxICMPPayloadLength
+					}
+					return len(hdr.View())
+				}
+
+				payload := stack.PayloadSince(reply.NetworkHeader())
+				defer payload.Release()
+				checker.IPv6(t, payload,
+					checker.SrcAddr(incomingIPv6Addr.Address),
+					checker.DstAddr(srcAddr),
+					checker.TTL(DefaultTTL),
+					checker.ICMPv6(
+						checker.ICMPv6Type(test.expectedICMPError.icmpType),
+						checker.ICMPv6Code(test.expectedICMPError.icmpCode),
+						checker.ICMPv6Payload(hdr.View()[:expectedICMPPayloadLength()]),
+					),
+				)
+				reply.DecRef()
+
+				if n := outgoingEndpoint.Drain(); n != 0 {
+					t.Fatalf("e2.Drain() = %d, want = 0", n)
+				}
+			} else if !reply.IsNil() {
+				t.Fatalf("Expected no ICMP packet through incoming NIC, instead found: %#v", reply)
 			}
 
-			if got, want := s.Stats().IP.Forwarding.PacketTooBig.Value(), boolToInt(test.icmpType == header.ICMPv6PacketTooBig); got != want {
-				t.Errorf("got s.Stats().IP.Forwarding.PacketTooBig.Value() = %d, want = %d", got, want)
+			reply = outgoingEndpoint.Read()
+			if test.expectPacketForwarded {
+				if reply.IsNil() {
+					t.Fatal("Expected ICMP Echo Request packet through outgoing NIC")
+				}
+
+				payload := stack.PayloadSince(reply.NetworkHeader())
+				defer payload.Release()
+				checker.IPv6WithExtHdr(t, payload,
+					checker.SrcAddr(srcAddr),
+					checker.DstAddr(dstAddr),
+					checker.TTL(packetTTL-1),
+					extHdrChecker,
+					checker.ICMPv6(
+						checker.ICMPv6Type(header.ICMPv6EchoRequest),
+						checker.ICMPv6Code(header.ICMPv6UnusedCode),
+						checker.ICMPv6Payload(nil),
+					),
+				)
+				reply.DecRef()
+
+				if n := incomingEndpoint.Drain(); n != 0 {
+					t.Fatalf("e1.Drain() = %d, want = 0", n)
+				}
+			} else if !reply.IsNil() {
+				t.Fatalf("Expected no ICMP Echo packet through outgoing NIC, instead found: %#v", reply)
+			}
+
+			if got, want := s.Stats().IP.Forwarding.ExtensionHeaderProblem.Value(), test.expectedExtensionHeaderErrors; got != want {
+				t.Errorf("s.Stats().IP.Forwarding.ExtensionHeaderProblem.Value() = %d, want = %d", got, want)
+			}
+
+			if got, want := s.Stats().IP.Forwarding.PacketTooBig.Value(), test.expectedPacketTooBigErrors; got != want {
+				t.Errorf("s.Stats().IP.Forwarding.PacketTooBig.Value() = %d, want = %d", got, want)
+			}
+
+			totalExpectedErrors := test.expectedPacketTooBigErrors + test.expectedExtensionHeaderErrors
+			if got, want := s.Stats().IP.Forwarding.Errors.Value(), totalExpectedErrors; got != want {
+				t.Errorf("s.Stats().IP.Forwarding.Errors.Value() = %d, want = %d", got, want)
 			}
 		})
 	}
 }
 
 func TestMultiCounterStatsInitialization(t *testing.T) {
-	s := stack.New(stack.Options{
-		NetworkProtocols: []stack.NetworkProtocolFactory{NewProtocol},
-	})
+	c := newTestContext()
+	defer c.cleanup()
+	s := c.s
+
 	proto := s.NetworkProtocolInstance(ProtocolNumber).(*protocol)
 	var nic testInterface
 	ep := proto.NewEndpoint(&nic, nil).(*endpoint)
@@ -3482,10 +3577,172 @@ func TestMultiCounterStatsInitialization(t *testing.T) {
 	// supposed to be bound.
 	refStack := s.Stats()
 	refEP := ep.stats.localStats
-	if err := testutil.ValidateMultiCounterStats(reflect.ValueOf(&ep.stats.ip).Elem(), []reflect.Value{reflect.ValueOf(&refStack.IP).Elem(), reflect.ValueOf(&refEP.IP).Elem()}); err != nil {
+	if err := testutil.ValidateMultiCounterStats(reflect.ValueOf(&ep.stats.ip).Elem(), []reflect.Value{reflect.ValueOf(&refStack.IP).Elem(), reflect.ValueOf(&refEP.IP).Elem()}, testutil.ValidateMultiCounterStatsOptions{
+		ExpectMultiCounterStat:            true,
+		ExpectMultiIntegralStatCounterMap: false,
+	}); err != nil {
 		t.Error(err)
 	}
-	if err := testutil.ValidateMultiCounterStats(reflect.ValueOf(&ep.stats.icmp).Elem(), []reflect.Value{reflect.ValueOf(&refStack.ICMP.V6).Elem(), reflect.ValueOf(&refEP.ICMP).Elem()}); err != nil {
+	if err := testutil.ValidateMultiCounterStats(reflect.ValueOf(&ep.stats.icmp).Elem(), []reflect.Value{reflect.ValueOf(&refStack.ICMP.V6).Elem(), reflect.ValueOf(&refEP.ICMP).Elem()}, testutil.ValidateMultiCounterStatsOptions{
+		ExpectMultiCounterStat:            true,
+		ExpectMultiIntegralStatCounterMap: false,
+	}); err != nil {
 		t.Error(err)
+	}
+}
+
+func TestIcmpRateLimit(t *testing.T) {
+	var (
+		host1IPv6Addr = tcpip.ProtocolAddress{
+			Protocol: ProtocolNumber,
+			AddressWithPrefix: tcpip.AddressWithPrefix{
+				Address:   tcpip.Address(net.ParseIP("10::1").To16()),
+				PrefixLen: 64,
+			},
+		}
+		host2IPv6Addr = tcpip.ProtocolAddress{
+			Protocol: ProtocolNumber,
+			AddressWithPrefix: tcpip.AddressWithPrefix{
+				Address:   tcpip.Address(net.ParseIP("10::2").To16()),
+				PrefixLen: 64,
+			},
+		}
+	)
+	const icmpBurst = 5
+
+	c := newTestContext()
+	defer c.cleanup()
+	s := c.s
+
+	s.SetICMPBurst(icmpBurst)
+
+	e := channel.New(1, defaultMTU, tcpip.LinkAddress(""))
+	defer e.Close()
+	if err := s.CreateNIC(nicID, e); err != nil {
+		t.Fatalf("s.CreateNIC(%d, _): %s", nicID, err)
+	}
+	if err := s.AddProtocolAddress(nicID, host1IPv6Addr, stack.AddressProperties{}); err != nil {
+		t.Fatalf("s.AddProtocolAddress(%d, %+v, {}): %s", nicID, host1IPv6Addr, err)
+	}
+	s.SetRouteTable([]tcpip.Route{
+		{
+			Destination: host1IPv6Addr.AddressWithPrefix.Subnet(),
+			NIC:         nicID,
+		},
+	})
+	tests := []struct {
+		name         string
+		createPacket func() []byte
+		check        func(*testing.T, *channel.Endpoint, int)
+	}{
+		{
+			name: "echo",
+			createPacket: func() []byte {
+				totalLength := header.IPv6MinimumSize + header.ICMPv6MinimumSize
+				hdr := prependable.New(totalLength)
+				icmpH := header.ICMPv6(hdr.Prepend(header.ICMPv6MinimumSize))
+				icmpH.SetIdent(1)
+				icmpH.SetSequence(1)
+				icmpH.SetType(header.ICMPv6EchoRequest)
+				icmpH.SetCode(header.ICMPv6UnusedCode)
+				icmpH.SetChecksum(0)
+				icmpH.SetChecksum(header.ICMPv6Checksum(header.ICMPv6ChecksumParams{
+					Header: icmpH,
+					Src:    host2IPv6Addr.AddressWithPrefix.Address,
+					Dst:    host1IPv6Addr.AddressWithPrefix.Address,
+				}))
+				payloadLength := hdr.UsedLength()
+				ip := header.IPv6(hdr.Prepend(header.IPv6MinimumSize))
+				ip.Encode(&header.IPv6Fields{
+					PayloadLength:     uint16(payloadLength),
+					TransportProtocol: header.ICMPv6ProtocolNumber,
+					HopLimit:          1,
+					SrcAddr:           host2IPv6Addr.AddressWithPrefix.Address,
+					DstAddr:           host1IPv6Addr.AddressWithPrefix.Address,
+				})
+				return hdr.View()
+			},
+			check: func(t *testing.T, e *channel.Endpoint, round int) {
+				p := e.Read()
+				if p.IsNil() {
+					t.Fatalf("expected echo response, no packet read in endpoint in round %d", round)
+				}
+				defer p.DecRef()
+				if got, want := p.NetworkProtocolNumber, header.IPv6ProtocolNumber; got != want {
+					t.Errorf("got p.NetworkProtocolNumber = %d, want = %d", got, want)
+				}
+				payload := stack.PayloadSince(p.NetworkHeader())
+				defer payload.Release()
+				checker.IPv6(t, payload,
+					checker.SrcAddr(host1IPv6Addr.AddressWithPrefix.Address),
+					checker.DstAddr(host2IPv6Addr.AddressWithPrefix.Address),
+					checker.ICMPv6(
+						checker.ICMPv6Type(header.ICMPv6EchoReply),
+					))
+			},
+		},
+		{
+			name: "dst unreachable",
+			createPacket: func() []byte {
+				totalLength := header.IPv6MinimumSize + header.UDPMinimumSize
+				hdr := prependable.New(totalLength)
+				udpH := header.UDP(hdr.Prepend(header.UDPMinimumSize))
+				udpH.Encode(&header.UDPFields{
+					SrcPort: 100,
+					DstPort: 101,
+					Length:  header.UDPMinimumSize,
+				})
+
+				// Calculate the UDP checksum and set it.
+				sum := header.PseudoHeaderChecksum(udp.ProtocolNumber, host2IPv6Addr.AddressWithPrefix.Address, host1IPv6Addr.AddressWithPrefix.Address, header.UDPMinimumSize)
+				sum = checksum.Checksum(nil, sum)
+				udpH.SetChecksum(^udpH.CalculateChecksum(sum))
+
+				payloadLength := hdr.UsedLength()
+				ip := header.IPv6(hdr.Prepend(header.IPv6MinimumSize))
+				ip.Encode(&header.IPv6Fields{
+					PayloadLength:     uint16(payloadLength),
+					TransportProtocol: header.UDPProtocolNumber,
+					HopLimit:          1,
+					SrcAddr:           host2IPv6Addr.AddressWithPrefix.Address,
+					DstAddr:           host1IPv6Addr.AddressWithPrefix.Address,
+				})
+				return hdr.View()
+			},
+			check: func(t *testing.T, e *channel.Endpoint, round int) {
+				p := e.Read()
+				if round >= icmpBurst {
+					if !p.IsNil() {
+						t.Errorf("got packet %x in round %d, expected ICMP rate limit to stop it", p.Data().AsRange().ToSlice(), round)
+						p.DecRef()
+					}
+					return
+				}
+				if p.IsNil() {
+					t.Fatalf("expected unreachable in round %d, no packet read in endpoint", round)
+				}
+				payload := stack.PayloadSince(p.NetworkHeader())
+				defer payload.Release()
+				checker.IPv6(t, payload,
+					checker.SrcAddr(host1IPv6Addr.AddressWithPrefix.Address),
+					checker.DstAddr(host2IPv6Addr.AddressWithPrefix.Address),
+					checker.ICMPv6(
+						checker.ICMPv6Type(header.ICMPv6DstUnreachable),
+					))
+				p.DecRef()
+			},
+		},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			for round := 0; round < icmpBurst+1; round++ {
+				pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
+					Payload: bufferv2.MakeWithData(testCase.createPacket()),
+				})
+				e.InjectInbound(header.IPv6ProtocolNumber, pkt)
+				pkt.DecRef()
+				testCase.check(t, e, round)
+			}
+		})
 	}
 }

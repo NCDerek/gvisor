@@ -21,7 +21,6 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"gvisor.dev/gvisor/pkg/tcpip"
-	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/checker"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/link/channel"
@@ -47,7 +46,10 @@ func TestLocalPing(t *testing.T) {
 		// request/reply packets.
 		icmpDataOffset = 8
 	)
-	ipv4Loopback := testutil.MustParse4("127.0.0.1")
+	ipv4Loopback := tcpip.AddressWithPrefix{
+		Address:   testutil.MustParse4("127.0.0.1"),
+		PrefixLen: 8,
+	}
 
 	channelEP := func() stack.LinkEndpoint { return channel.New(1, header.IPv6MinimumMTU, "") }
 	channelEPCheck := func(t *testing.T, e stack.LinkEndpoint) {
@@ -57,24 +59,24 @@ func TestLocalPing(t *testing.T) {
 		}
 	}
 
-	ipv4ICMPBuf := func(t *testing.T) buffer.View {
+	ipv4ICMPBuf := func(t *testing.T) []byte {
 		data := [8]byte{1, 2, 3, 4, 5, 6, 7, 8}
 		hdr := header.ICMPv4(make([]byte, header.ICMPv4MinimumSize+len(data)))
 		hdr.SetType(header.ICMPv4Echo)
 		if n := copy(hdr.Payload(), data[:]); n != len(data) {
 			t.Fatalf("copied %d bytes but expected to copy %d bytes", n, len(data))
 		}
-		return buffer.View(hdr)
+		return hdr
 	}
 
-	ipv6ICMPBuf := func(t *testing.T) buffer.View {
+	ipv6ICMPBuf := func(t *testing.T) []byte {
 		data := [8]byte{1, 2, 3, 4, 5, 6, 7, 9}
 		hdr := header.ICMPv6(make([]byte, header.ICMPv6MinimumSize+len(data)))
 		hdr.SetType(header.ICMPv6EchoRequest)
 		if n := copy(hdr.Payload(), data[:]); n != len(data) {
 			t.Fatalf("copied %d bytes but expected to copy %d bytes", n, len(data))
 		}
-		return buffer.View(hdr)
+		return hdr
 	}
 
 	tests := []struct {
@@ -82,8 +84,8 @@ func TestLocalPing(t *testing.T) {
 		transProto         tcpip.TransportProtocolNumber
 		netProto           tcpip.NetworkProtocolNumber
 		linkEndpoint       func() stack.LinkEndpoint
-		localAddr          tcpip.Address
-		icmpBuf            func(*testing.T) buffer.View
+		localAddr          tcpip.AddressWithPrefix
+		icmpBuf            func(*testing.T) []byte
 		expectedConnectErr tcpip.Error
 		checkLinkEndpoint  func(t *testing.T, e stack.LinkEndpoint)
 	}{
@@ -101,7 +103,7 @@ func TestLocalPing(t *testing.T) {
 			transProto:        icmp.ProtocolNumber6,
 			netProto:          ipv6.ProtocolNumber,
 			linkEndpoint:      loopback.New,
-			localAddr:         header.IPv6Loopback,
+			localAddr:         header.IPv6Loopback.WithPrefix(),
 			icmpBuf:           ipv6ICMPBuf,
 			checkLinkEndpoint: func(*testing.T, stack.LinkEndpoint) {},
 		},
@@ -110,7 +112,7 @@ func TestLocalPing(t *testing.T) {
 			transProto:        icmp.ProtocolNumber4,
 			netProto:          ipv4.ProtocolNumber,
 			linkEndpoint:      channelEP,
-			localAddr:         utils.Ipv4Addr.Address,
+			localAddr:         utils.Ipv4Addr,
 			icmpBuf:           ipv4ICMPBuf,
 			checkLinkEndpoint: channelEPCheck,
 		},
@@ -119,7 +121,7 @@ func TestLocalPing(t *testing.T) {
 			transProto:        icmp.ProtocolNumber6,
 			netProto:          ipv6.ProtocolNumber,
 			linkEndpoint:      channelEP,
-			localAddr:         utils.Ipv6Addr.Address,
+			localAddr:         utils.Ipv6Addr,
 			icmpBuf:           ipv6ICMPBuf,
 			checkLinkEndpoint: channelEPCheck,
 		},
@@ -182,22 +184,26 @@ func TestLocalPing(t *testing.T) {
 						t.Fatalf("s.CreateNIC(%d, _): %s", nicID, err)
 					}
 
-					if len(test.localAddr) != 0 {
-						if err := s.AddAddress(nicID, test.netProto, test.localAddr); err != nil {
-							t.Fatalf("s.AddAddress(%d, %d, %s): %s", nicID, test.netProto, test.localAddr, err)
+					if len(test.localAddr.Address) != 0 {
+						protocolAddr := tcpip.ProtocolAddress{
+							Protocol:          test.netProto,
+							AddressWithPrefix: test.localAddr,
+						}
+						if err := s.AddProtocolAddress(nicID, protocolAddr, stack.AddressProperties{}); err != nil {
+							t.Fatalf("AddProtocolAddress(%d, %+v, {}): %s", nicID, protocolAddr, err)
 						}
 					}
 
 					var wq waiter.Queue
-					we, ch := waiter.NewChannelEntry(nil)
-					wq.EventRegister(&we, waiter.ReadableEvents)
+					we, ch := waiter.NewChannelEntry(waiter.ReadableEvents)
+					wq.EventRegister(&we)
 					ep, err := s.NewEndpoint(test.transProto, test.netProto, &wq)
 					if err != nil {
 						t.Fatalf("s.NewEndpoint(%d, %d, _): %s", test.transProto, test.netProto, err)
 					}
 					defer ep.Close()
 
-					connAddr := tcpip.FullAddress{Addr: test.localAddr}
+					connAddr := tcpip.FullAddress{Addr: test.localAddr.Address}
 					if err := ep.Connect(connAddr); err != test.expectedConnectErr {
 						t.Fatalf("got ep.Connect(%#v) = %s, want = %s", connAddr, err, test.expectedConnectErr)
 					}
@@ -226,11 +232,11 @@ func TestLocalPing(t *testing.T) {
 					if err != nil {
 						t.Fatalf("ep.Read(...): %s", err)
 					}
-					if diff := cmp.Diff(buffer.View(w.Bytes()[icmpDataOffset:]), payload[icmpDataOffset:]); diff != "" {
+					if diff := cmp.Diff(w.Bytes()[icmpDataOffset:], payload[icmpDataOffset:]); diff != "" {
 						t.Errorf("received data mismatch (-want +got):\n%s", diff)
 					}
-					if rr.RemoteAddr.Addr != test.localAddr {
-						t.Errorf("got addr.Addr = %s, want = %s", rr.RemoteAddr.Addr, test.localAddr)
+					if rr.RemoteAddr.Addr != test.localAddr.Address {
+						t.Errorf("got addr.Addr = %s, want = %s", rr.RemoteAddr.Addr, test.localAddr.Address)
 					}
 
 					test.checkLinkEndpoint(t, e)
@@ -302,17 +308,18 @@ func TestLocalUDP(t *testing.T) {
 					}
 
 					if subTest.addAddress {
-						if err := s.AddProtocolAddressWithOptions(nicID, test.canBePrimaryAddr, stack.CanBePrimaryEndpoint); err != nil {
-							t.Fatalf("s.AddProtocolAddressWithOptions(%d, %#v, %d): %s", nicID, test.canBePrimaryAddr, stack.FirstPrimaryEndpoint, err)
+						if err := s.AddProtocolAddress(nicID, test.canBePrimaryAddr, stack.AddressProperties{}); err != nil {
+							t.Fatalf("s.AddProtocolAddress(%d, %+v, {}): %s", nicID, test.canBePrimaryAddr, err)
 						}
-						if err := s.AddProtocolAddressWithOptions(nicID, test.firstPrimaryAddr, stack.FirstPrimaryEndpoint); err != nil {
-							t.Fatalf("s.AddProtocolAddressWithOptions(%d, %#v, %d): %s", nicID, test.firstPrimaryAddr, stack.FirstPrimaryEndpoint, err)
+						properties := stack.AddressProperties{PEB: stack.FirstPrimaryEndpoint}
+						if err := s.AddProtocolAddress(nicID, test.firstPrimaryAddr, properties); err != nil {
+							t.Fatalf("s.AddProtocolAddress(%d, %+v, %+v): %s", nicID, test.firstPrimaryAddr, properties, err)
 						}
 					}
 
 					var serverWQ waiter.Queue
-					serverWE, serverCH := waiter.NewChannelEntry(nil)
-					serverWQ.EventRegister(&serverWE, waiter.ReadableEvents)
+					serverWE, serverCH := waiter.NewChannelEntry(waiter.ReadableEvents)
+					serverWQ.EventRegister(&serverWE)
 					server, err := s.NewEndpoint(udp.ProtocolNumber, test.firstPrimaryAddr.Protocol, &serverWQ)
 					if err != nil {
 						t.Fatalf("s.NewEndpoint(%d, %d): %s", udp.ProtocolNumber, test.firstPrimaryAddr.Protocol, err)
@@ -325,8 +332,8 @@ func TestLocalUDP(t *testing.T) {
 					}
 
 					var clientWQ waiter.Queue
-					clientWE, clientCH := waiter.NewChannelEntry(nil)
-					clientWQ.EventRegister(&clientWE, waiter.ReadableEvents)
+					clientWE, clientCH := waiter.NewChannelEntry(waiter.ReadableEvents)
+					clientWQ.EventRegister(&clientWE)
 					client, err := s.NewEndpoint(udp.ProtocolNumber, test.firstPrimaryAddr.Protocol, &clientWQ)
 					if err != nil {
 						t.Fatalf("s.NewEndpoint(%d, %d): %s", udp.ProtocolNumber, test.firstPrimaryAddr.Protocol, err)
@@ -379,7 +386,7 @@ func TestLocalUDP(t *testing.T) {
 						)); diff != "" {
 							t.Errorf("server.Read: unexpected result (-want +got):\n%s", diff)
 						}
-						if diff := cmp.Diff(buffer.View(clientPayload), buffer.View(readBuf.Bytes())); diff != "" {
+						if diff := cmp.Diff(clientPayload, readBuf.Bytes()); diff != "" {
 							t.Errorf("server read clientPayload mismatch (-want +got):\n%s", diff)
 						}
 						if t.Failed() {
@@ -419,7 +426,7 @@ func TestLocalUDP(t *testing.T) {
 						)); diff != "" {
 							t.Errorf("client.Read: unexpected result (-want +got):\n%s", diff)
 						}
-						if diff := cmp.Diff(buffer.View(serverPayload), buffer.View(readBuf.Bytes())); diff != "" {
+						if diff := cmp.Diff(serverPayload, readBuf.Bytes()); diff != "" {
 							t.Errorf("client read serverPayload mismatch (-want +got):\n%s", diff)
 						}
 						if t.Failed() {

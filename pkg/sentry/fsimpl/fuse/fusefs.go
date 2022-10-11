@@ -19,18 +19,18 @@ import (
 	"math"
 	"strconv"
 	"sync"
-	"sync/atomic"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/marshal"
+	"gvisor.dev/gvisor/pkg/marshal/primitive"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/kernfs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
-	"gvisor.dev/gvisor/pkg/waiter"
 )
 
 // Name is the default filesystem name.
@@ -96,9 +96,6 @@ type filesystem struct {
 
 	// opts is the options the fusefs is initialized with.
 	opts *filesystemOptions
-
-	// umounted is true if filesystem.Release() has been called.
-	umounted bool
 }
 
 // Name implements vfs.FilesystemType.Name.
@@ -232,19 +229,24 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		return nil, nil, linuxerr.EINVAL
 	}
 
+	fuseFD.mu.Lock()
+	connected := fuseFD.connected()
 	// Create a new FUSE filesystem.
 	fs, err := newFUSEFilesystem(ctx, vfsObj, &fsType, fuseFD, devMinor, &fsopts)
 	if err != nil {
 		log.Warningf("%s.NewFUSEFilesystem: failed with error: %v", fsType.Name(), err)
+		fuseFD.mu.Unlock()
 		return nil, nil, err
 	}
+	fuseFD.mu.Unlock()
 
 	// Send a FUSE_INIT request to the FUSE daemon server before returning.
 	// This call is not blocking.
-	if err := fs.conn.InitSend(creds, uint32(kernelTask.ThreadID())); err != nil {
-		log.Warningf("%s.InitSend: failed with error: %v", fsType.Name(), err)
-		fs.VFSFilesystem().DecRef(ctx) // returned by newFUSEFilesystem
-		return nil, nil, err
+	if !connected {
+		if err := fs.conn.InitSend(creds, uint32(kernelTask.ThreadID())); err != nil {
+			log.Warningf("%s.InitSend: failed with error: %v", fsType.Name(), err)
+			return nil, nil, err
+		}
 	}
 
 	// root is the fusefs root directory.
@@ -254,42 +256,28 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 }
 
 // newFUSEFilesystem creates a new FUSE filesystem.
+// +checklocks:fuseFD.mu
 func newFUSEFilesystem(ctx context.Context, vfsObj *vfs.VirtualFilesystem, fsType *FilesystemType, fuseFD *DeviceFD, devMinor uint32, opts *filesystemOptions) (*filesystem, error) {
-	conn, err := newFUSEConnection(ctx, fuseFD, opts)
-	if err != nil {
-		log.Warningf("fuse.NewFUSEFilesystem: NewFUSEConnection failed with error: %v", err)
-		return nil, linuxerr.EINVAL
+	if !fuseFD.connected() {
+		conn, err := newFUSEConnection(ctx, fuseFD, opts)
+		if err != nil {
+			log.Warningf("fuse.NewFUSEFilesystem: NewFUSEConnection failed with error: %v", err)
+			return nil, linuxerr.EINVAL
+		}
+		fuseFD.conn = conn
 	}
 
 	fs := &filesystem{
 		devMinor: devMinor,
 		opts:     opts,
-		conn:     conn,
+		conn:     fuseFD.conn,
 	}
 	fs.VFSFilesystem().Init(vfsObj, fsType, fs)
-
-	// FIXME(gvisor.dev/issue/4813): Doesn't conn or fs need to hold a
-	// reference on fuseFD, since conn uses fuseFD for communication with the
-	// server? Wouldn't doing so create a circular reference?
-	fs.VFSFilesystem().IncRef() // for fuseFD.fs
-	// FIXME(gvisor.dev/issue/4813): fuseFD.fs is accessed without
-	// synchronization.
-	fuseFD.fs = fs
-
 	return fs, nil
 }
 
 // Release implements vfs.FilesystemImpl.Release.
 func (fs *filesystem) Release(ctx context.Context) {
-	fs.conn.fd.mu.Lock()
-
-	fs.umounted = true
-	fs.conn.Abort(ctx)
-	// Notify all the waiters on this fd.
-	fs.conn.fd.waitQueue.Notify(waiter.ReadableEvents)
-
-	fs.conn.fd.mu.Unlock()
-
 	fs.Filesystem.VFSFilesystem().VirtualFilesystem().PutAnonBlockDevMinor(fs.devMinor)
 	fs.Filesystem.Release(ctx)
 }
@@ -297,6 +285,15 @@ func (fs *filesystem) Release(ctx context.Context) {
 // MountOptions implements vfs.FilesystemImpl.MountOptions.
 func (fs *filesystem) MountOptions() string {
 	return fs.opts.mopts
+}
+
+// NewFhData is returned by newEntry.
+type NewFhData struct {
+	// fh is the file handler.
+	fh uint64
+
+	// flags is the flags of the file.
+	flags uint32
 }
 
 // inode implements kernfs.Inode.
@@ -308,6 +305,7 @@ type inode struct {
 	kernfs.InodeAttrs
 	kernfs.InodeDirectoryNoNewChildren
 	kernfs.InodeNotSymlink
+	kernfs.InodeWatches
 	kernfs.OrderedChildren
 
 	// the owning filesystem. fs is immutable.
@@ -321,10 +319,10 @@ type inode struct {
 	locks vfs.FileLocks
 
 	// size of the file.
-	size uint64
+	size atomicbitops.Uint64
 
 	// attributeVersion is the version of inode's attributes.
-	attributeVersion uint64
+	attributeVersion atomicbitops.Uint64
 
 	// attributeTime is the remaining vaild time of attributes.
 	attributeTime uint64
@@ -334,6 +332,10 @@ type inode struct {
 
 	// link is result of following a symbolic link.
 	link string
+
+	// if newEntry got a new Fh from server it saves it here, until returned by Open
+	isNewFh   bool
+	newFhData NewFhData
 }
 
 func (fs *filesystem) newRoot(ctx context.Context, creds *auth.Credentials, mode linux.FileMode) *kernfs.Dentry {
@@ -351,7 +353,7 @@ func (fs *filesystem) newInode(ctx context.Context, nodeID uint64, attr linux.FU
 	i := &inode{fs: fs, nodeID: nodeID}
 	creds := auth.Credentials{EffectiveKGID: auth.KGID(attr.UID), EffectiveKUID: auth.KUID(attr.UID)}
 	i.InodeAttrs.Init(ctx, &creds, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), linux.FileMode(attr.Mode))
-	atomic.StoreUint64(&i.size, attr.Size)
+	i.size.Store(attr.Size)
 	i.OrderedChildren.Init(kernfs.OrderedChildrenOptions{})
 	i.InitRefs()
 	return i
@@ -395,7 +397,7 @@ func (i *inode) Open(ctx context.Context, rp *vfs.ResolvingPath, d *kernfs.Dentr
 	if !isDir && opts.Mode.IsDir() {
 		return nil, linuxerr.ENOTDIR
 	}
-	if opts.Flags&linux.O_LARGEFILE == 0 && atomic.LoadUint64(&i.size) > linux.MAX_NON_LFS {
+	if opts.Flags&linux.O_LARGEFILE == 0 && i.size.Load() > linux.MAX_NON_LFS {
 		return nil, linuxerr.EOVERFLOW
 	}
 
@@ -410,11 +412,17 @@ func (i *inode) Open(ctx context.Context, rp *vfs.ResolvingPath, d *kernfs.Dentr
 		fd = &(regularFD.fileDescription)
 		fdImpl = regularFD
 	}
+	fd.LockFD.Init(&i.locks)
 	// FOPEN_KEEP_CACHE is the defualt flag for noOpen.
 	fd.OpenFlag = linux.FOPEN_KEEP_CACHE
 
 	// Only send open request when FUSE server support open or is opening a directory.
-	if !i.fs.conn.noOpen || isDir {
+	if i.isNewFh {
+		// use Fh from NewEntry
+		fd.OpenFlag = i.newFhData.flags
+		fd.Fh = i.newFhData.fh
+		i.isNewFh = false
+	} else if !i.fs.conn.noOpen || isDir {
 		kernelTask := kernel.TaskFromContext(ctx)
 		if kernelTask == nil {
 			log.Warningf("fusefs.Inode.Open: couldn't get kernel task from context")
@@ -452,12 +460,11 @@ func (i *inode) Open(ctx context.Context, rp *vfs.ResolvingPath, d *kernfs.Dentr
 
 			// Process the reply.
 			fd.OpenFlag = out.OpenFlag
-			if isDir {
-				fd.OpenFlag &= ^uint32(linux.FOPEN_DIRECT_IO)
-			}
-
 			fd.Fh = out.Fh
 		}
+	}
+	if isDir {
+		fd.OpenFlag &= ^uint32(linux.FOPEN_DIRECT_IO)
 	}
 
 	// TODO(gvisor.dev/issue/3234): invalidate mmap after implemented it for FUSE Inode
@@ -474,9 +481,8 @@ func (i *inode) Open(ctx context.Context, rp *vfs.ResolvingPath, d *kernfs.Dentr
 	// by setting the file size to 0.
 	if i.fs.conn.atomicOTrunc && opts.Flags&linux.O_TRUNC != 0 {
 		i.fs.conn.mu.Lock()
-		i.fs.conn.attributeVersion++
-		i.attributeVersion = i.fs.conn.attributeVersion
-		atomic.StoreUint64(&i.size, 0)
+		i.attributeVersion.Store(i.fs.conn.attributeVersion.Add(1))
+		i.size.Store(0)
 		i.fs.conn.mu.Unlock()
 		i.attributeTime = 0
 	}
@@ -489,7 +495,7 @@ func (i *inode) Open(ctx context.Context, rp *vfs.ResolvingPath, d *kernfs.Dentr
 
 // Lookup implements kernfs.Inode.Lookup.
 func (i *inode) Lookup(ctx context.Context, name string) (kernfs.Inode, error) {
-	in := linux.FUSELookupIn{Name: name}
+	in := linux.FUSELookupIn{Name: linux.CString(name)}
 	return i.newEntry(ctx, name, 0, linux.FUSE_LOOKUP, &in)
 }
 
@@ -520,7 +526,7 @@ func (i *inode) NewFile(ctx context.Context, name string, opts vfs.OpenOptions) 
 			Mode:  uint32(opts.Mode) | linux.S_IFREG,
 			Umask: uint32(kernelTask.FSContext().Umask()),
 		},
-		Name: name,
+		Name: linux.CString(name),
 	}
 	return i.newEntry(ctx, name, linux.S_IFREG, linux.FUSE_CREATE, &in)
 }
@@ -533,16 +539,16 @@ func (i *inode) NewNode(ctx context.Context, name string, opts vfs.MknodOptions)
 			Rdev:  linux.MakeDeviceID(uint16(opts.DevMajor), opts.DevMinor),
 			Umask: uint32(kernel.TaskFromContext(ctx).FSContext().Umask()),
 		},
-		Name: name,
+		Name: linux.CString(name),
 	}
 	return i.newEntry(ctx, name, opts.Mode.FileType(), linux.FUSE_MKNOD, &in)
 }
 
 // NewSymlink implements kernfs.Inode.NewSymlink.
 func (i *inode) NewSymlink(ctx context.Context, name, target string) (kernfs.Inode, error) {
-	in := linux.FUSESymLinkIn{
-		Name:   name,
-		Target: target,
+	in := linux.FUSESymlinkIn{
+		Name:   linux.CString(name),
+		Target: linux.CString(target),
 	}
 	return i.newEntry(ctx, name, linux.S_IFLNK, linux.FUSE_SYMLINK, &in)
 }
@@ -554,7 +560,7 @@ func (i *inode) Unlink(ctx context.Context, name string, child kernfs.Inode) err
 		log.Warningf("fusefs.Inode.newEntry: couldn't get kernel task from context", i.nodeID)
 		return linuxerr.EINVAL
 	}
-	in := linux.FUSEUnlinkIn{Name: name}
+	in := linux.FUSEUnlinkIn{Name: linux.CString(name)}
 	req := i.fs.conn.NewRequest(auth.CredentialsFromContext(ctx), uint32(kernelTask.ThreadID()), i.nodeID, linux.FUSE_UNLINK, &in)
 	res, err := i.fs.conn.Call(kernelTask, req)
 	if err != nil {
@@ -571,7 +577,7 @@ func (i *inode) NewDir(ctx context.Context, name string, opts vfs.MkdirOptions) 
 			Mode:  uint32(opts.Mode),
 			Umask: uint32(kernel.TaskFromContext(ctx).FSContext().Umask()),
 		},
-		Name: name,
+		Name: linux.CString(name),
 	}
 	return i.newEntry(ctx, name, linux.S_IFDIR, linux.FUSE_MKDIR, &in)
 }
@@ -581,8 +587,30 @@ func (i *inode) RmDir(ctx context.Context, name string, child kernfs.Inode) erro
 	fusefs := i.fs
 	task, creds := kernel.TaskFromContext(ctx), auth.CredentialsFromContext(ctx)
 
-	in := linux.FUSERmDirIn{Name: name}
+	in := linux.FUSERmDirIn{Name: linux.CString(name)}
 	req := fusefs.conn.NewRequest(creds, uint32(task.ThreadID()), i.nodeID, linux.FUSE_RMDIR, &in)
+	res, err := i.fs.conn.Call(task, req)
+	if err != nil {
+		return err
+	}
+	return res.Error()
+}
+
+func (i *inode) Rename(ctx context.Context, oldname, newname string, child, dstDir kernfs.Inode) error {
+	fusefs := i.fs
+	task, creds := kernel.TaskFromContext(ctx), auth.CredentialsFromContext(ctx)
+
+	dstDirInode, ok := dstDir.(*inode)
+	if !ok {
+		return linuxerr.EXDEV
+	}
+
+	in := linux.FUSERenameIn{
+		Newdir:  primitive.Uint64(dstDirInode.nodeID),
+		Oldname: linux.CString(oldname),
+		Newname: linux.CString(newname),
+	}
+	req := fusefs.conn.NewRequest(creds, uint32(task.ThreadID()), i.nodeID, linux.FUSE_RENAME, &in)
 	res, err := i.fs.conn.Call(task, req)
 	if err != nil {
 		return err
@@ -606,14 +634,31 @@ func (i *inode) newEntry(ctx context.Context, name string, fileType linux.FileMo
 	if err := res.Error(); err != nil {
 		return nil, err
 	}
-	out := linux.FUSEEntryOut{}
-	if err := res.UnmarshalPayload(&out); err != nil {
-		return nil, err
+	out := linux.FUSECreateOut{}
+	if opcode == linux.FUSE_CREATE {
+		if err := res.UnmarshalPayload(&out); err != nil {
+			return nil, err
+		}
+	} else {
+		if err := res.UnmarshalPayload(&out.FUSEEntryOut); err != nil {
+			return nil, err
+		}
 	}
 	if opcode != linux.FUSE_LOOKUP && ((out.Attr.Mode&linux.S_IFMT)^uint32(fileType) != 0 || out.NodeID == 0 || out.NodeID == linux.FUSE_ROOT_ID) {
 		return nil, linuxerr.EIO
 	}
 	child := i.fs.newInode(ctx, out.NodeID, out.Attr)
+	if opcode == linux.FUSE_CREATE {
+		// File handler is returned by fuse server at a time of file create.
+		// Save it temporary in a created child, so Open could return it when invoked
+		// to be sure after fh is consumed reset 'isNewFh' flag of inode
+		childI, ok := child.(*inode)
+		if ok {
+			childI.isNewFh = true
+			childI.newFhData.fh = out.FUSEOpenOut.Fh
+			childI.newFhData.flags = out.FUSEOpenOut.OpenFlag
+		}
+	}
 	return child, nil
 }
 
@@ -652,7 +697,7 @@ func (i *inode) Readlink(ctx context.Context, mnt *vfs.Mount) (string, error) {
 func (i *inode) getFUSEAttr() linux.FUSEAttr {
 	return linux.FUSEAttr{
 		Ino:  i.Ino(),
-		Size: atomic.LoadUint64(&i.size),
+		Size: i.size.Load(),
 		Mode: uint32(i.Mode()),
 	}
 }
@@ -714,12 +759,12 @@ func statFromFUSEAttr(attr linux.FUSEAttr, mask, devMinor uint32) linux.Statx {
 // or read from local cache. It updates the corresponding attributes if
 // necessary.
 func (i *inode) getAttr(ctx context.Context, fs *vfs.Filesystem, opts vfs.StatOptions, flags uint32, fh uint64) (linux.FUSEAttr, error) {
-	attributeVersion := atomic.LoadUint64(&i.fs.conn.attributeVersion)
+	attributeVersion := i.fs.conn.attributeVersion.Load()
 
 	// TODO(gvisor.dev/issue/3679): send the request only if
-	// - invalid local cache for fields specified in the opts.Mask
-	// - forced update
-	// - i.attributeTime expired
+	//	- invalid local cache for fields specified in the opts.Mask
+	//	- forced update
+	//	- i.attributeTime expired
 	// If local cache is still valid, return local cache.
 	// Currently we always send a request,
 	// and we always set the metadata with the new result,
@@ -753,7 +798,7 @@ func (i *inode) getAttr(ctx context.Context, fs *vfs.Filesystem, opts vfs.StatOp
 
 	// Local version is newer, return the local one.
 	// Skip the update.
-	if attributeVersion != 0 && atomic.LoadUint64(&i.attributeVersion) > attributeVersion {
+	if attributeVersion != 0 && i.attributeVersion.Load() > attributeVersion {
 		return i.getFUSEAttr(), nil
 	}
 
@@ -765,7 +810,7 @@ func (i *inode) getAttr(ctx context.Context, fs *vfs.Filesystem, opts vfs.StatOp
 	}
 
 	// Set the size if no error (after SetStat() check).
-	atomic.StoreUint64(&i.size, out.Attr.Size)
+	i.size.Store(out.Attr.Size)
 
 	return out.Attr, nil
 }
@@ -798,8 +843,39 @@ func (i *inode) DecRef(ctx context.Context) {
 
 // StatFS implements kernfs.Inode.StatFS.
 func (i *inode) StatFS(ctx context.Context, fs *vfs.Filesystem) (linux.Statfs, error) {
-	// TODO(gvisor.dev/issues/3413): Complete the implementation of statfs.
-	return vfs.GenericStatFS(linux.FUSE_SUPER_MAGIC), nil
+	task := kernel.TaskFromContext(ctx)
+	if task == nil {
+		log.Warningf("couldn't get kernel task from context")
+		return linux.Statfs{}, linuxerr.EINVAL
+	}
+
+	req := i.fs.conn.NewRequest(auth.CredentialsFromContext(ctx), uint32(task.ThreadID()), i.nodeID,
+		linux.FUSE_STATFS, &linux.FUSEEmptyIn{},
+	)
+	res, err := i.fs.conn.Call(task, req)
+	if err != nil {
+		return linux.Statfs{}, err
+	}
+	if err := res.Error(); err != nil {
+		return linux.Statfs{}, err
+	}
+
+	var out linux.FUSEStatfsOut
+	if err := res.UnmarshalPayload(&out); err != nil {
+		return linux.Statfs{}, err
+	}
+
+	return linux.Statfs{
+		Type:            linux.FUSE_SUPER_MAGIC,
+		Blocks:          uint64(out.Blocks),
+		BlocksFree:      out.BlocksFree,
+		BlocksAvailable: out.BlocksAvailable,
+		Files:           out.Files,
+		FilesFree:       out.FilesFree,
+		BlockSize:       int64(out.BlockSize),
+		NameLength:      uint64(out.NameLength),
+		FragmentSize:    int64(out.FragmentSize),
+	}, nil
 }
 
 // fattrMaskFromStats converts vfs.SetStatOptions.Stat.Mask to linux stats mask

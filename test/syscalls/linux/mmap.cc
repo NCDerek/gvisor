@@ -29,6 +29,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <limits>
 #include <vector>
 
 #include "gmock/gmock.h"
@@ -91,7 +92,7 @@ class MMapTest : public ::testing::Test {
       return -1;
     }
 
-    int ret = munmap(addr_, length_);
+    int ret = MunmapSafe(addr_, length_);
 
     addr_ = nullptr;
     length_ = 0;
@@ -297,9 +298,10 @@ TEST_F(MMapTest, MapDevZeroSegfaultAfterUnmap) {
     *reinterpret_cast<volatile int*>(addr_saved) = 0xFF;
   };
 
-  EXPECT_THAT(InForkedProcess(rest),
-              IsPosixErrorOkAndHolds(AnyOf(Eq(W_EXITCODE(0, SIGSEGV)),
-                                           Eq(W_EXITCODE(0, 128 + SIGSEGV)))));
+  int child_exit_status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess(rest));
+  EXPECT_TRUE(WIFSIGNALED(child_exit_status) &&
+              WTERMSIG(child_exit_status) == SIGSEGV)
+      << "exit status: " << child_exit_status;
 }
 
 TEST_F(MMapTest, MapDevZeroUnaligned) {
@@ -913,13 +915,41 @@ TEST_F(MMapFileTest, MapOffsetBeyondEnd) {
               ::testing::KilledBySignal(SIGBUS), "");
 }
 
-// Verify mmap fails when sum of length and offset overflows.
-TEST_F(MMapFileTest, MapLengthPlusOffsetOverflows) {
+TEST_F(MMapFileTest, MapSecondToLastPositivePage) {
   SKIP_IF(!FSSupportsMap());
-  const size_t length = static_cast<size_t>(-kPageSize);
-  const off_t offset = kPageSize;
-  ASSERT_THAT(Map(0, length, PROT_READ, MAP_PRIVATE, fd_.get(), offset),
-              SyscallFailsWithErrno(ENOMEM));
+  EXPECT_THAT(
+      Map(0, kPageSize, PROT_READ, MAP_SHARED, fd_.get(),
+          (std::numeric_limits<off_t>::max() - kPageSize) & ~(kPageSize - 1)),
+      SyscallSucceeds());
+}
+
+TEST_F(MMapFileTest, MapLastPositivePage) {
+  SKIP_IF(!FSSupportsMap());
+  // For regular files, this should fail due to integer overflow of the end
+  // offset.
+  EXPECT_THAT(Map(0, kPageSize, PROT_READ, MAP_SHARED, fd_.get(),
+                  std::numeric_limits<off_t>::max() & ~(kPageSize - 1)),
+              SyscallFailsWithErrno(EOVERFLOW));
+}
+
+TEST_F(MMapFileTest, MapFirstNegativePage) {
+  SKIP_IF(!FSSupportsMap());
+  EXPECT_THAT(Map(0, kPageSize, PROT_READ, MAP_SHARED, fd_.get(),
+                  std::numeric_limits<off_t>::min()),
+              SyscallFailsWithErrno(EOVERFLOW));
+}
+
+TEST_F(MMapFileTest, MapSecondToLastNegativePage) {
+  SKIP_IF(!FSSupportsMap());
+  EXPECT_THAT(
+      Map(0, kPageSize, PROT_READ, MAP_SHARED, fd_.get(), -(2 * kPageSize)),
+      SyscallFailsWithErrno(EOVERFLOW));
+}
+
+TEST_F(MMapFileTest, MapLastNegativePage) {
+  SKIP_IF(!FSSupportsMap());
+  EXPECT_THAT(Map(0, kPageSize, PROT_READ, MAP_SHARED, fd_.get(), -kPageSize),
+              SyscallFailsWithErrno(EOVERFLOW));
 }
 
 // MAP_PRIVATE PROT_WRITE is allowed on read-only FDs.
@@ -954,7 +984,6 @@ TEST_F(MMapFileTest, WriteSharedOnReadOnlyFd) {
 // Mmap not allowed on O_PATH FDs.
 TEST_F(MMapFileTest, MmapFileWithOpath) {
   SKIP_IF(!FSSupportsMap());
-  SKIP_IF(IsRunningWithVFS1());
   const TempPath file = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFile());
   const FileDescriptor fd =
       ASSERT_NO_ERRNO_AND_VALUE(Open(file.path(), O_PATH));

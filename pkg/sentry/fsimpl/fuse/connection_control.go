@@ -15,8 +15,6 @@
 package fuse
 
 import (
-	"sync/atomic"
-
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
@@ -65,13 +63,13 @@ func (conn *connection) SetInitialized() {
 	// And it prevents the newer tasks from gaining
 	// unnecessary higher chance to be issued before the blocked one.
 
-	atomic.StoreInt32(&(conn.initialized), int32(1))
+	conn.initialized.Store(1)
 }
 
-// IsInitialized atomically check if the connection is initialized.
-// pairs with SetInitialized().
+// Initialized atomically check if the connection is initialized. pairs with
+// SetInitialized().
 func (conn *connection) Initialized() bool {
-	return atomic.LoadInt32(&(conn.initialized)) != 0
+	return conn.initialized.Load() != 0
 }
 
 // InitSend sends a FUSE_INIT request.
@@ -109,9 +107,13 @@ func (conn *connection) InitRecv(res *Response, hasSysAdminCap bool) error {
 // Process the FUSE_INIT reply from the FUSE server.
 // It tries to acquire the conn.asyncMu lock if minor version is newer than 13.
 func (conn *connection) initProcessReply(out *linux.FUSEInitOut, hasSysAdminCap bool) error {
+	conn.mu.Lock()
 	// No matter error or not, always set initialzied.
 	// to unblock the blocked requests.
-	defer conn.SetInitialized()
+	defer func() {
+		conn.SetInitialized()
+		conn.mu.Unlock()
+	}()
 
 	// No support for old major fuse versions.
 	if out.Major != linux.FUSE_KERNEL_VERSION {
@@ -186,7 +188,7 @@ func (conn *connection) initProcessReply(out *linux.FUSEInitOut, hasSysAdminCap 
 // It tries to acquire conn.fd.mu, conn.lock, conn.bgLock in order.
 // All possible requests waiting or blocking will be aborted.
 //
-// Preconditions: conn.fd.mu is locked.
+// +checklocks:conn.fd.mu
 func (conn *connection) Abort(ctx context.Context) {
 	conn.mu.Lock()
 	conn.asyncMu.Lock()
@@ -219,7 +221,7 @@ func (conn *connection) Abort(ctx context.Context) {
 	conn.asyncMu.Unlock()
 	conn.mu.Unlock()
 
-	// 1. The requets blocked before initialization.
+	// 1. The request blocked before initialization.
 	// Will reach call() `connected` check and return.
 	if !conn.Initialized() {
 		conn.SetInitialized()

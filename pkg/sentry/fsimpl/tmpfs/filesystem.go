@@ -16,7 +16,6 @@ package tmpfs
 
 import (
 	"fmt"
-	"sync/atomic"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
@@ -26,6 +25,16 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/socket/unix/transport"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
+)
+
+const (
+	// direntSize is the size of each directory entry
+	// that Linux uses for computing directory size.
+	// "20" is mm/shmem.c:BOGO_DIRENT_SIZE.
+	direntSize = 20
+	// Linux implementation uses a SHORT_SYMLINK_LEN 128.
+	// It accounts size for only SYMLINK with size >= 128.
+	shortSymlinkLen = 128
 )
 
 // Sync implements vfs.FilesystemImpl.Sync.
@@ -40,8 +49,8 @@ func (fs *filesystem) Sync(ctx context.Context) error {
 // stepLocked is loosely analogous to fs/namei.c:walk_component().
 //
 // Preconditions:
-// * filesystem.mu must be locked.
-// * !rp.Done().
+//   - filesystem.mu must be locked.
+//   - !rp.Done().
 func stepLocked(ctx context.Context, rp *vfs.ResolvingPath, d *dentry) (*dentry, error) {
 	dir, ok := d.inode.impl.(*directory)
 	if !ok {
@@ -69,7 +78,7 @@ afterSymlink:
 		rp.Advance()
 		return d.parent, nil
 	}
-	if len(name) > linux.NAME_MAX {
+	if len(name) > d.inode.fs.maxFilenameLen {
 		return nil, linuxerr.ENAMETOOLONG
 	}
 	child, ok := dir.childMap[name]
@@ -100,8 +109,8 @@ afterSymlink:
 // fs/namei.c:path_parentat().
 //
 // Preconditions:
-// * filesystem.mu must be locked.
-// * !rp.Done().
+//   - filesystem.mu must be locked.
+//   - !rp.Done().
 func walkParentDirLocked(ctx context.Context, rp *vfs.ResolvingPath, d *dentry) (*directory, error) {
 	for !rp.Final() {
 		next, err := stepLocked(ctx, rp, d)
@@ -144,8 +153,8 @@ func resolveLocked(ctx context.Context, rp *vfs.ResolvingPath) (*dentry, error) 
 // fs/namei.c:filename_create() and done_path_create().
 //
 // Preconditions:
-// * !rp.Done().
-// * For the final path component in rp, !rp.ShouldFollowSymlink().
+//   - !rp.Done().
+//   - For the final path component in rp, !rp.ShouldFollowSymlink().
 func (fs *filesystem) doCreateAt(ctx context.Context, rp *vfs.ResolvingPath, dir bool, create func(parentDir *directory, name string) error) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
@@ -163,7 +172,7 @@ func (fs *filesystem) doCreateAt(ctx context.Context, rp *vfs.ResolvingPath, dir
 	if name == "." || name == ".." {
 		return linuxerr.EEXIST
 	}
-	if len(name) > linux.NAME_MAX {
+	if len(name) > fs.maxFilenameLen {
 		return linuxerr.ENAMETOOLONG
 	}
 	if _, ok := parentDir.childMap[name]; ok {
@@ -207,7 +216,13 @@ func (fs *filesystem) AccessAt(ctx context.Context, rp *vfs.ResolvingPath, creds
 	if err != nil {
 		return err
 	}
-	return d.inode.checkPermissions(creds, ats)
+	if err := d.inode.checkPermissions(creds, ats); err != nil {
+		return err
+	}
+	if ats.MayWrite() && rp.Mount().ReadOnly() {
+		return linuxerr.EROFS
+	}
+	return nil
 }
 
 // GetDentryAt implements vfs.FilesystemImpl.GetDentryAt.
@@ -253,13 +268,13 @@ func (fs *filesystem) LinkAt(ctx context.Context, rp *vfs.ResolvingPath, vd vfs.
 		if i.isDir() {
 			return linuxerr.EPERM
 		}
-		if err := vfs.MayLink(auth.CredentialsFromContext(ctx), linux.FileMode(atomic.LoadUint32(&i.mode)), auth.KUID(atomic.LoadUint32(&i.uid)), auth.KGID(atomic.LoadUint32(&i.gid))); err != nil {
+		if err := vfs.MayLink(auth.CredentialsFromContext(ctx), linux.FileMode(i.mode.Load()), auth.KUID(i.uid.Load()), auth.KGID(i.gid.Load())); err != nil {
 			return err
 		}
-		if i.nlink == 0 {
+		if i.nlink.Load() == 0 {
 			return linuxerr.ENOENT
 		}
-		if i.nlink == maxLinks {
+		if i.nlink.Load() == maxLinks {
 			return linuxerr.EMLINK
 		}
 		i.incLinksLocked()
@@ -273,7 +288,7 @@ func (fs *filesystem) LinkAt(ctx context.Context, rp *vfs.ResolvingPath, vd vfs.
 func (fs *filesystem) MkdirAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.MkdirOptions) error {
 	return fs.doCreateAt(ctx, rp, true /* dir */, func(parentDir *directory, name string) error {
 		creds := rp.Credentials()
-		if parentDir.inode.nlink == maxLinks {
+		if parentDir.inode.nlink.Load() == maxLinks {
 			return linuxerr.EMLINK
 		}
 		parentDir.inode.incLinksLocked() // from child's ".."
@@ -371,7 +386,7 @@ afterTrailingSymlink:
 	if name == "." || name == ".." {
 		return nil, linuxerr.EISDIR
 	}
-	if len(name) > linux.NAME_MAX {
+	if len(name) > fs.maxFilenameLen {
 		return nil, linuxerr.ENAMETOOLONG
 	}
 	// Determine whether or not we need to create a file.
@@ -516,6 +531,9 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 		}
 		return linuxerr.EBUSY
 	}
+	if len(newName) > fs.maxFilenameLen {
+		return linuxerr.ENAMETOOLONG
+	}
 	mnt := rp.Mount()
 	if mnt != oldParentVD.Mount() {
 		return linuxerr.EXDEV
@@ -580,7 +598,7 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 			}
 		}
 	} else {
-		if renamed.inode.isDir() && newParentDir.inode.nlink == maxLinks {
+		if renamed.inode.isDir() && newParentDir.inode.nlink.Load() == maxLinks {
 			return linuxerr.EMLINK
 		}
 	}
@@ -727,12 +745,20 @@ func (fs *filesystem) StatFSAt(ctx context.Context, rp *vfs.ResolvingPath) (linu
 	if _, err := resolveLocked(ctx, rp); err != nil {
 		return linux.Statfs{}, err
 	}
-	return globalStatfs, nil
+	return fs.statFS(), nil
 }
 
 // SymlinkAt implements vfs.FilesystemImpl.SymlinkAt.
 func (fs *filesystem) SymlinkAt(ctx context.Context, rp *vfs.ResolvingPath, target string) error {
 	return fs.doCreateAt(ctx, rp, false /* dir */, func(parentDir *directory, name string) error {
+		// Linux allocates a page to store symlink targets that have length larger
+		// than shortSymlinkLen. Targets are just stored as string here, but simulate
+		// the page accounting for it. See mm/shmem.c:shmem_symlink().
+		if len(target) >= shortSymlinkLen {
+			if !fs.accountPages(1) {
+				return linuxerr.ENOSPC
+			}
+		}
 		creds := rp.Credentials()
 		child := fs.newDentry(fs.newSymlink(creds.EffectiveKUID, creds.EffectiveKGID, 0777, target, parentDir))
 		parentDir.insertChildLocked(child, name)
@@ -779,12 +805,10 @@ func (fs *filesystem) UnlinkAt(ctx context.Context, rp *vfs.ResolvingPath) error
 	if err := vfsObj.PrepareDeleteDentry(mntns, &child.vfsd); err != nil {
 		return err
 	}
-
 	// Generate inotify events. Note that this must take place before the link
 	// count of the child is decremented, or else the watches may be dropped
 	// before these events are added.
 	vfs.InotifyRemoveChild(ctx, &child.inode.watches, &parentDir.inode.watches, name)
-
 	parentDir.removeChildLocked(child)
 	child.inode.decLinksLocked(ctx)
 	vfsObj.CommitDeleteDentry(ctx, &child.vfsd)
@@ -909,4 +933,82 @@ func (fs *filesystem) PrependPath(ctx context.Context, vfsroot, vd vfs.VirtualDe
 // MountOptions implements vfs.FilesystemImpl.MountOptions.
 func (fs *filesystem) MountOptions() string {
 	return fs.mopts
+}
+
+// checkFillAllocation checks if pages allocated by Fill() and PagesToFill()
+// are consistent.
+func (fs *filesystem) checkFillAllocation(pagesReqd, pagesAlloced uint64) {
+	if pagesReqd < pagesAlloced {
+		panic(fmt.Sprintf("More pages were allocated by Fill() than PagesToFill() had reported: pagesReqd=%d, pagesAlloced=%d", pagesReqd, pagesAlloced))
+	}
+	if pagesDiff := pagesReqd - pagesAlloced; pagesDiff > 0 {
+		fs.unaccountPages(pagesDiff)
+	}
+}
+
+// accountPagesPartial increases the pagesUsed if tmpfs is mounted with size
+// option by as much as possible without going over the size mount option. It
+// returns the number of pages that we were able to account for. It returns false
+// when the maxSizeInPages has been exhausted and no more allocation can be done.
+// The returned value is guaranteed to be <= pagesInc. If the size mount option is
+// not set, then pagesInc will be returned.
+func (fs *filesystem) accountPagesPartial(pagesInc uint64) uint64 {
+	if fs.maxSizeInPages == 0 || pagesInc == 0 {
+		return pagesInc
+	}
+
+	// Need to acquire fs.pagesUsedMu for fs.pagesUsed.
+	fs.pagesUsedMu.Lock()
+	defer fs.pagesUsedMu.Unlock()
+	if fs.maxSizeInPages <= fs.pagesUsed {
+		return 0
+	}
+
+	pagesFree := fs.maxSizeInPages - fs.pagesUsed
+	if pagesFree < pagesInc {
+		fs.pagesUsed += pagesFree
+		return pagesFree
+	}
+
+	fs.pagesUsed += pagesInc
+	return pagesInc
+}
+
+// accountPages increases the pagesUsed in filesystem struct if tmpfs
+// is mounted with size option. We return a false when the maxSizeInPages
+// has been exhausted and no more allocation can be done.
+func (fs *filesystem) accountPages(pagesInc uint64) bool {
+	if fs.maxSizeInPages == 0 || pagesInc == 0 {
+		return true // No accounting needed.
+	}
+
+	// Need to acquire fs.pagesUsedMu for fs.pagesUsed.
+	fs.pagesUsedMu.Lock()
+	defer fs.pagesUsedMu.Unlock()
+	if fs.maxSizeInPages <= fs.pagesUsed {
+		return false
+	}
+
+	pagesFree := fs.maxSizeInPages - fs.pagesUsed
+	if pagesFree < pagesInc {
+		return false
+	}
+
+	fs.pagesUsed += pagesInc
+	return true
+}
+
+// unaccountPages decreases the pagesUsed in filesystem struct if tmpfs
+// is mounted with size option.
+func (fs *filesystem) unaccountPages(pagesDec uint64) {
+	if fs.maxSizeInPages == 0 || pagesDec == 0 {
+		return
+	}
+	// Need to acquire fs.pagesUsedMu for fs.pagesUsed.
+	fs.pagesUsedMu.Lock()
+	defer fs.pagesUsedMu.Unlock()
+	if fs.pagesUsed < pagesDec {
+		panic(fmt.Sprintf("Deallocating more pages than allocated: fs.pagesUsed = %d, pagesDec = %d", fs.pagesUsed, pagesDec))
+	}
+	fs.pagesUsed -= pagesDec
 }

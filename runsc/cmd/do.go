@@ -31,6 +31,7 @@ import (
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/log"
+	"gvisor.dev/gvisor/runsc/cmd/util"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/container"
 	"gvisor.dev/gvisor/runsc/flag"
@@ -47,6 +48,8 @@ type Do struct {
 	ip      string
 	quiet   bool
 	overlay bool
+	uidMap  idMapSlice
+	gidMap  idMapSlice
 }
 
 // Name implements subcommands.Command.Name.
@@ -71,6 +74,44 @@ used for testing only.
 `
 }
 
+type idMapSlice []specs.LinuxIDMapping
+
+// String implements flag.Value.String.
+func (is *idMapSlice) String() string {
+	return fmt.Sprintf("%#v", is)
+}
+
+// Get implements flag.Value.Get.
+func (is *idMapSlice) Get() interface{} {
+	return is
+}
+
+// Set implements flag.Value.Set.
+func (is *idMapSlice) Set(s string) error {
+	fs := strings.Fields(s)
+	if len(fs) != 3 {
+		return fmt.Errorf("invalid mapping: %s", s)
+	}
+	var cid, hid, size int
+	var err error
+	if cid, err = strconv.Atoi(fs[0]); err != nil {
+		return fmt.Errorf("invalid mapping: %s", s)
+	}
+	if hid, err = strconv.Atoi(fs[1]); err != nil {
+		return fmt.Errorf("invalid mapping: %s", s)
+	}
+	if size, err = strconv.Atoi(fs[2]); err != nil {
+		return fmt.Errorf("invalid mapping: %s", s)
+	}
+	m := specs.LinuxIDMapping{
+		ContainerID: uint32(cid),
+		HostID:      uint32(hid),
+		Size:        uint32(size),
+	}
+	*is = append(*is, m)
+	return nil
+}
+
 // SetFlags implements subcommands.Command.SetFlags.
 func (c *Do) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&c.root, "root", "/", `path to the root directory, defaults to "/"`)
@@ -78,6 +119,8 @@ func (c *Do) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&c.ip, "ip", "192.168.10.2", "IPv4 address for the sandbox")
 	f.BoolVar(&c.quiet, "quiet", false, "suppress runsc messages to stdout. Application output is still sent to stdout and stderr")
 	f.BoolVar(&c.overlay, "force-overlay", true, "use an overlay. WARNING: disabling gives the command write access to the host")
+	f.Var(&c.uidMap, "uid-map", "Add a user id mapping [ContainerID, HostID, Size]")
+	f.Var(&c.gidMap, "gid-map", "Add a group id mapping [ContainerID, HostID, Size]")
 }
 
 // Execute implements subcommands.Command.Execute.
@@ -92,25 +135,25 @@ func (c *Do) Execute(_ context.Context, f *flag.FlagSet, args ...interface{}) su
 
 	if conf.Rootless {
 		if err := specutils.MaybeRunAsRoot(); err != nil {
-			return Errorf("Error executing inside namespace: %v", err)
+			return util.Errorf("Error executing inside namespace: %v", err)
 		}
 		// Execution will continue here if no more capabilities are needed...
 	}
 
 	hostname, err := os.Hostname()
 	if err != nil {
-		return Errorf("Error to retrieve hostname: %v", err)
+		return util.Errorf("Error to retrieve hostname: %v", err)
 	}
 
 	// Map the entire host file system, optionally using an overlay.
 	conf.Overlay = c.overlay
 	absRoot, err := resolvePath(c.root)
 	if err != nil {
-		return Errorf("Error resolving root: %v", err)
+		return util.Errorf("Error resolving root: %v", err)
 	}
 	absCwd, err := resolvePath(c.cwd)
 	if err != nil {
-		return Errorf("Error resolving current directory: %v", err)
+		return util.Errorf("Error resolving current directory: %v", err)
 	}
 
 	spec := &specs.Spec{
@@ -127,6 +170,12 @@ func (c *Do) Execute(_ context.Context, f *flag.FlagSet, args ...interface{}) su
 	}
 
 	cid := fmt.Sprintf("runsc-%06d", rand.Int31n(1000000))
+
+	if c.uidMap != nil || c.gidMap != nil {
+		addNamespace(spec, specs.LinuxNamespace{Type: specs.UserNamespace})
+		spec.Linux.UIDMappings = c.uidMap
+		spec.Linux.GIDMappings = c.gidMap
+	}
 
 	if conf.Network == config.NetworkNone {
 		addNamespace(spec, specs.LinuxNamespace{Type: specs.NetworkNamespace})
@@ -148,7 +197,7 @@ func (c *Do) Execute(_ context.Context, f *flag.FlagSet, args ...interface{}) su
 			defer clean()
 
 		default:
-			return Errorf("Error setting up network: %v", err)
+			return util.Errorf("Error setting up network: %v", err)
 		}
 	}
 
@@ -214,7 +263,7 @@ func (c *Do) setupNet(cid string, spec *specs.Spec) (func(), error) {
 
 		// Enable network access.
 		"sysctl -w net.ipv4.ip_forward=1",
-		fmt.Sprintf("iptables -t nat -A POSTROUTING -s %s -o %s -j MASQUERADE", c.ip, dev),
+		fmt.Sprintf("iptables -t nat -A POSTROUTING -s %s -o %s -m comment --comment runsc-%s -j MASQUERADE", c.ip, dev, peer),
 		fmt.Sprintf("iptables -A FORWARD -i %s -o %s -j ACCEPT", dev, peer),
 		fmt.Sprintf("iptables -A FORWARD -o %s -i %s -j ACCEPT", dev, peer),
 	}
@@ -224,25 +273,25 @@ func (c *Do) setupNet(cid string, spec *specs.Spec) (func(), error) {
 		args := strings.Split(cmd, " ")
 		cmd := exec.Command(args[0], args[1:]...)
 		if err := cmd.Run(); err != nil {
-			c.cleanupNet(cid, "", "", "")
+			c.cleanupNet(cid, dev, "", "", "")
 			return nil, fmt.Errorf("failed to run %q: %v", cmd, err)
 		}
 	}
 
 	resolvPath, err := makeFile("/etc/resolv.conf", "nameserver 8.8.8.8\n", spec)
 	if err != nil {
-		c.cleanupNet(cid, "", "", "")
+		c.cleanupNet(cid, dev, "", "", "")
 		return nil, err
 	}
 	hostnamePath, err := makeFile("/etc/hostname", cid+"\n", spec)
 	if err != nil {
-		c.cleanupNet(cid, resolvPath, "", "")
+		c.cleanupNet(cid, dev, resolvPath, "", "")
 		return nil, err
 	}
 	hosts := fmt.Sprintf("127.0.0.1\tlocalhost\n%s\t%s\n", c.ip, cid)
 	hostsPath, err := makeFile("/etc/hosts", hosts, spec)
 	if err != nil {
-		c.cleanupNet(cid, resolvPath, hostnamePath, "")
+		c.cleanupNet(cid, dev, resolvPath, hostnamePath, "")
 		return nil, err
 	}
 
@@ -252,7 +301,7 @@ func (c *Do) setupNet(cid string, spec *specs.Spec) (func(), error) {
 	}
 	addNamespace(spec, netns)
 
-	return func() { c.cleanupNet(cid, resolvPath, hostnamePath, hostsPath) }, nil
+	return func() { c.cleanupNet(cid, dev, resolvPath, hostnamePath, hostsPath) }, nil
 }
 
 // cleanupNet tries to cleanup the network setup in setupNet.
@@ -262,12 +311,15 @@ func (c *Do) setupNet(cid string, spec *specs.Spec) (func(), error) {
 //
 // Unfortunately none of this can be automatically cleaned up on process exit,
 // we must do so explicitly.
-func (c *Do) cleanupNet(cid, resolvPath, hostnamePath, hostsPath string) {
+func (c *Do) cleanupNet(cid, dev, resolvPath, hostnamePath, hostsPath string) {
 	_, peer := deviceNames(cid)
 
 	cmds := []string{
 		fmt.Sprintf("ip link delete %s", peer),
 		fmt.Sprintf("ip netns delete %s", cid),
+		fmt.Sprintf("iptables -t nat -D POSTROUTING -s %s -o %s -m comment --comment runsc-%s -j MASQUERADE", c.ip, dev, peer),
+		fmt.Sprintf("iptables -D FORWARD -i %s -o %s -j ACCEPT", dev, peer),
+		fmt.Sprintf("iptables -D FORWARD -o %s -i %s -j ACCEPT", dev, peer),
 	}
 
 	for _, cmd := range cmds {
@@ -353,11 +405,11 @@ func startContainerAndWait(spec *specs.Spec, conf *config.Config, cid string, wa
 
 	out, err := json.Marshal(spec)
 	if err != nil {
-		return Errorf("Error to marshal spec: %v", err)
+		return util.Errorf("Error to marshal spec: %v", err)
 	}
 	tmpDir, err := ioutil.TempDir("", "runsc-do")
 	if err != nil {
-		return Errorf("Error to create tmp dir: %v", err)
+		return util.Errorf("Error to create tmp dir: %v", err)
 	}
 	defer os.RemoveAll(tmpDir)
 
@@ -366,7 +418,7 @@ func startContainerAndWait(spec *specs.Spec, conf *config.Config, cid string, wa
 
 	cfgPath := filepath.Join(tmpDir, "config.json")
 	if err := ioutil.WriteFile(cfgPath, out, 0755); err != nil {
-		return Errorf("Error write spec: %v", err)
+		return util.Errorf("Error write spec: %v", err)
 	}
 
 	containerArgs := container.Args{
@@ -378,12 +430,12 @@ func startContainerAndWait(spec *specs.Spec, conf *config.Config, cid string, wa
 
 	ct, err := container.New(conf, containerArgs)
 	if err != nil {
-		return Errorf("creating container: %v", err)
+		return util.Errorf("creating container: %v", err)
 	}
 	defer ct.Destroy()
 
 	if err := ct.Start(conf); err != nil {
-		return Errorf("starting container: %v", err)
+		return util.Errorf("starting container: %v", err)
 	}
 
 	// Forward signals to init in the container. Thus if we get SIGINT from
@@ -396,7 +448,7 @@ func startContainerAndWait(spec *specs.Spec, conf *config.Config, cid string, wa
 
 	ws, err := ct.Wait()
 	if err != nil {
-		return Errorf("waiting for container: %v", err)
+		return util.Errorf("waiting for container: %v", err)
 	}
 
 	*waitStatus = ws

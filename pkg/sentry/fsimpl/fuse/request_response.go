@@ -15,11 +15,11 @@
 package fuse
 
 import (
-	"fmt"
-
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/marshal"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
@@ -29,10 +29,8 @@ import (
 // server may implement an older version of FUSE protocol, which contains a
 // linux.FUSEInitOut with less attributes.
 //
-// Dynamically-sized objects cannot be marshalled.
+// +marshal dynamic
 type fuseInitRes struct {
-	marshal.StubMarshallable
-
 	// initOut contains the response from the FUSE server.
 	initOut linux.FUSEInitOut
 
@@ -40,8 +38,12 @@ type fuseInitRes struct {
 	initLen uint32
 }
 
+func (r *fuseInitRes) MarshalBytes(src []byte) []byte {
+	panic("Unimplemented, fuseInitRes should never be marshalled")
+}
+
 // UnmarshalBytes deserializes src to the initOut attribute in a fuseInitRes.
-func (r *fuseInitRes) UnmarshalBytes(src []byte) {
+func (r *fuseInitRes) UnmarshalBytes(src []byte) []byte {
 	out := &r.initOut
 
 	// Introduced before FUSE kernel version 7.13.
@@ -70,7 +72,7 @@ func (r *fuseInitRes) UnmarshalBytes(src []byte) {
 		out.MaxPages = uint16(hostarch.ByteOrder.Uint16(src[:2]))
 		src = src[2:]
 	}
-	_ = src // Remove unused warning.
+	return src
 }
 
 // SizeBytes is the size of the payload of the FUSE_INIT response.
@@ -92,10 +94,6 @@ type Request struct {
 	id   linux.FUSEOpID
 	hdr  *linux.FUSEHeaderIn
 	data []byte
-
-	// payload for this request: extra bytes to write after
-	// the data slice. Used by FUSE_WRITE.
-	payload []byte
 
 	// If this request is async.
 	async bool
@@ -123,9 +121,8 @@ func (conn *connection) NewRequest(creds *auth.Credentials, pid uint32, ino uint
 
 	buf := make([]byte, hdr.Len)
 
-	// TODO(gVisor.dev/issue/3698): Use the unsafe version once go_marshal is safe to use again.
-	hdr.MarshalBytes(buf[:hdrLen])
-	payload.MarshalBytes(buf[hdrLen:])
+	hdr.MarshalUnsafe(buf[:hdrLen])
+	payload.MarshalUnsafe(buf[hdrLen:])
 
 	return &Request{
 		id:   hdr.Unique,
@@ -215,7 +212,9 @@ func (r *Response) UnmarshalPayload(m marshal.Marshallable) error {
 	wantDataLen := uint32(m.SizeBytes())
 
 	if haveDataLen < wantDataLen {
-		return fmt.Errorf("payload too small. Minimum data lenth required: %d,  but got data length %d", wantDataLen, haveDataLen)
+		log.Warningf("fusefs: Payload too small. Minimum data length required: %d, but got data length %d", wantDataLen, haveDataLen)
+		return linuxerr.EINVAL
+
 	}
 
 	// The response data is empty unless there is some payload. And so, doesn't
@@ -224,7 +223,6 @@ func (r *Response) UnmarshalPayload(m marshal.Marshallable) error {
 		return nil
 	}
 
-	// TODO(gVisor.dev/issue/3698): Use the unsafe version once go_marshal is safe to use again.
-	m.UnmarshalBytes(r.data[hdrLen:])
+	m.UnmarshalUnsafe(r.data[hdrLen:])
 	return nil
 }

@@ -25,42 +25,42 @@ import (
 
 // Int8 is a marshal.Marshallable implementation for int8.
 //
-// +marshal slice:Int8Slice:inner
+// +marshal boundCheck slice:Int8Slice:inner
 type Int8 int8
 
 // Uint8 is a marshal.Marshallable implementation for uint8.
 //
-// +marshal slice:Uint8Slice:inner
+// +marshal boundCheck slice:Uint8Slice:inner
 type Uint8 uint8
 
 // Int16 is a marshal.Marshallable implementation for int16.
 //
-// +marshal slice:Int16Slice:inner
+// +marshal boundCheck slice:Int16Slice:inner
 type Int16 int16
 
 // Uint16 is a marshal.Marshallable implementation for uint16.
 //
-// +marshal slice:Uint16Slice:inner
+// +marshal boundCheck slice:Uint16Slice:inner
 type Uint16 uint16
 
 // Int32 is a marshal.Marshallable implementation for int32.
 //
-// +marshal slice:Int32Slice:inner
+// +marshal boundCheck slice:Int32Slice:inner
 type Int32 int32
 
 // Uint32 is a marshal.Marshallable implementation for uint32.
 //
-// +marshal slice:Uint32Slice:inner
+// +marshal boundCheck slice:Uint32Slice:inner
 type Uint32 uint32
 
 // Int64 is a marshal.Marshallable implementation for int64.
 //
-// +marshal slice:Int64Slice:inner
+// +marshal boundCheck slice:Int64Slice:inner
 type Int64 int64
 
 // Uint64 is a marshal.Marshallable implementation for uint64.
 //
-// +marshal slice:Uint64Slice:inner
+// +marshal boundCheck slice:Uint64Slice:inner
 type Uint64 uint64
 
 // ByteSlice is a marshal.Marshallable implementation for []byte.
@@ -76,13 +76,13 @@ func (b *ByteSlice) SizeBytes() int {
 }
 
 // MarshalBytes implements marshal.Marshallable.MarshalBytes.
-func (b *ByteSlice) MarshalBytes(dst []byte) {
-	copy(dst, *b)
+func (b *ByteSlice) MarshalBytes(dst []byte) []byte {
+	return dst[copy(dst, *b):]
 }
 
 // UnmarshalBytes implements marshal.Marshallable.UnmarshalBytes.
-func (b *ByteSlice) UnmarshalBytes(src []byte) {
-	copy(*b, src)
+func (b *ByteSlice) UnmarshalBytes(src []byte) []byte {
+	return src[copy(*b, src):]
 }
 
 // Packed implements marshal.Marshallable.Packed.
@@ -91,13 +91,13 @@ func (b *ByteSlice) Packed() bool {
 }
 
 // MarshalUnsafe implements marshal.Marshallable.MarshalUnsafe.
-func (b *ByteSlice) MarshalUnsafe(dst []byte) {
-	b.MarshalBytes(dst)
+func (b *ByteSlice) MarshalUnsafe(dst []byte) []byte {
+	return b.MarshalBytes(dst)
 }
 
 // UnmarshalUnsafe implements marshal.Marshallable.UnmarshalUnsafe.
-func (b *ByteSlice) UnmarshalUnsafe(src []byte) {
-	b.UnmarshalBytes(src)
+func (b *ByteSlice) UnmarshalUnsafe(src []byte) []byte {
+	return b.UnmarshalBytes(src)
 }
 
 // CopyIn implements marshal.Marshallable.CopyIn.

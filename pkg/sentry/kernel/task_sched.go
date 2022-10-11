@@ -19,7 +19,6 @@ package kernel
 import (
 	"fmt"
 	"math/rand"
-	"sync/atomic"
 	"time"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
@@ -134,9 +133,9 @@ func (t *Task) accountTaskGoroutineEnter(state TaskGoroutineState) {
 }
 
 // Preconditions:
-// * The caller must be running on the task goroutine
-// * The caller must be leaving a state indicated by a previous call to
-//   t.accountTaskGoroutineEnter(state).
+//   - The caller must be running on the task goroutine
+//   - The caller must be leaving a state indicated by a previous call to
+//     t.accountTaskGoroutineEnter(state).
 func (t *Task) accountTaskGoroutineLeave(state TaskGoroutineState) {
 	if state != TaskGoroutineRunningApp {
 		// Task is unblocking/continuing.
@@ -186,7 +185,7 @@ func (t *Task) cpuStatsAt(now uint64) usage.CPUStats {
 	return usage.CPUStats{
 		UserTime:          time.Duration(tsched.userTicksAt(now) * uint64(linux.ClockTick)),
 		SysTime:           time.Duration(tsched.sysTicksAt(now) * uint64(linux.ClockTick)),
-		VoluntarySwitches: atomic.LoadUint64(&t.yieldCount),
+		VoluntarySwitches: t.yieldCount.Load(),
 	}
 }
 
@@ -205,7 +204,7 @@ func (tg *ThreadGroup) CPUStats() usage.CPUStats {
 }
 
 // Preconditions: Same as TaskGoroutineSchedInfo.userTicksAt, plus:
-// * The TaskSet mutex must be locked.
+//   - The TaskSet mutex must be locked.
 func (tg *ThreadGroup) cpuStatsAtLocked(now uint64) usage.CPUStats {
 	stats := tg.exitedCPUStats
 	// Account for live tasks.
@@ -352,20 +351,20 @@ func newKernelCPUClockTicker(k *Kernel) *kernelCPUClockTicker {
 	}
 }
 
-// Notify implements ktime.TimerListener.Notify.
-func (ticker *kernelCPUClockTicker) Notify(exp uint64, setting ktime.Setting) (ktime.Setting, bool) {
+// NotifyTimer implements ktime.TimerListener.NotifyTimer.
+func (ticker *kernelCPUClockTicker) NotifyTimer(exp uint64, setting ktime.Setting) (ktime.Setting, bool) {
 	// Only increment cpuClock by 1 regardless of the number of expirations.
 	// This approximately compensates for cases where thread throttling or bad
 	// Go runtime scheduling prevents the kernelCPUClockTicker goroutine, and
 	// presumably task goroutines as well, from executing for a long period of
 	// time. It's also necessary to prevent CPU clocks from seeing large
 	// discontinuous jumps.
-	now := atomic.AddUint64(&ticker.k.cpuClock, 1)
+	now := ticker.k.cpuClock.Add(1)
 
 	// Check thread group CPU timers.
 	tgs := ticker.k.tasks.Root.ThreadGroupsAppend(ticker.tgs)
 	for _, tg := range tgs {
-		if atomic.LoadUint32(&tg.cpuTimersEnabled) == 0 {
+		if tg.cpuTimersEnabled.Load() == 0 {
 			continue
 		}
 
@@ -451,11 +450,11 @@ func (ticker *kernelCPUClockTicker) Notify(exp uint64, setting ktime.Setting) (k
 	ticker.tgs = tgs[:0]
 
 	// If nothing is running, we can disable the timer.
-	tasks := atomic.LoadInt64(&ticker.k.runningTasks)
+	tasks := ticker.k.runningTasks.Load()
 	if tasks == 0 {
 		ticker.k.runningTasksMu.Lock()
 		defer ticker.k.runningTasksMu.Unlock()
-		tasks := atomic.LoadInt64(&ticker.k.runningTasks)
+		tasks := ticker.k.runningTasks.Load()
 		if tasks != 0 {
 			// Raced with a 0 -> 1 transition.
 			return setting, false
@@ -470,10 +469,6 @@ func (ticker *kernelCPUClockTicker) Notify(exp uint64, setting ktime.Setting) (k
 	}
 
 	return setting, false
-}
-
-// Destroy implements ktime.TimerListener.Destroy.
-func (ticker *kernelCPUClockTicker) Destroy() {
 }
 
 // randInt31n returns a random integer in [0, n).
@@ -526,9 +521,9 @@ func (t *Task) NotifyRlimitCPUUpdated() {
 func (tg *ThreadGroup) updateCPUTimersEnabledLocked() {
 	rlimitCPU := tg.limits.Get(limits.CPU)
 	if tg.itimerVirtSetting.Enabled || tg.itimerProfSetting.Enabled || tg.rlimitCPUSoftSetting.Enabled || rlimitCPU.Max != limits.Infinity {
-		atomic.StoreUint32(&tg.cpuTimersEnabled, 1)
+		tg.cpuTimersEnabled.Store(1)
 	} else {
-		atomic.StoreUint32(&tg.cpuTimersEnabled, 0)
+		tg.cpuTimersEnabled.Store(0)
 	}
 }
 
@@ -616,7 +611,7 @@ func (t *Task) SetCPUMask(mask sched.CPUSet) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.allowedCPUMask = mask
-	atomic.StoreInt32(&t.cpu, assignCPU(mask, rootTID))
+	t.cpu.Store(assignCPU(mask, rootTID))
 	return nil
 }
 
@@ -626,7 +621,7 @@ func (t *Task) CPU() int32 {
 		return int32(hostcpu.GetCPU())
 	}
 
-	return atomic.LoadInt32(&t.cpu)
+	return t.cpu.Load()
 }
 
 // assignCPU returns the virtualized CPU number for the task with global TID

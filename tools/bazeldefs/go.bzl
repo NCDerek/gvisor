@@ -11,8 +11,6 @@ go_embed_data = _go_embed_data
 
 go_path = _go_path
 
-bazel_worker_proto = "//tools/bazeldefs:worker_protocol_go_proto"
-
 def _go_proto_or_grpc_library(go_library_func, name, **kwargs):
     if "importpath" in kwargs:
         # If importpath is explicit, pass straight through.
@@ -59,9 +57,14 @@ def go_binary(name, static = False, pure = False, x_defs = None, system_malloc =
         kwargs["static"] = "on"
     if pure:
         kwargs["pure"] = "on"
+    gc_goopts = select({
+        "//conditions:default": kwargs.pop("gc_goopts", []),
+        "//tools:debug": kwargs.pop("gc_goopts", []) + ["-all=-N -l"],
+    })
     _go_binary(
         name = name,
         x_defs = x_defs,
+        gc_goopts = gc_goopts,
         **kwargs
     )
 
@@ -135,17 +138,13 @@ def go_context(ctx, goos = None, goarch = None, std = False):
     go_ctx = _go_context(ctx)
     if goos == None:
         goos = go_ctx.sdk.goos
-    elif goos != go_ctx.sdk.goos:
-        fail("Internal GOOS (%s) doesn't match GoSdk GOOS (%s)." % (goos, go_ctx.sdk.goos))
     if goarch == None:
         goarch = go_ctx.sdk.goarch
-    elif goarch != go_ctx.sdk.goarch:
-        fail("Internal GOARCH (%s) doesn't match GoSdk GOARCH (%s)." % (goarch, go_ctx.sdk.goarch))
     return struct(
         env = go_ctx.env,
         go = go_ctx.go,
-        goarch = go_ctx.sdk.goarch,
-        goos = go_ctx.sdk.goos,
+        goarch = goarch,
+        goos = goos,
         gotags = go_ctx.tags,
         nogo_args = [],
         runfiles = depset([go_ctx.go] + go_ctx.sdk.srcs + go_ctx.sdk.tools + go_ctx.stdlib.libs),
@@ -156,4 +155,11 @@ def select_goarch():
     return select_arch(amd64 = "amd64", arm64 = "arm64")
 
 def select_goos():
-    return select_system(linux = "linux")
+    return select_system(
+        linux = "linux",
+        darwin = "darwin",
+    )
+
+# Defined by rules_go.
+gotsan_values = None
+gotsan_flag_values = {"@io_bazel_rules_go//go/config:race": "true"}

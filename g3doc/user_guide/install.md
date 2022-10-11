@@ -26,19 +26,21 @@ To download and install the latest release manually follow these steps:
 
 To install gVisor as a Docker runtime, run the following commands:
 
-```bash
-/usr/local/bin/runsc install
-sudo systemctl reload docker
-docker run --rm --runtime=runsc hello-world
+```shell
+$ /usr/local/bin/runsc install
+$ sudo systemctl reload docker
+$ docker run --rm --runtime=runsc hello-world
 ```
 
 For more details about using gVisor with Docker, see
-[Docker Quick Start](./quick_start/docker.md)
+[Docker Quick Start](./quick_start/docker.md). Please read the
+[Production guide](/docs/user_guide/production/) before running such a setup for
+production purposes.
 
-Note: It is important to copy `runsc` to a location that is readable and
-executable to all users, since `runsc` executes itself as user `nobody` to avoid
-unnecessary privileges. The `/usr/local/bin` directory is a good place to put
-the `runsc` binary.
+> **Note**: It is important to copy `runsc` to a location that is readable and
+> executable to all users, since `runsc` executes itself as user `nobody` to
+> avoid unnecessary privileges. The `/usr/local/bin` directory is a good place
+> to put the `runsc` binary.
 
 ## Install from an `apt` repository
 
@@ -51,18 +53,17 @@ sudo apt-get install -y \
     apt-transport-https \
     ca-certificates \
     curl \
-    gnupg-agent \
-    software-properties-common
+    gnupg
 ```
 
 Next, configure the key used to sign archives and the repository.
 
 NOTE: The key was updated on 2021-07-13 to replace the expired key. If you get
-errors about the key being expired, run the `apt-key add` command below again.
+errors about the key being expired, run the `curl` command below again.
 
 ```bash
-curl -fsSL https://gvisor.dev/archive.key | sudo apt-key add -
-sudo add-apt-repository "deb [arch=amd64,arm64] https://storage.googleapis.com/gvisor/releases release main"
+curl -fsSL https://gvisor.dev/archive.key | sudo gpg --dearmor -o /usr/share/keyrings/gvisor-archive-keyring.gpg
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/gvisor-archive-keyring.gpg] https://storage.googleapis.com/gvisor/releases release main" | sudo tee /etc/apt/sources.list.d/gvisor.list > /dev/null
 ```
 
 Now the runsc package can be installed:

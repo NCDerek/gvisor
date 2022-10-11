@@ -30,7 +30,7 @@ func TestAddressableEndpointStateCleanup(t *testing.T) {
 	}
 
 	var s stack.AddressableEndpointState
-	s.Init(&ep)
+	s.Init(&ep, stack.AddressableEndpointStateOptions{HiddenWhileDisabled: false})
 
 	addr := tcpip.AddressWithPrefix{
 		Address:   "\x01",
@@ -38,9 +38,10 @@ func TestAddressableEndpointStateCleanup(t *testing.T) {
 	}
 
 	{
-		ep, err := s.AddAndAcquirePermanentAddress(addr, stack.NeverPrimaryEndpoint, stack.AddressConfigStatic, false /* deprecated */)
+		properties := stack.AddressProperties{PEB: stack.NeverPrimaryEndpoint}
+		ep, err := s.AddAndAcquirePermanentAddress(addr, properties)
 		if err != nil {
-			t.Fatalf("s.AddAndAcquirePermanentAddress(%s, %d, %d, false): %s", addr, stack.NeverPrimaryEndpoint, stack.AddressConfigStatic, err)
+			t.Fatalf("s.AddAndAcquirePermanentAddress(%s, %+v): %s", addr, properties, err)
 		}
 		// We don't need the address endpoint.
 		ep.DecRef()

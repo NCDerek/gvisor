@@ -388,8 +388,6 @@ PosixErrorOr<size_t> PollAndReadFd(int fd, void* buf, size_t count,
 }
 
 TEST(PtyTrunc, Truncate) {
-  SKIP_IF(IsRunningWithVFS1());
-
   // setsid either puts us in a new session or fails because we're already the
   // session leader. Either way, this ensures we're the session leader and have
   // no controlling terminal.
@@ -479,7 +477,6 @@ TEST(BasicPtyTest, OpenMasterReplica) {
 }
 
 TEST(BasicPtyTest, OpenSetsControllingTTY) {
-  SKIP_IF(IsRunningWithVFS1());
   // setsid either puts us in a new session or fails because we're already the
   // session leader. Either way, this ensures we're the session leader.
   ASSERT_THAT(setsid(), AnyOf(SyscallSucceeds(), SyscallFailsWithErrno(EPERM)));
@@ -506,7 +503,6 @@ TEST(BasicPtyTest, OpenSetsControllingTTY) {
 }
 
 TEST(BasicPtyTest, OpenMasterDoesNotSetsControllingTTY) {
-  SKIP_IF(IsRunningWithVFS1());
   // setsid either puts us in a new session or fails because we're already the
   // session leader. Either way, this ensures we're the session leader.
   ASSERT_THAT(setsid(), AnyOf(SyscallSucceeds(), SyscallFailsWithErrno(EPERM)));
@@ -518,7 +514,6 @@ TEST(BasicPtyTest, OpenMasterDoesNotSetsControllingTTY) {
 }
 
 TEST(BasicPtyTest, OpenNOCTTY) {
-  SKIP_IF(IsRunningWithVFS1());
   // setsid either puts us in a new session or fails because we're already the
   // session leader. Either way, this ensures we're the session leader.
   ASSERT_THAT(setsid(), AnyOf(SyscallSucceeds(), SyscallFailsWithErrno(EPERM)));
@@ -1125,7 +1120,10 @@ TEST_F(PtyTest, TermiosICANONEOF) {
   ExpectReadable(replica_, sizeof(input), buf);
   EXPECT_STREQ(buf, "abc");
 
-  ExpectFinished(replica_);
+  // New Linux kernels can return zero.
+  EXPECT_THAT(
+      ReadFd(replica_.get(), buf, 1),
+      AnyOf(SyscallSucceedsWithValue(0), SyscallFailsWithErrno(EAGAIN)));
 }
 
 // ICANON limits us to 4096 bytes including a terminating character. Anything
@@ -1658,6 +1656,11 @@ TEST_F(JobControlTest, SetForegroundProcessGroupSIGTTOUBackground) {
     int wstatus;
     TEST_PCHECK(waitpid(grandchild, &wstatus, WSTOPPED) == grandchild);
     TEST_PCHECK(WSTOPSIG(wstatus) == SIGTTOU);
+
+    // The child's `tcsetpgrp` got signalled and so should not have
+    // taken effect. Verify that.
+    TEST_PCHECK(tcgetpgrp(replica_.get()) == getpid());
+    EXPECT_THAT(kill(grandchild, SIGKILL), SyscallSucceeds());
   });
   ASSERT_NO_ERRNO(res);
 }
@@ -1704,11 +1707,20 @@ TEST_F(JobControlTest, SetForegroundProcessGroupSIGTTOUBlocked) {
       sigset_t signal_set;
       sigemptyset(&signal_set);
       sigaddset(&signal_set, SIGTTOU);
+      // Block SIGTTIN as well, to make sure that the kernel isn't
+      // checking for "blocked == [SIGTTOU]" (see issue 7941 for
+      // context).
+      sigaddset(&signal_set, SIGTTIN);
       sigprocmask(SIG_BLOCK, &signal_set, NULL);
       // Assign a different pgid to the child so it will result as
       // a background process.
       TEST_PCHECK(!setpgid(grandchild, getpid()));
       TEST_PCHECK(!tcsetpgrp(replica_.get(), getpgid(0)));
+      // Unmask the signals to make sure we still don't get
+      // signaled. That would happen if `tcsetpgrp` enqueued the
+      // signal through the mask -- we would not yet have received it,
+      // because of the mask.
+      sigprocmask(SIG_UNBLOCK, &signal_set, NULL);
       _exit(0);
     }
     int wstatus;

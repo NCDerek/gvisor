@@ -12,14 +12,17 @@ go_library(
     ],
     visibility = ["//visibility:public"],
     deps = [
+        "//pkg/atomicbitops",
+        "//pkg/bufferv2",
         "//pkg/sync",
         "//pkg/tcpip",
-        "//pkg/tcpip/buffer",
+        "//pkg/tcpip/checksum",
         "//pkg/tcpip/header",
         "//pkg/tcpip/header/parse",
         "//pkg/tcpip/network/hash",
         "//pkg/tcpip/network/internal/fragmentation",
         "//pkg/tcpip/network/internal/ip",
+        "//pkg/tcpip/network/internal/multicast",
         "//pkg/tcpip/stack",
     ],
 )
@@ -30,12 +33,16 @@ go_test(
     srcs = [
         "igmp_test.go",
         "ipv4_test.go",
+        "main_test.go",
     ],
     deps = [
+        "//pkg/bufferv2",
+        "//pkg/refs",
+        "//pkg/refsvfs2",
         "//pkg/sync",
         "//pkg/tcpip",
-        "//pkg/tcpip/buffer",
         "//pkg/tcpip/checker",
+        "//pkg/tcpip/checksum",
         "//pkg/tcpip/faketime",
         "//pkg/tcpip/header",
         "//pkg/tcpip/link/channel",
@@ -43,6 +50,7 @@ go_test(
         "//pkg/tcpip/network/arp",
         "//pkg/tcpip/network/internal/testutil",
         "//pkg/tcpip/network/ipv4",
+        "//pkg/tcpip/prependable",
         "//pkg/tcpip/stack",
         "//pkg/tcpip/testutil",
         "//pkg/tcpip/transport/icmp",
@@ -51,6 +59,7 @@ go_test(
         "//pkg/tcpip/transport/udp",
         "//pkg/waiter",
         "@com_github_google_go_cmp//cmp:go_default_library",
+        "@com_github_google_go_cmp//cmp/cmpopts:go_default_library",
     ],
 )
 

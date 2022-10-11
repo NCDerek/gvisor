@@ -40,10 +40,12 @@ type DynamicBytesFile struct {
 	InodeNoopRefCount
 	InodeNotDirectory
 	InodeNotSymlink
+	InodeWatches
 
 	locks vfs.FileLocks
 	// data can additionally implement vfs.WritableDynamicBytesSource to support
-	// writes.
+	// writes. This field cannot be changed to a different bytes source after
+	// Init.
 	data vfs.DynamicBytesSource
 }
 
@@ -74,6 +76,16 @@ func (*DynamicBytesFile) SetStat(context.Context, *vfs.Filesystem, *auth.Credent
 	return linuxerr.EPERM
 }
 
+// Locks returns the file locks for this file.
+func (f *DynamicBytesFile) Locks() *vfs.FileLocks {
+	return &f.locks
+}
+
+// Data returns the underlying data source.
+func (f *DynamicBytesFile) Data() vfs.DynamicBytesSource {
+	return f.data
+}
+
 // DynamicBytesFD implements vfs.FileDescriptionImpl for an FD backed by a
 // DynamicBytesFile.
 //
@@ -96,7 +108,7 @@ func (fd *DynamicBytesFD) Init(m *vfs.Mount, d *Dentry, data vfs.DynamicBytesSou
 		return err
 	}
 	fd.inode = d.inode
-	fd.SetDataSource(data)
+	fd.DynamicBytesFileDescriptionImpl.Init(&fd.vfsfd, data)
 	return nil
 }
 

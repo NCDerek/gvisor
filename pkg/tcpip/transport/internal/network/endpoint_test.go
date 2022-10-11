@@ -16,11 +16,14 @@ package network_test
 
 import (
 	"fmt"
+	"os"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	"gvisor.dev/gvisor/pkg/bufferv2"
+	"gvisor.dev/gvisor/pkg/refs"
+	"gvisor.dev/gvisor/pkg/refsvfs2"
 	"gvisor.dev/gvisor/pkg/tcpip"
-	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/checker"
 	"gvisor.dev/gvisor/pkg/tcpip/faketime"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
@@ -33,6 +36,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/transport"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/internal/network"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
+	"gvisor.dev/gvisor/pkg/waiter"
 )
 
 var (
@@ -45,17 +49,17 @@ var (
 func TestEndpointStateTransitions(t *testing.T) {
 	const nicID = 1
 
-	data := buffer.View([]byte{1, 2, 4, 5})
-	v4Checker := func(t *testing.T, b buffer.View) {
-		checker.IPv4(t, b,
+	data := []byte{1, 2, 4, 5}
+	v4Checker := func(t *testing.T, v *bufferv2.View) {
+		checker.IPv4(t, v,
 			checker.SrcAddr(ipv4NICAddr),
 			checker.DstAddr(ipv4RemoteAddr),
 			checker.IPPayload(data),
 		)
 	}
 
-	v6Checker := func(t *testing.T, b buffer.View) {
-		checker.IPv6(t, b,
+	v6Checker := func(t *testing.T, v *bufferv2.View) {
+		checker.IPv6(t, v,
 			checker.SrcAddr(ipv6NICAddr),
 			checker.DstAddr(ipv6RemoteAddr),
 			checker.IPPayload(data),
@@ -72,7 +76,7 @@ func TestEndpointStateTransitions(t *testing.T) {
 		expectedBoundAddr       tcpip.Address
 		remoteAddr              tcpip.Address
 		expectedRemoteAddr      tcpip.Address
-		checker                 func(*testing.T, buffer.View)
+		checker                 func(*testing.T, *bufferv2.View)
 	}{
 		{
 			name:                    "IPv4",
@@ -124,11 +128,20 @@ func TestEndpointStateTransitions(t *testing.T) {
 				t.Fatalf("s.CreateNIC(%d, _): %s", nicID, err)
 			}
 
-			if err := s.AddAddress(nicID, ipv4.ProtocolNumber, ipv4NICAddr); err != nil {
-				t.Fatalf("s.AddAddress(%d, %d, %s): %s", nicID, ipv4.ProtocolNumber, ipv4NICAddr, err)
+			ipv4ProtocolAddr := tcpip.ProtocolAddress{
+				Protocol:          ipv4.ProtocolNumber,
+				AddressWithPrefix: ipv4NICAddr.WithPrefix(),
 			}
-			if err := s.AddAddress(nicID, ipv6.ProtocolNumber, ipv6NICAddr); err != nil {
-				t.Fatalf("s.AddAddress(%d, %d, %s): %s", nicID, ipv6.ProtocolNumber, ipv6NICAddr, err)
+			if err := s.AddProtocolAddress(nicID, ipv4ProtocolAddr, stack.AddressProperties{}); err != nil {
+				t.Fatalf("s.AddProtocolAddress(%d, %+v, {}: %s", nicID, ipv4ProtocolAddr, err)
+			}
+			ipv6ProtocolAddr := tcpip.ProtocolAddress{
+				Protocol:          ipv6.ProtocolNumber,
+				AddressWithPrefix: ipv6NICAddr.WithPrefix(),
+			}
+
+			if err := s.AddProtocolAddress(nicID, ipv6ProtocolAddr, stack.AddressProperties{}); err != nil {
+				t.Fatalf("s.AddProtocolAddress(%d, %+v, {}): %s", nicID, ipv6ProtocolAddr, err)
 			}
 
 			s.SetRouteTable([]tcpip.Route{
@@ -138,7 +151,8 @@ func TestEndpointStateTransitions(t *testing.T) {
 
 			var ops tcpip.SocketOptions
 			var ep network.Endpoint
-			ep.Init(s, test.netProto, udp.ProtocolNumber, &ops)
+			var wq waiter.Queue
+			ep.Init(s, test.netProto, udp.ProtocolNumber, &ops, &wq)
 			defer ep.Close()
 			if state := ep.State(); state != transport.DatagramEndpointStateInitial {
 				t.Fatalf("got ep.State() = %s, want = %s", state, transport.DatagramEndpointStateInitial)
@@ -189,16 +203,21 @@ func TestEndpointStateTransitions(t *testing.T) {
 			}, info); diff != "" {
 				t.Errorf("write packet info mismatch (-want +got):\n%s", diff)
 			}
-			if err := ctx.WritePacket(stack.NewPacketBuffer(stack.PacketBufferOptions{
+			injectPkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
 				ReserveHeaderBytes: int(info.MaxHeaderLength),
-				Data:               data.ToVectorisedView(),
-			}), false /* headerIncluded */); err != nil {
+				Payload:            bufferv2.MakeWithData(data),
+			})
+			defer injectPkt.DecRef()
+			if err := ctx.WritePacket(injectPkt, false /* headerIncluded */); err != nil {
 				t.Fatalf("ctx.WritePacket(_, false): %s", err)
 			}
-			if pkt, ok := e.Read(); !ok {
+			if pkt := e.Read(); pkt.IsNil() {
 				t.Fatalf("expected packet to be read from link endpoint")
 			} else {
-				test.checker(t, stack.PayloadSince(pkt.Pkt.NetworkHeader()))
+				payload := stack.PayloadSince(pkt.NetworkHeader())
+				defer payload.Release()
+				test.checker(t, payload)
+				pkt.DecRef()
 			}
 
 			ep.Close()
@@ -257,16 +276,25 @@ func TestBindNICID(t *testing.T) {
 						t.Fatalf("s.CreateNIC(%d, _): %s", nicID, err)
 					}
 
-					if err := s.AddAddress(nicID, ipv4.ProtocolNumber, ipv4NICAddr); err != nil {
-						t.Fatalf("s.AddAddress(%d, %d, %s): %s", nicID, ipv4.ProtocolNumber, ipv4NICAddr, err)
+					ipv4ProtocolAddr := tcpip.ProtocolAddress{
+						Protocol:          ipv4.ProtocolNumber,
+						AddressWithPrefix: ipv4NICAddr.WithPrefix(),
 					}
-					if err := s.AddAddress(nicID, ipv6.ProtocolNumber, ipv6NICAddr); err != nil {
-						t.Fatalf("s.AddAddress(%d, %d, %s): %s", nicID, ipv6.ProtocolNumber, ipv6NICAddr, err)
+					if err := s.AddProtocolAddress(nicID, ipv4ProtocolAddr, stack.AddressProperties{}); err != nil {
+						t.Fatalf("s.AddProtocolAddress(%d, %+v, {}): %s", nicID, ipv4ProtocolAddr, err)
+					}
+					ipv6ProtocolAddr := tcpip.ProtocolAddress{
+						Protocol:          ipv6.ProtocolNumber,
+						AddressWithPrefix: ipv6NICAddr.WithPrefix(),
+					}
+					if err := s.AddProtocolAddress(nicID, ipv6ProtocolAddr, stack.AddressProperties{}); err != nil {
+						t.Fatalf("s.AddProtocolAddress(%d, %+v, {}): %s", nicID, ipv6ProtocolAddr, err)
 					}
 
 					var ops tcpip.SocketOptions
 					var ep network.Endpoint
-					ep.Init(s, test.netProto, udp.ProtocolNumber, &ops)
+					var wq waiter.Queue
+					ep.Init(s, test.netProto, udp.ProtocolNumber, &ops, &wq)
 					defer ep.Close()
 					if ep.WasBound() {
 						t.Fatal("got ep.WasBound() = true, want = false")
@@ -298,4 +326,11 @@ func TestBindNICID(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestMain(m *testing.M) {
+	refs.SetLeakMode(refs.LeaksPanic)
+	code := m.Run()
+	refsvfs2.DoLeakCheck()
+	os.Exit(code)
 }

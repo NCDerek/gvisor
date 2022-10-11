@@ -16,7 +16,6 @@ package fuse
 
 import (
 	"io"
-	"sync/atomic"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
@@ -34,7 +33,7 @@ import (
 // We do not support direct IO (which read the exact number of bytes)
 // at this moment.
 func (fs *filesystem) ReadInPages(ctx context.Context, fd *regularFileFD, off uint64, size uint32) ([][]byte, uint32, error) {
-	attributeVersion := atomic.LoadUint64(&fs.conn.attributeVersion)
+	attributeVersion := fs.conn.attributeVersion.Load()
 
 	t := kernel.TaskFromContext(ctx)
 	if t == nil {
@@ -138,10 +137,9 @@ func (fs *filesystem) ReadCallback(ctx context.Context, fd *regularFileFD, off u
 		// Update existing size.
 		newSize := off + uint64(sizeRead)
 		fs.conn.mu.Lock()
-		if attributeVersion == i.attributeVersion && newSize < atomic.LoadUint64(&i.size) {
-			fs.conn.attributeVersion++
-			i.attributeVersion = i.fs.conn.attributeVersion
-			atomic.StoreUint64(&i.size, newSize)
+		if attributeVersion == i.attributeVersion.Load() && newSize < i.size.Load() {
+			i.attributeVersion.Store(i.fs.conn.attributeVersion.Add(1))
+			i.size.Store(newSize)
 		}
 		fs.conn.mu.Unlock()
 	}
@@ -165,14 +163,16 @@ func (fs *filesystem) Write(ctx context.Context, fd *regularFileFD, off uint64, 
 	}
 
 	// Reuse the same struct for unmarshalling to avoid unnecessary memory allocation.
-	in := linux.FUSEWriteIn{
-		Fh: fd.Fh,
-		// TODO(gvisor.dev/issue/3245): file lock
-		LockOwner: 0,
-		// TODO(gvisor.dev/issue/3245): |= linux.FUSE_READ_LOCKOWNER
-		// TODO(gvisor.dev/issue/3237): |= linux.FUSE_WRITE_CACHE (not added yet)
-		WriteFlags: 0,
-		Flags:      fd.statusFlags(),
+	in := linux.FUSEWritePayloadIn{
+		Header: linux.FUSEWriteIn{
+			Fh: fd.Fh,
+			// TODO(gvisor.dev/issue/3245): file lock
+			LockOwner: 0,
+			// TODO(gvisor.dev/issue/3245): |= linux.FUSE_READ_LOCKOWNER
+			// TODO(gvisor.dev/issue/3237): |= linux.FUSE_WRITE_CACHE (not added yet)
+			WriteFlags: 0,
+			Flags:      fd.statusFlags(),
+		},
 	}
 
 	inode := fd.inode()
@@ -197,11 +197,11 @@ func (fs *filesystem) Write(ctx context.Context, fd *regularFileFD, off uint64, 
 			toWrite = maxWrite
 		}
 
-		in.Offset = off + uint64(written)
-		in.Size = toWrite
+		in.Header.Offset = off + uint64(written)
+		in.Header.Size = toWrite
+		in.Payload = data[written : written+toWrite]
 
 		req := fs.conn.NewRequest(auth.CredentialsFromContext(ctx), uint32(t.ThreadID()), inode.nodeID, linux.FUSE_WRITE, &in)
-		req.payload = data[written : written+toWrite]
 
 		// TODO(gvisor.dev/issue/3247): support async write.
 

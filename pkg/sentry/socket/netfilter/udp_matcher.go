@@ -59,7 +59,7 @@ func (udpMarshaler) unmarshal(_ *kernel.Task, buf []byte, filter stack.IPHeaderF
 	// For alignment reasons, the match's total size may exceed what's
 	// strictly necessary to hold matchData.
 	var matchData linux.XTUDP
-	matchData.UnmarshalUnsafe(buf[:matchData.SizeBytes()])
+	matchData.UnmarshalUnsafe(buf)
 	nflog("parseMatchers: parsed XTUDP: %+v", matchData)
 
 	if matchData.InverseFlags != 0 {
@@ -92,10 +92,10 @@ func (*UDPMatcher) name() string {
 }
 
 // Match implements Matcher.Match.
-func (um *UDPMatcher) Match(hook stack.Hook, pkt *stack.PacketBuffer, _, _ string) (bool, bool) {
+func (um *UDPMatcher) Match(hook stack.Hook, pkt stack.PacketBufferPtr, _, _ string) (bool, bool) {
 	switch pkt.NetworkProtocolNumber {
 	case header.IPv4ProtocolNumber:
-		netHeader := header.IPv4(pkt.NetworkHeader().View())
+		netHeader := header.IPv4(pkt.NetworkHeader().Slice())
 		if netHeader.TransportProtocol() != header.UDPProtocolNumber {
 			return false, false
 		}
@@ -112,7 +112,7 @@ func (um *UDPMatcher) Match(hook stack.Hook, pkt *stack.PacketBuffer, _, _ strin
 		// As in Linux, we do not perform an IPv6 fragment check. See
 		// xt_action_param.fragoff in
 		// include/linux/netfilter/x_tables.h.
-		if header.IPv6(pkt.NetworkHeader().View()).TransportProtocol() != header.UDPProtocolNumber {
+		if header.IPv6(pkt.NetworkHeader().Slice()).TransportProtocol() != header.UDPProtocolNumber {
 			return false, false
 		}
 
@@ -121,7 +121,7 @@ func (um *UDPMatcher) Match(hook stack.Hook, pkt *stack.PacketBuffer, _, _ strin
 		return false, false
 	}
 
-	udpHeader := header.UDP(pkt.TransportHeader().View())
+	udpHeader := header.UDP(pkt.TransportHeader().Slice())
 	if len(udpHeader) < header.UDPMinimumSize {
 		// There's no valid UDP header here, so we drop the packet immediately.
 		return false, true

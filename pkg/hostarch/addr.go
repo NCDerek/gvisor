@@ -123,3 +123,26 @@ func PageRoundUp(x uint64) (addr uint64, ok bool) {
 	ok = addr >= x
 	return
 }
+
+// ToPages returns number of Pages for x.
+// x is rounded up to the nearest page boundary.
+func ToPages(x uint64) (uint64, bool) {
+	xRoundedUp, ok := PageRoundUp(x)
+	if !ok {
+		return 0, false
+	}
+	return xRoundedUp / PageSize, true
+}
+
+// CacheLineRoundDown returns the offset rounded down to the nearest cache line boundary.
+func CacheLineRoundDown(x uint64) uint64 {
+	return x & ^uint64(CacheLineSize-1)
+}
+
+// CacheLineRoundUp returns the offset rounded up to the nearest cache line boundary. ok is true iff
+// rounding up did not wrap around.
+func CacheLineRoundUp(x uint64) (val uint64, ok bool) {
+	val = CacheLineRoundDown(x + uint64(CacheLineSize-1))
+	ok = val >= x
+	return
+}

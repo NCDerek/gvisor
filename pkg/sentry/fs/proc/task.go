@@ -114,6 +114,7 @@ func (p *proc) newTaskDir(ctx context.Context, t *kernel.Task, msrc *fs.MountSou
 		"ns":            newNamespaceDir(ctx, t, msrc),
 		"oom_score":     newOOMScore(ctx, msrc),
 		"oom_score_adj": newOOMScoreAdj(ctx, t, msrc),
+		"root":          newRoot(ctx, t, msrc),
 		"smaps":         newSmaps(ctx, t, msrc),
 		"stat":          newTaskStat(ctx, t, msrc, isThreadGroup, p.pidns),
 		"statm":         newStatm(ctx, t, msrc),
@@ -354,6 +355,49 @@ func (e *cwd) Readlink(ctx context.Context, inode *fs.Inode) (string, error) {
 	defer root.DecRef(ctx)
 
 	name, _ := cwd.FullName(root)
+	return name, nil
+}
+
+// root is an fs.InodeOperations symlink for the /proc/PID/root file.
+//
+// +stateify savable
+type root struct {
+	ramfs.Symlink
+
+	t *kernel.Task
+}
+
+func newRoot(ctx context.Context, t *kernel.Task, msrc *fs.MountSource) *fs.Inode {
+	rootSymlink := &root{
+		Symlink: *ramfs.NewSymlink(ctx, fs.RootOwner, ""),
+		t:       t,
+	}
+	return newProcInode(ctx, rootSymlink, msrc, fs.Symlink, t)
+}
+
+// Readlink implements fs.InodeOperations.
+func (e *root) Readlink(ctx context.Context, inode *fs.Inode) (string, error) {
+	if !kernel.ContextCanTrace(ctx, e.t, false) {
+		return "", linuxerr.EACCES
+	}
+	if err := checkTaskState(e.t); err != nil {
+		return "", err
+	}
+	root := e.t.FSContext().RootDirectory()
+	if root == nil {
+		// It could have raced with process deletion.
+		return "", linuxerr.ESRCH
+	}
+	defer root.DecRef(ctx)
+
+	fsRoot := fs.RootFromContext(ctx)
+	if fsRoot == nil {
+		// It could have raced with process deletion.
+		return "", linuxerr.ESRCH
+	}
+	defer fsRoot.DecRef(ctx)
+
+	name, _ := root.FullName(fsRoot)
 	return name, nil
 }
 
@@ -774,13 +818,13 @@ func (i *ioData) ReadSeqFileData(ctx context.Context, h seqfile.SeqHandle) ([]se
 	io.Accumulate(i.IOUsage())
 
 	var buf bytes.Buffer
-	fmt.Fprintf(&buf, "rchar: %d\n", io.CharsRead)
-	fmt.Fprintf(&buf, "wchar: %d\n", io.CharsWritten)
-	fmt.Fprintf(&buf, "syscr: %d\n", io.ReadSyscalls)
-	fmt.Fprintf(&buf, "syscw: %d\n", io.WriteSyscalls)
-	fmt.Fprintf(&buf, "read_bytes: %d\n", io.BytesRead)
-	fmt.Fprintf(&buf, "write_bytes: %d\n", io.BytesWritten)
-	fmt.Fprintf(&buf, "cancelled_write_bytes: %d\n", io.BytesWriteCancelled)
+	fmt.Fprintf(&buf, "rchar: %d\n", io.CharsRead.Load())
+	fmt.Fprintf(&buf, "wchar: %d\n", io.CharsWritten.Load())
+	fmt.Fprintf(&buf, "syscr: %d\n", io.ReadSyscalls.Load())
+	fmt.Fprintf(&buf, "syscw: %d\n", io.WriteSyscalls.Load())
+	fmt.Fprintf(&buf, "read_bytes: %d\n", io.BytesRead.Load())
+	fmt.Fprintf(&buf, "write_bytes: %d\n", io.BytesWritten.Load())
+	fmt.Fprintf(&buf, "cancelled_write_bytes: %d\n", io.BytesWriteCancelled.Load())
 
 	return []seqfile.SeqData{{Buf: buf.Bytes(), Handle: (*ioData)(nil)}}, 0
 }

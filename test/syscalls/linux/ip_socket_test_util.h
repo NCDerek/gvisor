@@ -115,25 +115,6 @@ SocketKind IPv4TCPUnboundSocket(int type);
 // created with AF_INET6, SOCK_STREAM, IPPROTO_TCP and the given type.
 SocketKind IPv6TCPUnboundSocket(int type);
 
-// IfAddrHelper is a helper class that determines the local interfaces present
-// and provides functions to obtain their names, index numbers, and IP address.
-class IfAddrHelper {
- public:
-  IfAddrHelper() : ifaddr_(nullptr) {}
-  ~IfAddrHelper() { Release(); }
-
-  PosixError Load();
-  void Release();
-
-  std::vector<std::string> InterfaceList(int family) const;
-
-  const sockaddr* GetAddr(int family, std::string name) const;
-  PosixErrorOr<int> GetIndex(std::string name) const;
-
- private:
-  struct ifaddrs* ifaddr_;
-};
-
 // GetAddr4Str returns the given IPv4 network address structure as a string.
 std::string GetAddr4Str(const in_addr* a);
 
@@ -143,6 +124,57 @@ std::string GetAddr6Str(const in6_addr* a);
 // GetAddrStr returns the given IPv4 or IPv6 network address structure as a
 // string.
 std::string GetAddrStr(const sockaddr* a);
+
+// RecvTOS attempts to read buf_size bytes into buf, and then updates buf_size
+// with the numbers of bytes actually read. It expects the IP_TOS cmsg to be
+// received. The buffer must already be allocated with at least buf_size size.
+void RecvTOS(int sock, char buf[], size_t* buf_size, uint8_t* out_tos);
+
+// SendTOS sends a message using buf as payload and tos as IP_TOS control
+// message.
+void SendTOS(int sock, char buf[], size_t buf_size, uint8_t tos);
+
+// RecvTClass attempts to read buf_size bytes into buf, and then updates
+// buf_size with the numbers of bytes actually read. It expects the IPV6_TCLASS
+// cmsg to be received. The buffer must already be allocated with at least
+// buf_size size.
+void RecvTClass(int sock, char buf[], size_t* buf_size, int* out_tclass);
+
+// SendTClass sends a message using buf as payload and tclass as IP_TOS control
+// message.
+void SendTClass(int sock, char buf[], size_t buf_size, int tclass);
+
+// RecvTTL attempts to read buf_size bytes into buf, and then updates buf_size
+// with the numbers of bytes actually read. It expects the IP_TTL cmsg to be
+// received. The buffer must already be allocated with at least buf_size size.
+void RecvTTL(int sock, char buf[], size_t* buf_size, int* out_ttl);
+
+// SendTTL sends a message using buf as payload and ttl as IP_TOS control
+// message.
+void SendTTL(int sock, char buf[], size_t buf_size, int ttl);
+
+// RecvHopLimit attempts to read buf_size bytes into buf, and then updates
+// buf_size with the numbers of bytes actually read. It expects the
+// IPV6_HOPLIMIT cmsg to be received. The buffer must already be allocated with
+// at least buf_size size.
+void RecvHopLimit(int sock, char buf[], size_t* buf_size, int* out_hoplimit);
+
+// SendHopLimit sends a message using buf as payload and hoplimit as IP_HOPLIMIT
+// control message.
+void SendHopLimit(int sock, char buf[], size_t buf_size, int hoplimit);
+// RecvPktInfo attempts to read buf_size bytes into buf, and then updates
+// buf_size with the numbers of bytes actually read. It expects the
+// IP_PKTINFO cmsg to be received. The buffer must already be allocated with
+// at least buf_size size.
+void RecvPktInfo(int sock, char buf[], size_t* buf_size,
+                 in_pktinfo* out_pktinfo);
+
+// RecvIPv6PktInfo attempts to read buf_size bytes into buf, and then updates
+// buf_size with the numbers of bytes actually read. It expects the
+// IPV6_PKTINFO cmsg to be received. The buffer must already be allocated with
+// at least buf_size size.
+void RecvIPv6PktInfo(int sock, char buf[], size_t* buf_size,
+                     in6_pktinfo* out_pktinfo);
 
 }  // namespace testing
 }  // namespace gvisor

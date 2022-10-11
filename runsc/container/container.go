@@ -35,19 +35,22 @@ import (
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/control"
-	"gvisor.dev/gvisor/pkg/sentry/sighandling"
+	"gvisor.dev/gvisor/pkg/sighandling"
 	"gvisor.dev/gvisor/runsc/boot"
 	"gvisor.dev/gvisor/runsc/cgroup"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/console"
+	"gvisor.dev/gvisor/runsc/donation"
 	"gvisor.dev/gvisor/runsc/sandbox"
 	"gvisor.dev/gvisor/runsc/specutils"
 )
 
+const cgroupParentAnnotation = "dev.gvisor.spec.cgroup-parent"
+
 // validateID validates the container id.
 func validateID(id string) error {
 	// See libcontainer/factory_linux.go.
-	idRegex := regexp.MustCompile(`^[\w+-\.]+$`)
+	idRegex := regexp.MustCompile(`^[\w+\.-]+$`)
 	if !idRegex.MatchString(id) {
 		return fmt.Errorf("invalid container id: %v", id)
 	}
@@ -112,6 +115,16 @@ type Container struct {
 	// Sandbox is the sandbox this container is running in. It's set when the
 	// container is created and reset when the sandbox is destroyed.
 	Sandbox *sandbox.Sandbox `json:"sandbox"`
+
+	// CompatCgroup has the cgroup configuration for the container. For the single
+	// container case, container cgroup is set in `c.Sandbox` only. CompactCgroup
+	// is only set for multi-container, where the `c.Sandbox` cgroup represents
+	// the entire pod.
+	//
+	// Note that CompatCgroup is created only for compatibility with tools
+	// that expect container cgroups to exist. Setting limits here makes no change
+	// to the container in question.
+	CompatCgroup cgroup.CgroupJSON `json:"compatCgroup"`
 
 	// Saver handles load from/save to the state file safely from multiple
 	// processes.
@@ -206,7 +219,7 @@ func New(conf *config.Config, args Args) (*Container, error) {
 	// Lock the container metadata file to prevent concurrent creations of
 	// containers with the same id.
 	if err := c.Saver.lockForNew(); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("cannot lock container metadata file: %w", err)
 	}
 	defer c.Saver.unlockOrDie()
 
@@ -231,32 +244,22 @@ func New(conf *config.Config, args Args) (*Container, error) {
 		if args.Spec.Linux.CgroupsPath == "" && !conf.TestOnlyAllowRunAsCurrentUserWithoutChroot {
 			args.Spec.Linux.CgroupsPath = "/" + args.ID
 		}
-		// Create and join cgroup before processes are created to ensure they are
-		// part of the cgroup from the start (and all their children processes).
-		cg, err := cgroup.NewFromSpec(args.Spec)
-		if err != nil {
-			return nil, err
-		}
-		if cg != nil {
-			// TODO(gvisor.dev/issue/3481): Remove when cgroups v2 is supported.
-			if !conf.Rootless && cgroup.IsOnlyV2() {
-				return nil, fmt.Errorf("cgroups V2 is not yet supported. Enable cgroups V1 and retry")
-			}
-			// If there is cgroup config, install it before creating sandbox process.
-			if err := cg.Install(args.Spec.Linux.Resources); err != nil {
-				switch {
-				case errors.Is(err, unix.EACCES) && conf.Rootless:
-					log.Warningf("Skipping cgroup configuration in rootless mode: %v", err)
-					cg = nil
-				default:
-					return nil, fmt.Errorf("configuring cgroup: %v", err)
-				}
+		var subCgroup, parentCgroup cgroup.Cgroup
+		if !conf.IgnoreCgroups {
+			var err error
+
+			// Create and join cgroup before processes are created to ensure they are
+			// part of the cgroup from the start (and all their children processes).
+			parentCgroup, subCgroup, err = c.setupCgroupForRoot(conf, args.Spec)
+			if err != nil {
+				return nil, fmt.Errorf("cannot set up cgroup for root: %w", err)
 			}
 		}
-		if err := runInCgroup(cg, func() error {
+		c.CompatCgroup = cgroup.CgroupJSON{Cgroup: subCgroup}
+		if err := runInCgroup(parentCgroup, func() error {
 			ioFiles, specFile, err := c.createGoferProcess(args.Spec, conf, args.BundleDir, args.Attached)
 			if err != nil {
-				return err
+				return fmt.Errorf("cannot create gofer process: %w", err)
 			}
 
 			// Start a new sandbox for this container. Any errors after this point
@@ -269,12 +272,12 @@ func New(conf *config.Config, args Args) (*Container, error) {
 				UserLog:       args.UserLog,
 				IOFiles:       ioFiles,
 				MountsFile:    specFile,
-				Cgroup:        cg,
+				Cgroup:        parentCgroup,
 				Attached:      args.Attached,
 			}
 			sand, err := sandbox.New(conf, sandArgs)
 			if err != nil {
-				return err
+				return fmt.Errorf("cannot create sandbox: %w", err)
 			}
 			c.Sandbox = sand
 			return nil
@@ -292,9 +295,15 @@ func New(conf *config.Config, args Args) (*Container, error) {
 		}
 		sb, err := Load(conf.RootDir, fullID, LoadOpts{Exact: true})
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("cannot load sandbox: %w", err)
 		}
 		c.Sandbox = sb.Sandbox
+
+		subCgroup, err := c.setupCgroupForSubcontainer(conf, args.Spec)
+		if err != nil {
+			return nil, err
+		}
+		c.CompatCgroup = cgroup.CgroupJSON{Cgroup: subCgroup}
 
 		// If the console control socket file is provided, then create a new
 		// pty master/slave pair and send the TTY to the sandbox process.
@@ -311,7 +320,7 @@ func New(conf *config.Config, args Args) (*Container, error) {
 		}
 
 		if err := c.Sandbox.CreateSubcontainer(conf, c.ID, tty); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("cannot create subcontainer: %w", err)
 		}
 	}
 	c.changeStatus(Created)
@@ -321,7 +330,28 @@ func New(conf *config.Config, args Args) (*Container, error) {
 		return nil, err
 	}
 
-	// Write the PID file. Containerd considers the create complete after
+	// "If any prestart hook fails, the runtime MUST generate an error,
+	// stop and destroy the container" -OCI spec.
+	if c.Spec.Hooks != nil {
+		// Even though the hook name is Prestart, runc used to call it from create.
+		// For this reason, it's now deprecated, but the spec requires it to be
+		// called *before* CreateRuntime and CreateRuntime must be called in create.
+		//
+		// "For runtimes that implement the deprecated prestart hooks as
+		// createRuntime hooks, createRuntime hooks MUST be called after the
+		// prestart hooks."
+		if err := executeHooks(c.Spec.Hooks.Prestart, c.State()); err != nil {
+			return nil, err
+		}
+		if err := executeHooks(c.Spec.Hooks.CreateRuntime, c.State()); err != nil {
+			return nil, err
+		}
+		if len(c.Spec.Hooks.CreateContainer) > 0 {
+			log.Warningf("CreateContainer hook skipped because running inside container namespace is not supported")
+		}
+	}
+
+	// Write the PID file. Containerd considers the call to create complete after
 	// this file is created, so it must be the last thing we do.
 	if args.PIDFile != "" {
 		if err := ioutil.WriteFile(args.PIDFile, []byte(strconv.Itoa(c.SandboxPid())), 0644); err != nil {
@@ -349,10 +379,8 @@ func (c *Container) Start(conf *config.Config) error {
 
 	// "If any prestart hook fails, the runtime MUST generate an error,
 	// stop and destroy the container" -OCI spec.
-	if c.Spec.Hooks != nil {
-		if err := executeHooks(c.Spec.Hooks.Prestart, c.State()); err != nil {
-			return err
-		}
+	if c.Spec.Hooks != nil && len(c.Spec.Hooks.StartContainer) > 0 {
+		log.Warningf("StartContainer hook skipped because running inside container namespace is not supported")
 	}
 
 	if isRoot(c.Spec) {
@@ -362,7 +390,7 @@ func (c *Container) Start(conf *config.Config) error {
 	} else {
 		// Join cgroup to start gofer process to ensure it's part of the cgroup from
 		// the start (and all their children processes).
-		if err := runInCgroup(c.Sandbox.Cgroup, func() error {
+		if err := runInCgroup(c.Sandbox.CgroupJSON.Cgroup, func() error {
 			// Create the gofer process.
 			goferFiles, mountsFile, err := c.createGoferProcess(c.Spec, conf, c.BundleDir, false)
 			if err != nil {
@@ -434,10 +462,8 @@ func (c *Container) Restore(spec *specs.Spec, conf *config.Config, restoreFile s
 
 	// "If any prestart hook fails, the runtime MUST generate an error,
 	// stop and destroy the container" -OCI spec.
-	if c.Spec.Hooks != nil {
-		if err := executeHooks(c.Spec.Hooks.Prestart, c.State()); err != nil {
-			return err
-		}
+	if c.Spec.Hooks != nil && len(c.Spec.Hooks.StartContainer) > 0 {
+		log.Warningf("StartContainer hook skipped because running inside container namespace is not supported")
 	}
 
 	if err := c.Sandbox.Restore(c.ID, spec, conf, restoreFile); err != nil {
@@ -506,13 +532,13 @@ func (c *Container) Event() (*boot.EventOut, error) {
 	return event, nil
 }
 
-// SandboxPid returns the Pid of the sandbox the container is running in, or -1 if the
+// SandboxPid returns the Getpid of the sandbox the container is running in, or -1 if the
 // container is not running.
 func (c *Container) SandboxPid() int {
 	if err := c.requireStatus("get PID", Created, Running, Paused); err != nil {
 		return -1
 	}
-	return c.Sandbox.Pid
+	return c.Sandbox.Getpid()
 }
 
 // Wait waits for the container to exit, and returns its WaitStatus.
@@ -646,44 +672,15 @@ func (c *Container) Resume() error {
 	return c.saveLocked()
 }
 
-// Cat prints out the content of the files.
-func (c *Container) Cat(files []string, out *os.File) error {
-	log.Debugf("Cat in container, cid: %s, files: %+v", c.ID, files)
-	return c.Sandbox.Cat(c.ID, files, out)
-}
-
-// Usage displays memory used by the application.
-func (c *Container) Usage(full bool) (control.MemoryUsage, error) {
-	log.Debugf("Usage in container, cid: %s, full: %v", c.ID, full)
-	return c.Sandbox.Usage(c.ID, full)
-}
-
-// UsageFD shows application memory usage using two donated FDs.
-func (c *Container) UsageFD() (*control.MemoryUsageRecord, error) {
-	log.Debugf("UsageFD in container, cid: %s", c.ID)
-	return c.Sandbox.UsageFD(c.ID)
-}
-
-// Reduce requests that the sentry attempt to reduce its memory usage.
-func (c *Container) Reduce(wait bool) error {
-	log.Debugf("Reduce in container, cid: %s", c.ID)
-	return c.Sandbox.Reduce(c.ID, wait)
-}
-
-// Stream dumps all events to out.
-func (c *Container) Stream(filters []string, out *os.File) error {
-	log.Debugf("Stream in container, cid: %s", c.ID)
-	return c.Sandbox.Stream(c.ID, filters, out)
-}
-
 // State returns the metadata of the container.
 func (c *Container) State() specs.State {
 	return specs.State{
-		Version: specs.Version,
-		ID:      c.ID,
-		Status:  c.Status.String(),
-		Pid:     c.SandboxPid(),
-		Bundle:  c.BundleDir,
+		Version:     specs.Version,
+		ID:          c.ID,
+		Status:      c.Status,
+		Pid:         c.SandboxPid(),
+		Bundle:      c.BundleDir,
+		Annotations: c.Spec.Annotations,
 	}
 }
 
@@ -713,9 +710,9 @@ func (c *Container) Destroy() error {
 	sb := c.Sandbox
 
 	// We must perform the following cleanup steps:
-	// * stop the container and gofer processes,
-	// * remove the container filesystem on the host, and
-	// * delete the container metadata directory.
+	//	* stop the container and gofer processes,
+	//	* remove the container filesystem on the host, and
+	//	* delete the container metadata directory.
 	//
 	// It's possible for one or more of these steps to fail, but we should
 	// do our best to perform all of the cleanups. Hence, we keep a slice
@@ -781,16 +778,16 @@ func (c *Container) saveLocked() error {
 // root containers), and waits for the container or sandbox and the gofer
 // to stop. If any of them doesn't stop before timeout, an error is returned.
 func (c *Container) stop() error {
-	var cgroup *cgroup.Cgroup
+	var parentCgroup cgroup.Cgroup
 
 	if c.Sandbox != nil {
 		log.Debugf("Destroying container, cid: %s", c.ID)
 		if err := c.Sandbox.DestroyContainer(c.ID); err != nil {
 			return fmt.Errorf("destroying container %q: %v", c.ID, err)
 		}
-		// Only uninstall cgroup for sandbox stop.
+		// Only uninstall parentCgroup for sandbox stop.
 		if c.Sandbox.IsRootContainer(c.ID) {
-			cgroup = c.Sandbox.Cgroup
+			parentCgroup = c.Sandbox.CgroupJSON.Cgroup
 		}
 		// Only set sandbox to nil after it has been told to destroy the container.
 		c.Sandbox = nil
@@ -809,9 +806,16 @@ func (c *Container) stop() error {
 		return err
 	}
 
-	// Gofer is running in cgroups, so Cgroup.Uninstall has to be called after it.
-	if cgroup != nil {
-		if err := cgroup.Uninstall(); err != nil {
+	// Delete container cgroup if any.
+	if c.CompatCgroup.Cgroup != nil {
+		if err := c.CompatCgroup.Cgroup.Uninstall(); err != nil {
+			return err
+		}
+	}
+	// Gofer is running inside parentCgroup, so Cgroup.Uninstall has to be called
+	// after the gofer has stopped.
+	if parentCgroup != nil {
+		if err := parentCgroup.Uninstall(); err != nil {
 			return err
 		}
 	}
@@ -853,26 +857,12 @@ func (c *Container) waitForStopped() error {
 }
 
 func (c *Container) createGoferProcess(spec *specs.Spec, conf *config.Config, bundleDir string, attached bool) ([]*os.File, *os.File, error) {
-	// Start with the general config flags.
-	args := conf.ToFlags()
+	donations := donation.Agency{}
+	defer donations.Close()
 
-	var goferEnds []*os.File
-
-	// nextFD is the next available file descriptor for the gofer process.
-	// It starts at 3 because 0-2 are used by stdin/stdout/stderr.
-	nextFD := 3
-
-	if conf.LogFilename != "" {
-		logFile, err := os.OpenFile(conf.LogFilename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-		if err != nil {
-			return nil, nil, fmt.Errorf("opening log file %q: %v", conf.LogFilename, err)
-		}
-		defer logFile.Close()
-		goferEnds = append(goferEnds, logFile)
-		args = append(args, "--log-fd="+strconv.Itoa(nextFD))
-		nextFD++
+	if err := donations.OpenAndDonate("log-fd", conf.LogFilename, os.O_CREATE|os.O_WRONLY|os.O_APPEND); err != nil {
+		return nil, nil, err
 	}
-
 	if conf.DebugLog != "" {
 		test := ""
 		if len(conf.TestOnlyTestNameEnv) != 0 {
@@ -881,27 +871,36 @@ func (c *Container) createGoferProcess(spec *specs.Spec, conf *config.Config, bu
 				test = t
 			}
 		}
-		debugLogFile, err := specutils.DebugLogFile(conf.DebugLog, "gofer", test)
-		if err != nil {
-			return nil, nil, fmt.Errorf("opening debug log file in %q: %v", conf.DebugLog, err)
+		if err := donations.DonateDebugLogFile("debug-log-fd", conf.DebugLog, "gofer", test); err != nil {
+			return nil, nil, err
 		}
-		defer debugLogFile.Close()
-		goferEnds = append(goferEnds, debugLogFile)
-		args = append(args, "--debug-log-fd="+strconv.Itoa(nextFD))
-		nextFD++
 	}
 
-	args = append(args, "gofer", "--bundle", bundleDir)
+	// Start with the general config flags.
+	cmd := exec.Command(specutils.ExePath, conf.ToFlags()...)
+	cmd.SysProcAttr = &unix.SysProcAttr{}
+
+	// Set Args[0] to make easier to spot the gofer process. Otherwise it's
+	// shown as `exe`.
+	cmd.Args[0] = "runsc-gofer"
+
+	// Tranfer FDs that need to be present before the "gofer" command.
+	// Start at 3 because 0, 1, and 2 are taken by stdin/out/err.
+	nextFD := donations.Transfer(cmd, 3)
+
+	cmd.Args = append(cmd.Args, "gofer", "--bundle", bundleDir)
 
 	// Open the spec file to donate to the sandbox.
 	specFile, err := specutils.OpenSpec(bundleDir)
 	if err != nil {
 		return nil, nil, fmt.Errorf("opening spec file: %v", err)
 	}
-	defer specFile.Close()
-	goferEnds = append(goferEnds, specFile)
-	args = append(args, "--spec-fd="+strconv.Itoa(nextFD))
-	nextFD++
+	donations.DonateAndClose("spec-fd", specFile)
+
+	// Donate any profile FDs to the gofer.
+	if err := c.donateGoferProfileFDs(conf, &donations); err != nil {
+		return nil, nil, fmt.Errorf("donating gofer profile fds: %w", err)
+	}
 
 	// Create pipe that allows gofer to send mount list to sandbox after all paths
 	// have been resolved.
@@ -909,15 +908,12 @@ func (c *Container) createGoferProcess(spec *specs.Spec, conf *config.Config, bu
 	if err != nil {
 		return nil, nil, err
 	}
-	defer mountsGofer.Close()
-	goferEnds = append(goferEnds, mountsGofer)
-	args = append(args, fmt.Sprintf("--mounts-fd=%d", nextFD))
-	nextFD++
+	donations.DonateAndClose("mounts-fd", mountsGofer)
 
 	// Add root mount and then add any other additional mounts.
 	mountCount := 1
 	for _, m := range spec.Mounts {
-		if specutils.Is9PMount(m, conf.VFS2) {
+		if specutils.IsGoferMount(m) {
 			mountCount++
 		}
 	}
@@ -931,27 +927,13 @@ func (c *Container) createGoferProcess(spec *specs.Spec, conf *config.Config, bu
 		sandEnds = append(sandEnds, os.NewFile(uintptr(fds[0]), "sandbox IO FD"))
 
 		goferEnd := os.NewFile(uintptr(fds[1]), "gofer IO FD")
-		defer goferEnd.Close()
-		goferEnds = append(goferEnds, goferEnd)
-
-		args = append(args, fmt.Sprintf("--io-fds=%d", nextFD))
-		nextFD++
+		donations.DonateAndClose("io-fds", goferEnd)
 	}
-
-	binPath := specutils.ExePath
-	cmd := exec.Command(binPath, args...)
-	cmd.ExtraFiles = goferEnds
-
-	// Set Args[0] to make easier to spot the gofer process. Otherwise it's
-	// shown as `exe`.
-	cmd.Args[0] = "runsc-gofer"
 
 	if attached {
 		// The gofer is attached to the lifetime of this process, so it
 		// should synchronously die when this process dies.
-		cmd.SysProcAttr = &unix.SysProcAttr{
-			Pdeathsig: unix.SIGKILL,
-		}
+		cmd.SysProcAttr.Pdeathsig = unix.SIGKILL
 	}
 
 	// Enter new namespaces to isolate from the rest of the system. Don't unshare
@@ -964,22 +946,95 @@ func (c *Container) createGoferProcess(spec *specs.Spec, conf *config.Config, bu
 		{Type: specs.UTSNamespace},
 	}
 
+	rootlessEUID := unix.Getuid() != 0
 	// Setup any uid/gid mappings, and create or join the configured user
 	// namespace so the gofer's view of the filesystem aligns with the
 	// users in the sandbox.
-	userNS := specutils.FilterNS([]specs.LinuxNamespaceType{specs.UserNamespace}, spec)
-	nss = append(nss, userNS...)
-	specutils.SetUIDGIDMappings(cmd, spec)
-	if len(userNS) != 0 {
-		// We need to set UID and GID to have capabilities in a new user namespace.
-		cmd.SysProcAttr.Credential = &syscall.Credential{Uid: 0, Gid: 0}
+	if !rootlessEUID {
+		userNS := specutils.FilterNS([]specs.LinuxNamespaceType{specs.UserNamespace}, spec)
+		nss = append(nss, userNS...)
+		specutils.SetUIDGIDMappings(cmd, spec)
+		if len(userNS) != 0 {
+			// We need to set UID and GID to have capabilities in a new user namespace.
+			cmd.SysProcAttr.Credential = &syscall.Credential{Uid: 0, Gid: 0}
+		}
+	} else {
+		userNS := specutils.FilterNS([]specs.LinuxNamespaceType{specs.UserNamespace}, spec)
+		if len(userNS) == 0 {
+			return nil, nil, fmt.Errorf("unable to run a rootless container without userns")
+		}
+		fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+		if err != nil {
+			return nil, nil, err
+		}
+		syncFile := os.NewFile(uintptr(fds[0]), "sync FD")
+		defer syncFile.Close()
+
+		f := os.NewFile(uintptr(fds[1]), "sync other FD")
+		donations.DonateAndClose("sync-userns-fd", f)
+		if cmd.SysProcAttr == nil {
+			cmd.SysProcAttr = &unix.SysProcAttr{}
+		}
+		cmd.SysProcAttr.AmbientCaps = []uintptr{
+			unix.CAP_CHOWN,
+			unix.CAP_DAC_OVERRIDE,
+			unix.CAP_DAC_READ_SEARCH,
+			unix.CAP_FOWNER,
+			unix.CAP_FSETID,
+			unix.CAP_SYS_CHROOT,
+			unix.CAP_SETUID,
+			unix.CAP_SETGID,
+			unix.CAP_SYS_ADMIN,
+			unix.CAP_SETPCAP,
+		}
+		nss = append(nss, specs.LinuxNamespace{Type: specs.UserNamespace})
 	}
 
+	donations.Transfer(cmd, nextFD)
+
 	// Start the gofer in the given namespace.
-	log.Debugf("Starting gofer: %s %v", binPath, args)
+	donation.LogDonations(cmd)
+	log.Debugf("Starting gofer: %s %v", cmd.Path, cmd.Args)
 	if err := specutils.StartInNS(cmd, nss); err != nil {
 		return nil, nil, fmt.Errorf("gofer: %v", err)
 	}
+
+	if rootlessEUID {
+		log.Debugf("Setting user mappings")
+		args := []string{strconv.Itoa(cmd.Process.Pid)}
+		for _, idMap := range spec.Linux.UIDMappings {
+			log.Infof("Mapping host uid %d to container uid %d (size=%d)",
+				idMap.HostID, idMap.ContainerID, idMap.Size)
+			args = append(args,
+				strconv.Itoa(int(idMap.ContainerID)),
+				strconv.Itoa(int(idMap.HostID)),
+				strconv.Itoa(int(idMap.Size)),
+			)
+		}
+
+		out, err := exec.Command("newuidmap", args...).CombinedOutput()
+		log.Debugf("newuidmap: %#v\n%s", args, out)
+		if err != nil {
+			return nil, nil, fmt.Errorf("newuidmap failed: %w", err)
+		}
+
+		args = []string{strconv.Itoa(cmd.Process.Pid)}
+		for _, idMap := range spec.Linux.GIDMappings {
+			log.Infof("Mapping host uid %d to container uid %d (size=%d)",
+				idMap.HostID, idMap.ContainerID, idMap.Size)
+			args = append(args,
+				strconv.Itoa(int(idMap.ContainerID)),
+				strconv.Itoa(int(idMap.HostID)),
+				strconv.Itoa(int(idMap.Size)),
+			)
+		}
+		out, err = exec.Command("newgidmap", args...).CombinedOutput()
+		log.Debugf("newgidmap: %#v\n%s", args, out)
+		if err != nil {
+			return nil, nil, fmt.Errorf("newgidmap failed: %w", err)
+		}
+	}
+
 	log.Infof("Gofer started, PID: %d", cmd.Process.Pid)
 	c.GoferPid = cmd.Process.Pid
 	c.goferIsChild = true
@@ -1049,7 +1104,7 @@ func isRoot(spec *specs.Spec) bool {
 
 // runInCgroup executes fn inside the specified cgroup. If cg is nil, execute
 // it in the current context.
-func runInCgroup(cg *cgroup.Cgroup, fn func() error) error {
+func runInCgroup(cg cgroup.Cgroup, fn func() error) error {
 	if cg == nil {
 		return fn()
 	}
@@ -1130,7 +1185,7 @@ func adjustSandboxOOMScoreAdj(s *sandbox.Sandbox, spec *specs.Spec, rootDir stri
 	}
 
 	// Set the lowest of all containers oom_score_adj to the sandbox.
-	return setOOMScoreAdj(s.Pid, lowScore)
+	return setOOMScoreAdj(s.Getpid(), lowScore)
 }
 
 // setOOMScoreAdj sets oom_score_adj to the given value for the given PID.
@@ -1207,4 +1262,113 @@ func (c *Container) populateStats(event *boot.EventOut) {
 	log.Debugf("Usage, container: %d, cgroups: %d, all: %d, total: %.0f", containerUsage, cgroupsUsage, allContainersUsage, total)
 	event.Event.Data.CPU.Usage.Total = uint64(total)
 	return
+}
+
+// setupCgroupForRoot configures and returns cgroup for the sandbox and the
+// root container. If `cgroupParentAnnotation` is set, use that path as the
+// sandbox cgroup and use Spec.Linux.CgroupsPath as the root container cgroup.
+func (c *Container) setupCgroupForRoot(conf *config.Config, spec *specs.Spec) (cgroup.Cgroup, cgroup.Cgroup, error) {
+	var parentCgroup cgroup.Cgroup
+	if parentPath, ok := spec.Annotations[cgroupParentAnnotation]; ok {
+		var err error
+		parentCgroup, err = cgroup.NewFromPath(parentPath, conf.SystemdCgroup)
+		if err != nil {
+			return nil, nil, err
+		}
+	} else {
+		var err error
+		parentCgroup, err = cgroup.NewFromSpec(spec, conf.SystemdCgroup)
+		if parentCgroup == nil || err != nil {
+			return nil, nil, err
+		}
+	}
+
+	var err error
+	parentCgroup, err = cgroupInstall(conf, parentCgroup, spec.Linux.Resources)
+	if parentCgroup == nil || err != nil {
+		return nil, nil, err
+	}
+
+	subCgroup, err := c.setupCgroupForSubcontainer(conf, spec)
+	if err != nil {
+		_ = parentCgroup.Uninstall()
+		return nil, nil, err
+	}
+	return parentCgroup, subCgroup, nil
+}
+
+// setupCgroupForSubcontainer sets up empty cgroups for subcontainers. Since
+// subcontainers run exclusively inside the sandbox, subcontainer cgroups on the
+// host have no effect on them. However, some tools (e.g. cAdvisor) uses cgroups
+// paths to discover new containers and report stats for them.
+func (c *Container) setupCgroupForSubcontainer(conf *config.Config, spec *specs.Spec) (cgroup.Cgroup, error) {
+	if isRoot(spec) {
+		if _, ok := spec.Annotations[cgroupParentAnnotation]; !ok {
+			return nil, nil
+		}
+	}
+
+	cg, err := cgroup.NewFromSpec(spec, conf.SystemdCgroup)
+	if cg == nil || err != nil {
+		return nil, err
+	}
+	// Use empty resources, just want the directory structure created.
+	return cgroupInstall(conf, cg, &specs.LinuxResources{})
+}
+
+// donateGoferProfileFDs will open profile files and donate their FDs to the
+// gofer.
+func (c *Container) donateGoferProfileFDs(conf *config.Config, donations *donation.Agency) error {
+	// The gofer profile files are named based on the provided flag, but
+	// suffixed with "gofer" and the container ID to avoid collisions with
+	// sentry profile files or profile files from other gofers.
+	//
+	// TODO(b/243183772): Merge gofer profile data with sentry profile data
+	// into a single file.
+	profSuffix := ".gofer." + c.ID
+	const profFlags = os.O_CREATE | os.O_WRONLY | os.O_TRUNC
+	if conf.ProfileBlock != "" {
+		if err := donations.OpenAndDonate("profile-block-fd", conf.ProfileBlock+profSuffix, profFlags); err != nil {
+			return err
+		}
+	}
+	if conf.ProfileCPU != "" {
+		if err := donations.OpenAndDonate("profile-cpu-fd", conf.ProfileCPU+profSuffix, profFlags); err != nil {
+			return err
+		}
+	}
+	if conf.ProfileHeap != "" {
+		if err := donations.OpenAndDonate("profile-heap-fd", conf.ProfileHeap+profSuffix, profFlags); err != nil {
+			return err
+		}
+	}
+	if conf.ProfileMutex != "" {
+		if err := donations.OpenAndDonate("profile-mutex-fd", conf.ProfileMutex+profSuffix, profFlags); err != nil {
+			return err
+		}
+	}
+	if conf.TraceFile != "" {
+		if err := donations.OpenAndDonate("trace-fd", conf.TraceFile+profSuffix, profFlags); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// cgroupInstall creates cgroups dir structure and sets their respective
+// resources. In case of success, returns the cgroups instance and nil error.
+// For rootless, it's possible that cgroups operations fail, in this case the
+// error is suppressed and a nil cgroups instance is returned to indicate that
+// no cgroups was configured.
+func cgroupInstall(conf *config.Config, cg cgroup.Cgroup, res *specs.LinuxResources) (cgroup.Cgroup, error) {
+	if err := cg.Install(res); err != nil {
+		switch {
+		case (errors.Is(err, unix.EACCES) || errors.Is(err, unix.EROFS)) && conf.Rootless:
+			log.Warningf("Skipping cgroup configuration in rootless mode: %v", err)
+			return nil, nil
+		default:
+			return nil, fmt.Errorf("configuring cgroup: %v", err)
+		}
+	}
+	return cg, nil
 }

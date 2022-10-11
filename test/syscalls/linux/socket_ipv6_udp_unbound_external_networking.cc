@@ -18,8 +18,6 @@ namespace gvisor {
 namespace testing {
 
 TEST_P(IPv6UDPUnboundExternalNetworkingSocketTest, TestJoinLeaveMulticast) {
-  SKIP_IF(!found_net_interfaces_);
-
   auto sender = ASSERT_NO_ERRNO_AND_VALUE(NewSocket());
   auto receiver = ASSERT_NO_ERRNO_AND_VALUE(NewSocket());
 
@@ -64,8 +62,9 @@ TEST_P(IPv6UDPUnboundExternalNetworkingSocketTest, TestJoinLeaveMulticast) {
 
   // Check that we received the multicast packet.
   char recv_buf[sizeof(send_buf)] = {};
-  ASSERT_THAT(RetryEINTR(recv)(receiver->get(), recv_buf, sizeof(recv_buf), 0),
-              SyscallSucceedsWithValue(sizeof(recv_buf)));
+  EXPECT_THAT(
+      RecvTimeout(receiver->get(), recv_buf, sizeof(recv_buf), 1 /*timeout*/),
+      IsPosixErrorOkAndHolds(sizeof(recv_buf)));
 
   EXPECT_EQ(0, memcmp(send_buf, recv_buf, sizeof(send_buf)));
 

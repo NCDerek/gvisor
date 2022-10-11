@@ -17,24 +17,24 @@ package stack
 import (
 	"fmt"
 	"strings"
-	"sync"
 
+	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 )
 
 // A Hook specifies one of the hooks built into the network stack.
 //
-//                      Userspace app          Userspace app
-//                            ^                      |
-//                            |                      v
-//                         [Input]               [Output]
-//                            ^                      |
-//                            |                      v
-//                            |                   routing
-//                            |                      |
-//                            |                      v
-// ----->[Prerouting]----->routing----->[Forward]---------[Postrouting]----->
+//	                     Userspace app          Userspace app
+//	                           ^                      |
+//	                           |                      v
+//	                        [Input]               [Output]
+//	                           ^                      |
+//	                           |                      v
+//	                           |                   routing
+//	                           |                      |
+//	                           |                      v
+//		----->[Prerouting]----->routing----->[Forward]---------[Postrouting]----->
 type Hook uint
 
 const (
@@ -81,26 +81,27 @@ const (
 //
 // +stateify savable
 type IPTables struct {
-	// mu protects v4Tables, v6Tables, and modified.
+	connections ConnTrack
+
+	reaper tcpip.Timer
+
 	mu sync.RWMutex
 	// v4Tables and v6tables map tableIDs to tables. They hold builtin
-	// tables only, not user tables. mu must be locked for accessing.
+	// tables only, not user tables.
+	//
+	// mu protects the array of tables, but not the tables themselves.
+	// +checklocks:mu
 	v4Tables [NumTables]Table
+	//
+	// mu protects the array of tables, but not the tables themselves.
+	// +checklocks:mu
 	v6Tables [NumTables]Table
 	// modified is whether tables have been modified at least once. It is
 	// used to elide the iptables performance overhead for workloads that
 	// don't utilize iptables.
+	//
+	// +checklocks:mu
 	modified bool
-
-	// priorities maps each hook to a list of table names. The order of the
-	// list is the order in which each table should be visited for that
-	// hook. It is immutable.
-	priorities [NumHooks][]TableID
-
-	connections ConnTrack
-
-	// reaperDone can be signaled to stop the reaper goroutine.
-	reaperDone chan struct{}
 }
 
 // VisitTargets traverses all the targets of all tables and replaces each with
@@ -239,7 +240,7 @@ type IPHeaderFilter struct {
 //
 // Preconditions: pkt.NetworkHeader is set and is at least of the minimal IPv4
 // or IPv6 header length.
-func (fl IPHeaderFilter) match(pkt *PacketBuffer, hook Hook, inNicName, outNicName string) bool {
+func (fl IPHeaderFilter) match(pkt PacketBufferPtr, hook Hook, inNicName, outNicName string) bool {
 	// Extract header fields.
 	var (
 		transProto tcpip.TransportProtocolNumber
@@ -248,13 +249,13 @@ func (fl IPHeaderFilter) match(pkt *PacketBuffer, hook Hook, inNicName, outNicNa
 	)
 	switch proto := pkt.NetworkProtocolNumber; proto {
 	case header.IPv4ProtocolNumber:
-		hdr := header.IPv4(pkt.NetworkHeader().View())
+		hdr := header.IPv4(pkt.NetworkHeader().Slice())
 		transProto = hdr.TransportProtocol()
 		dstAddr = hdr.DestinationAddress()
 		srcAddr = hdr.SourceAddress()
 
 	case header.IPv6ProtocolNumber:
-		hdr := header.IPv6(pkt.NetworkHeader().View())
+		hdr := header.IPv6(pkt.NetworkHeader().Slice())
 		transProto = hdr.TransportProtocol()
 		dstAddr = hdr.DestinationAddress()
 		srcAddr = hdr.SourceAddress()
@@ -344,7 +345,7 @@ type Matcher interface {
 	// used for suspicious packets.
 	//
 	// Precondition: packet.NetworkHeader is set.
-	Match(hook Hook, packet *PacketBuffer, inputInterfaceName, outputInterfaceName string) (matches bool, hotdrop bool)
+	Match(hook Hook, packet PacketBufferPtr, inputInterfaceName, outputInterfaceName string) (matches bool, hotdrop bool)
 }
 
 // A Target is the interface for taking an action for a packet.
@@ -352,5 +353,5 @@ type Target interface {
 	// Action takes an action on the packet and returns a verdict on how
 	// traversal should (or should not) continue. If the return value is
 	// Jump, it also returns the index of the rule to jump to.
-	Action(*PacketBuffer, *ConnTrack, Hook, *Route, tcpip.Address) (RuleVerdict, int)
+	Action(PacketBufferPtr, Hook, *Route, AddressableEndpoint) (RuleVerdict, int)
 }

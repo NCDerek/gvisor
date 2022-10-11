@@ -1,54 +1,56 @@
 load("//tools:defs.bzl", "go_library", "go_test")
-load("//tools/go_fieldenum:defs.bzl", "go_fieldenum")
 load("//tools/go_generics:defs.bzl", "go_template_instance")
 
 licenses(["notice"])
 
-go_fieldenum(
-    name = "seccheck_fieldenum",
-    srcs = [
-        "clone.go",
-        "task.go",
-    ],
-    out = "seccheck_fieldenum.go",
-    package = "seccheck",
-)
-
 go_template_instance(
-    name = "seqatomic_checkerslice",
-    out = "seqatomic_checkerslice_unsafe.go",
+    name = "seqatomic_sinkslice",
+    out = "seqatomic_sinkslice_unsafe.go",
     package = "seccheck",
-    suffix = "CheckerSlice",
+    suffix = "SinkSlice",
     template = "//pkg/sync/seqatomic:generic_seqatomic",
     types = {
-        "Value": "[]Checker",
+        "Value": "[]Sink",
     },
 )
 
 go_library(
     name = "seccheck",
     srcs = [
-        "clone.go",
+        "config.go",
+        "metadata.go",
+        "metadata_amd64.go",
+        "metadata_arm64.go",
         "seccheck.go",
-        "seccheck_fieldenum.go",
-        "seqatomic_checkerslice_unsafe.go",
-        "task.go",
+        "seqatomic_sinkslice_unsafe.go",
+        "syscall.go",
     ],
     visibility = ["//:sandbox"],
     deps = [
         "//pkg/abi/linux",
+        "//pkg/atomicbitops",
         "//pkg/context",
+        "//pkg/fd",
         "//pkg/gohacks",
-        "//pkg/sentry/kernel/auth",
+        "//pkg/log",
+        "//pkg/sentry/arch",
         "//pkg/sentry/kernel/time",
+        "//pkg/sentry/seccheck/points:points_go_proto",
         "//pkg/sync",
+        "@org_golang_google_protobuf//proto:go_default_library",
     ],
 )
 
 go_test(
     name = "seccheck_test",
     size = "small",
-    srcs = ["seccheck_test.go"],
+    srcs = [
+        "metadata_test.go",
+        "seccheck_test.go",
+    ],
     library = ":seccheck",
-    deps = ["//pkg/context"],
+    deps = [
+        "//pkg/context",
+        "//pkg/sentry/seccheck/points:points_go_proto",
+    ],
 )

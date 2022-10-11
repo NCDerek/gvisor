@@ -70,7 +70,7 @@ type inodeFileState struct {
 	descriptor *descriptor `state:"wait"`
 
 	// Event queue for blocking operations.
-	queue waiter.Queue `state:"zerovalue"`
+	queue waiter.Queue
 
 	// sattr is used to restore the inodeOperations.
 	sattr fs.StableAttr `state:"wait"`
@@ -92,9 +92,9 @@ func (i *inodeFileState) ReadToBlocksAt(ctx context.Context, dsts safemem.BlockS
 	// TODO(jamieliu): Using safemem.FromIOReader here is wasteful for two
 	// reasons:
 	//
-	// - Using preadv instead of iterated preads saves on host system calls.
+	//	- Using preadv instead of iterated preads saves on host system calls.
 	//
-	// - Host system calls can handle destination memory that would fault in
+	//	- Host system calls can handle destination memory that would fault in
 	// gr3 (i.e. they can accept safemem.Blocks with NeedSafecopy() == true),
 	// so the buffering performed by FromIOReader is unnecessary.
 	//

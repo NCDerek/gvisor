@@ -7,7 +7,8 @@ RUN apt-get update && apt-get install -y curl gnupg2 git \
         openjdk-11-jdk-headless zip unzip \
         apt-transport-https ca-certificates gnupg-agent \
         software-properties-common \
-        pkg-config libffi-dev patch diffutils libssl-dev
+        pkg-config libffi-dev patch diffutils libssl-dev iptables kmod \
+        clang
 
 # Install Docker client for the website build.
 RUN curl -fsSL https://download.docker.com/linux/ubuntu/gpg | apt-key add -
@@ -24,6 +25,6 @@ RUN curl https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud
     ln -s /google-cloud-sdk/bin/gcloud /usr/bin/gcloud
 
 # Download the official bazel binary. The APT repository isn't used because there is not packages for arm64.
-RUN sh -c 'curl -o /usr/local/bin/bazel https://releases.bazel.build/4.0.0/release/bazel-4.0.0-linux-$(uname -m | sed s/aarch64/arm64/) && chmod ugo+x /usr/local/bin/bazel'
+RUN sh -c 'curl -o /usr/local/bin/bazel https://releases.bazel.build/4.2.1/release/bazel-4.2.1-linux-$(uname -m | sed s/aarch64/arm64/) && chmod ugo+x /usr/local/bin/bazel'
 WORKDIR /workspace
 ENTRYPOINT ["/usr/local/bin/bazel"]

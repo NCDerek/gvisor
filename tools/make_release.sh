@@ -38,9 +38,11 @@ for arg in "$@"; do
   fi
 done
 
+export DEBIAN_FRONTEND=noninteractive
 # install_raw installs raw artifacts.
 install_raw() {
   for binary in "${binaries[@]}"; do
+    local arch name
     # Copy the raw file & generate a sha512sum, sorted by architecture.
     arch=$(file "${binary}" | cut -d',' -f2 | awk '{print $NF}' | tr '-' '_')
     name=$(basename "${binary}")

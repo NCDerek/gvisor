@@ -25,6 +25,7 @@ import (
 
 	"google.golang.org/protobuf/encoding/prototext"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/anypb"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	pb "gvisor.dev/gvisor/pkg/eventchannel/eventchannel_go_proto"
 	"gvisor.dev/gvisor/pkg/log"
@@ -56,6 +57,15 @@ func Emit(msg proto.Message) error {
 // AddEmitter is a helper method that calls DefaultEmitter.AddEmitter.
 func AddEmitter(e Emitter) {
 	DefaultEmitter.AddEmitter(e)
+}
+
+// HaveEmitters indicates if any emitters have been registered to the
+// default emitter.
+func HaveEmitters() bool {
+	DefaultEmitter.mu.Lock()
+	defer DefaultEmitter.mu.Unlock()
+
+	return len(DefaultEmitter.emitters) > 0
 }
 
 // multiEmitter is an Emitter that forwards messages to multiple Emitters.
@@ -139,7 +149,7 @@ func SocketEmitter(fd int) (Emitter, error) {
 
 // Emit implements Emitter.Emit.
 func (s *socketEmitter) Emit(msg proto.Message) (bool, error) {
-	any, err := newAny(msg)
+	any, err := anypb.New(msg)
 	if err != nil {
 		return false, err
 	}

@@ -94,7 +94,6 @@ TEST_F(OpenTest, OTruncAndReadOnlyFile) {
 }
 
 TEST_F(OpenTest, OCreateDirectory) {
-  SKIP_IF(IsRunningWithVFS1());
   auto dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
 
   // Normal case: existing directory.
@@ -497,9 +496,6 @@ TEST_F(OpenTest, OpenNonDirectoryWithTrailingSlash) {
 }
 
 TEST_F(OpenTest, OpenWithStrangeFlags) {
-  // VFS1 incorrectly allows read/write operations on such file descriptors.
-  SKIP_IF(IsRunningWithVFS1());
-
   const TempPath file = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFile());
   const FileDescriptor fd =
       ASSERT_NO_ERRNO_AND_VALUE(Open(file.path(), O_WRONLY | O_RDWR));
@@ -509,7 +505,6 @@ TEST_F(OpenTest, OpenWithStrangeFlags) {
 }
 
 TEST_F(OpenTest, OpenWithOpath) {
-  SKIP_IF(IsRunningWithVFS1());
   AutoCapability cap1(CAP_DAC_OVERRIDE, false);
   AutoCapability cap2(CAP_DAC_READ_SEARCH, false);
   const DisableSave ds;  // Permissions are dropped.
@@ -526,6 +521,14 @@ TEST_F(OpenTest, OpenWithOpath) {
   // Can open file with O_PATH because don't need permissions on the object when
   // opening with O_PATH.
   ASSERT_NO_ERRNO(Open(path, O_PATH));
+}
+
+// NOTE(b/236445327): Regression test. Opening a non-directory with O_PATH and
+// O_DIRECTORY should fail with ENOTDIR.
+TEST_F(OpenTest, OPathWithODirectory) {
+  auto newFile = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFile());
+  EXPECT_THAT(open(newFile.path().c_str(), O_RDONLY | O_DIRECTORY | O_PATH),
+              SyscallFailsWithErrno(ENOTDIR));
 }
 
 }  // namespace

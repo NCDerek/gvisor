@@ -66,6 +66,7 @@ func main() {
 		unix.SYS_MUNLOCK:         {},
 		unix.SYS_MUNMAP:          {},
 		unix.SYS_NANOSLEEP:       {},
+		unix.SYS_OPENAT:          {},
 		unix.SYS_PPOLL:           {},
 		unix.SYS_PREAD64:         {},
 		unix.SYS_PSELECT6:        {},
@@ -95,22 +96,25 @@ func main() {
 	}
 
 	arch_syscalls(syscalls)
+	// We choose a syscall that is unlikely to be called by Go runtime,
+	// even with race or other instrumentation enabled.
+	syscall := uintptr(unix.SYS_UMASK)
 
 	die := *dieFlag
 	if !die {
-		syscalls[unix.SYS_OPENAT] = []seccomp.Rule{
+		syscalls[syscall] = []seccomp.Rule{
 			{
-				seccomp.EqualTo(10),
+				seccomp.EqualTo(0),
 			},
 		}
 	}
 
-	if err := seccomp.Install(syscalls); err != nil {
-		fmt.Printf("Failed to install seccomp: %v", err)
+	if err := seccomp.Install(syscalls, nil); err != nil {
+		fmt.Printf("Failed to install seccomp: %v\n", err)
 		os.Exit(1)
 	}
 	fmt.Printf("Filters installed\n")
 
-	unix.RawSyscall(unix.SYS_OPENAT, 10, 0, 0)
+	unix.RawSyscall(syscall, 0, 0, 0)
 	fmt.Printf("Syscall was allowed!!!\n")
 }

@@ -13,12 +13,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package runtimeoptions contains the runtimeoptions proto.
+// Package runtimeoptions contains the runtimeoptions proto for containerd 1.5
+// and above.
 package runtimeoptions
-
-import proto "github.com/gogo/protobuf/proto"
-
-func init() {
-	// TODO(gvisor.dev/issue/6449): Upgrade runtimeoptions.proto after upgrading to containerd 1.5
-	proto.RegisterType((*Options)(nil), "runtimeoptions.v1.Options")
-}

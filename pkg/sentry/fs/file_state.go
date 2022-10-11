@@ -14,6 +14,8 @@
 
 package fs
 
+import "fmt"
+
 // beforeSave is invoked by stateify.
 func (f *File) beforeSave() {
 	f.saving = true
@@ -24,8 +26,9 @@ func (f *File) beforeSave() {
 
 // afterLoad is invoked by stateify.
 func (f *File) afterLoad() {
-	f.mu.Init()
 	if f.flags.Async && f.async != nil {
-		f.async.Register(f)
+		if err := f.async.Register(f); err != nil {
+			panic(fmt.Sprint("async.Register:", err))
+		}
 	}
 }

@@ -23,13 +23,17 @@ import (
 )
 
 const (
-	checkLocksAnnotation  = "// +checklocks:"
-	checkLocksAcquires    = "// +checklocksacquire:"
-	checkLocksReleases    = "// +checklocksrelease:"
-	checkLocksIgnore      = "// +checklocksignore"
-	checkLocksForce       = "// +checklocksforce"
-	checkLocksFail        = "// +checklocksfail"
-	checkAtomicAnnotation = "// +checkatomic"
+	checkLocksAnnotation     = "// +checklocks:"
+	checkLocksAnnotationRead = "// +checklocksread:"
+	checkLocksAcquires       = "// +checklocksacquire:"
+	checkLocksAcquiresRead   = "// +checklocksacquireread:"
+	checkLocksReleases       = "// +checklocksrelease:"
+	checkLocksReleasesRead   = "// +checklocksreleaseread:"
+	checkLocksIgnore         = "// +checklocksignore"
+	checkLocksForce          = "// +checklocksforce"
+	checkLocksFail           = "// +checklocksfail"
+	checkLocksAlias          = "// +checklocksalias:"
+	checkAtomicAnnotation    = "// +checkatomic"
 )
 
 // failData indicates an expected failure.
@@ -86,6 +90,9 @@ func (pc *passContext) maybeFail(pos token.Pos, fmtStr string, args ...interface
 	}
 	if _, ok := pc.exemptions[pc.positionKey(pos)]; ok {
 		return // Ignored, not counted.
+	}
+	if !enableWrappers && !pos.IsValid() {
+		return // Ignored, implicit.
 	}
 	pc.pass.Reportf(pos, fmtStr, args...)
 }

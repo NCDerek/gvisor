@@ -15,6 +15,7 @@
 package cgroup
 
 import (
+	"encoding/json"
 	"io/ioutil"
 	"os"
 	"path/filepath"
@@ -59,7 +60,7 @@ var dindMountinfo = `
 `
 
 func TestUninstallEnoent(t *testing.T) {
-	c := Cgroup{
+	c := cgroupV1{
 		// Use a non-existent name.
 		Name: "runsc-test-uninstall-656e6f656e740a",
 		Own:  make(map[string]bool),
@@ -127,6 +128,18 @@ func uint64Ptr(v uint64) *uint64 {
 
 func boolPtr(v bool) *bool {
 	return &v
+}
+
+func createDir(dir string, contents map[string]string) error {
+	for name := range contents {
+		path := filepath.Join(dir, name)
+		f, err := os.Create(path)
+		if err != nil {
+			return err
+		}
+		f.Close()
+	}
+	return nil
 }
 
 func checkDir(t *testing.T, dir string, contents map[string]string) {
@@ -254,6 +267,9 @@ func TestBlockIO(t *testing.T) {
 				t.Fatalf("error creating temporary directory: %v", err)
 			}
 			defer os.RemoveAll(dir)
+			if err := createDir(dir, tc.wants); err != nil {
+				t.Fatalf("createDir(): %v", err)
+			}
 
 			spec := &specs.LinuxResources{
 				BlockIO: tc.spec,
@@ -304,6 +320,9 @@ func TestCPU(t *testing.T) {
 				t.Fatalf("error creating temporary directory: %v", err)
 			}
 			defer os.RemoveAll(dir)
+			if err := createDir(dir, tc.wants); err != nil {
+				t.Fatalf("createDir(): %v", err)
+			}
 
 			spec := &specs.LinuxResources{
 				CPU: tc.spec,
@@ -343,6 +362,9 @@ func TestCPUSet(t *testing.T) {
 				t.Fatalf("error creating temporary directory: %v", err)
 			}
 			defer os.RemoveAll(dir)
+			if err := createDir(dir, tc.wants); err != nil {
+				t.Fatalf("createDir(): %v", err)
+			}
 
 			spec := &specs.LinuxResources{
 				CPU: tc.spec,
@@ -481,6 +503,9 @@ func TestHugeTlb(t *testing.T) {
 				t.Fatalf("error creating temporary directory: %v", err)
 			}
 			defer os.RemoveAll(dir)
+			if err := createDir(dir, tc.wants); err != nil {
+				t.Fatalf("createDir(): %v", err)
+			}
 
 			spec := &specs.LinuxResources{
 				HugepageLimits: tc.spec,
@@ -542,6 +567,9 @@ func TestMemory(t *testing.T) {
 				t.Fatalf("error creating temporary directory: %v", err)
 			}
 			defer os.RemoveAll(dir)
+			if err := createDir(dir, tc.wants); err != nil {
+				t.Fatalf("createDir(): %v", err)
+			}
 
 			spec := &specs.LinuxResources{
 				Memory: tc.spec,
@@ -584,6 +612,9 @@ func TestNetworkClass(t *testing.T) {
 				t.Fatalf("error creating temporary directory: %v", err)
 			}
 			defer os.RemoveAll(dir)
+			if err := createDir(dir, tc.wants); err != nil {
+				t.Fatalf("createDir(): %v", err)
+			}
 
 			spec := &specs.LinuxResources{
 				Network: tc.spec,
@@ -631,6 +662,9 @@ func TestNetworkPriority(t *testing.T) {
 				t.Fatalf("error creating temporary directory: %v", err)
 			}
 			defer os.RemoveAll(dir)
+			if err := createDir(dir, tc.wants); err != nil {
+				t.Fatalf("createDir(): %v", err)
+			}
 
 			spec := &specs.LinuxResources{
 				Network: tc.spec,
@@ -671,6 +705,9 @@ func TestPids(t *testing.T) {
 				t.Fatalf("error creating temporary directory: %v", err)
 			}
 			defer os.RemoveAll(dir)
+			if err := createDir(dir, tc.wants); err != nil {
+				t.Fatalf("createDir(): %v", err)
+			}
 
 			spec := &specs.LinuxResources{
 				Pids: tc.spec,
@@ -795,7 +832,7 @@ func TestLoadPaths(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			r := strings.NewReader(tc.cgroups)
 			mountinfo := strings.NewReader(tc.mountinfo)
-			got, err := loadPathsHelper(r, mountinfo)
+			got, err := loadPathsHelper(r, mountinfo, false)
 			if len(tc.err) == 0 {
 				if err != nil {
 					t.Fatalf("Unexpected error: %v", err)
@@ -827,6 +864,12 @@ func TestOptional(t *testing.T) {
 		spec  *specs.LinuxResources
 		err   string
 	}{
+		{
+			name:  "pids",
+			ctrlr: &pids{},
+			spec:  &specs.LinuxResources{Pids: &specs.LinuxPids{Limit: 1}},
+			err:   "Pids.Limit set but pids cgroup controller not found",
+		},
 		{
 			name:  "net-cls",
 			ctrlr: &networkClass{},
@@ -861,5 +904,57 @@ func TestOptional(t *testing.T) {
 				t.Errorf("ctrlr.skip() want: *%s*, got: %q", tc.err, err)
 			}
 		})
+	}
+}
+
+func TestJSON(t *testing.T) {
+	for _, tc := range []struct {
+		cg Cgroup
+	}{
+		{
+			cg: &cgroupV1{
+				Name:    "foobar",
+				Parents: map[string]string{"hello": "world"},
+				Own:     map[string]bool{"parent": true},
+			},
+		},
+		{
+			cg: &cgroupV2{
+				Mountpoint:  "foobar",
+				Path:        "a/path/here",
+				Controllers: []string{"test", "controllers"},
+				Own:         []string{"I", "own", "this"},
+			},
+		},
+		{
+			cg: CreateMockSystemdCgroup(),
+		},
+		{
+			cg: nil,
+		},
+	} {
+		in := &CgroupJSON{Cgroup: tc.cg}
+		data, err := json.Marshal(in)
+		if err != nil {
+			t.Fatalf("could not serialize %v to JSON: %v", in, err)
+		}
+		out := &CgroupJSON{}
+		if err := json.Unmarshal(data, out); err != nil {
+			t.Fatalf("could not deserialize %v from JSON: %v", data, err)
+		}
+		switch tc.cg.(type) {
+		case *cgroupSystemd:
+			if _, ok := out.Cgroup.(*cgroupSystemd); !ok {
+				t.Errorf("cgroup incorrectly deserialized from JSON: got %v, want %v", out.Cgroup, tc.cg)
+			}
+		case *cgroupV1:
+			if _, ok := out.Cgroup.(*cgroupV1); !ok {
+				t.Errorf("cgroup incorrectly deserialized from JSON: got %v, want %v", out.Cgroup, tc.cg)
+			}
+		case *cgroupV2:
+			if _, ok := out.Cgroup.(*cgroupV2); !ok {
+				t.Errorf("cgroup incorrectly deserialized from JSON: got %v, want %v", out.Cgroup, tc.cg)
+			}
+		}
 	}
 }

@@ -11,9 +11,7 @@ go_library(
     visibility = ["//:sandbox"],
     deps = [
         "//pkg/refs",
-        "//pkg/sentry/control:control_go_proto",
         "//pkg/sentry/watchdog",
-        "//pkg/sync",
         "//runsc/flag",
     ],
 )
@@ -25,8 +23,5 @@ go_test(
         "config_test.go",
     ],
     library = ":config",
-    deps = [
-        "//pkg/sentry/control:control_go_proto",
-        "//runsc/flag",
-    ],
+    deps = ["//runsc/flag"],
 )

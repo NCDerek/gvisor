@@ -10,8 +10,20 @@ go_template_instance(
     prefix = "dentry",
     template = "//pkg/ilist:generic_list",
     types = {
-        "Element": "*dentry",
-        "Linker": "*dentry",
+        "Element": "*dentryListElem",
+        "Linker": "*dentryListElem",
+    },
+)
+
+go_template_instance(
+    name = "special_fd_list",
+    out = "special_fd_list.go",
+    package = "gofer",
+    prefix = "specialFD",
+    template = "//pkg/ilist:generic_list",
+    types = {
+        "Element": "*specialFileFD",
+        "Linker": "*specialFileFD",
     },
 )
 
@@ -41,6 +53,7 @@ go_library(
         "revalidate.go",
         "save_restore.go",
         "socket.go",
+        "special_fd_list.go",
         "special_file.go",
         "symlink.go",
         "time.go",
@@ -48,13 +61,17 @@ go_library(
     visibility = ["//pkg/sentry:internal"],
     deps = [
         "//pkg/abi/linux",
+        "//pkg/atomicbitops",
         "//pkg/context",
         "//pkg/errors/linuxerr",
         "//pkg/fd",
         "//pkg/fdnotifier",
         "//pkg/fspath",
         "//pkg/hostarch",
+        "//pkg/lisafs",
         "//pkg/log",
+        "//pkg/marshal",
+        "//pkg/marshal/primitive",
         "//pkg/metric",
         "//pkg/p9",
         "//pkg/refs",
@@ -93,6 +110,7 @@ go_test(
     deps = [
         "//pkg/p9",
         "//pkg/sentry/contexttest",
+        "//pkg/sentry/kernel/time",
         "//pkg/sentry/pgalloc",
     ],
 )

@@ -18,6 +18,8 @@
 #include <sys/sendfile.h>
 #include <unistd.h>
 
+#include <string_view>
+
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "absl/strings/string_view.h"
@@ -474,6 +476,8 @@ TEST(SendFileTest, SendToNotARegularFile) {
 }
 
 TEST(SendFileTest, SendPipeWouldBlock) {
+  // This test fails on Linux, likely due to a Linux bug.
+  SKIP_IF(!IsRunningOnGvisor());
   // Create temp file.
   constexpr char kData[] =
       "The fool doth think he is wise, but the wise man knows himself to be a "
@@ -520,6 +524,8 @@ TEST(SendFileTest, SendPipeEOF) {
 }
 
 TEST(SendFileTest, SendToFullPipeReturnsEAGAIN) {
+  // This test fails on Linux, likely due to a Linux bug.
+  SKIP_IF(!IsRunningOnGvisor());
   // Create and open an empty input file.
   const TempPath in_file = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFile());
   const FileDescriptor in_fd =
@@ -621,6 +627,31 @@ TEST(SendFileTest, SendFileToSelf) {
   off_t offset = 0;
   ASSERT_THAT(sendfile(fd.get(), fd.get(), &offset, kSendfileSize),
               SyscallSucceedsWithValue(kSendfileSize));
+}
+
+// NOTE(b/237442794): Regression test. Make sure sendfile works with a count
+// larger than input file size.
+TEST(SendFileTest, LargeCount) {
+  // Create input file with some wisdom. It is imperative to use a
+  // Shakespearean quote, consistent with the rest of this file.
+  constexpr std::string_view kData =
+      "We know what we are, but know not what we may be.";
+  const TempPath in_file = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileWith(
+      GetAbsoluteTestTmpdir(), kData, TempPath::kDefaultFileMode));
+
+  const TempPath out_file = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFile());
+
+  // Open the input file as read only.
+  const FileDescriptor inf =
+      ASSERT_NO_ERRNO_AND_VALUE(Open(in_file.path(), O_RDONLY));
+
+  // Open the output file as write only.
+  const FileDescriptor outf =
+      ASSERT_NO_ERRNO_AND_VALUE(Open(out_file.path(), O_WRONLY));
+
+  // Set a count larger than kDataSize.
+  EXPECT_THAT(sendfile(outf.get(), inf.get(), nullptr, 2 * kData.size()),
+              SyscallSucceedsWithValue(kData.size()));
 }
 
 }  // namespace

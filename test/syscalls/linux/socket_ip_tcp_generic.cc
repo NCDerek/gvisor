@@ -515,6 +515,41 @@ TEST_P(TCPSocketPairTest, SetSoKeepalive) {
   EXPECT_EQ(get, kSockOptOff);
 }
 
+TEST_P(TCPSocketPairTest, SetSoKeepaliveClosed) {
+  auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
+
+  // Force a RST to be sent using SO_LINGER.
+  auto linger_opt = linger{.l_onoff = 1, .l_linger = 0};
+  ASSERT_THAT(setsockopt(sockets->second_fd(), SOL_SOCKET, SO_LINGER,
+                         &linger_opt, sizeof(linger_opt)),
+              SyscallSucceeds());
+  ASSERT_THAT(close(sockets->release_second_fd()), SyscallSucceeds());
+
+  // Wait for the other end to receive the RST (up to 20 seconds).
+  constexpr int kPollTimeoutMs = 20000;
+  auto pfd = pollfd{
+      .fd = sockets->first_fd(),
+      .events = POLLIN | POLLHUP,
+      .revents = 0,
+  };
+  ASSERT_THAT(RetryEINTR(poll)(&pfd, 1, kPollTimeoutMs),
+              SyscallSucceedsWithValue(1));
+  ASSERT_EQ(pfd.revents & POLLHUP, POLLHUP);
+
+  // Now that the connection is closed, we should still be able to set
+  // SO_KEEPALIVE.
+  ASSERT_THAT(setsockopt(sockets->first_fd(), SOL_SOCKET, SO_KEEPALIVE,
+                         &kSockOptOn, sizeof(kSockOptOn)),
+              SyscallSucceeds());
+  int get = -1;
+  socklen_t get_len = sizeof(get);
+  ASSERT_THAT(
+      getsockopt(sockets->first_fd(), SOL_SOCKET, SO_KEEPALIVE, &get, &get_len),
+      SyscallSucceeds());
+  ASSERT_EQ(get, kSockOptOn);
+  ASSERT_EQ(get_len, sizeof(get));
+}
+
 TEST_P(TCPSocketPairTest, TCPKeepidleDefault) {
   auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
 
@@ -883,6 +918,27 @@ TEST_P(TCPSocketPairTest, SetTCPLingerTimeoutZero) {
   EXPECT_EQ(get_len, sizeof(get));
   EXPECT_THAT(get,
               AnyOf(Eq(kMaxTCPLingerTimeout), Eq(kOldMaxTCPLingerTimeout)));
+}
+
+TEST_P(TCPSocketPairTest, SoLingerOptionWithReset) {
+  auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
+
+  // Set and get SO_LINGER with zero timeout.
+  struct linger sl;
+  sl.l_onoff = 1;
+  sl.l_linger = 0;
+  ASSERT_THAT(
+      setsockopt(sockets->first_fd(), SOL_SOCKET, SO_LINGER, &sl, sizeof(sl)),
+      SyscallSucceeds());
+  char buf[1000] = {};
+  ASSERT_THAT(RetryEINTR(write)(sockets->first_fd(), buf, sizeof(buf)),
+              SyscallSucceedsWithValue(sizeof(buf)));
+
+  ASSERT_THAT(close(sockets->release_first_fd()), SyscallSucceeds());
+
+  write(sockets->second_fd(), buf, sizeof(buf));
+  ASSERT_THAT(RetryEINTR(read)(sockets->second_fd(), buf, sizeof(buf)),
+              SyscallSucceedsWithValue(sizeof(buf)));
 }
 
 TEST_P(TCPSocketPairTest, SetTCPLingerTimeoutAboveMax) {
@@ -1304,5 +1360,59 @@ TEST_P(TCPSocketPairTest, CloseWithLingerOption) {
   ASSERT_THAT(RetryEINTR(write)(dupFd.get(), buf, sizeof(buf)),
               SyscallFailsWithErrno(EBADF));
 }
+
+TEST_P(TCPSocketPairTest, ResetWithSoLingerZeroTimeoutOption) {
+  auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
+
+  // Check getsockopt before SO_LINGER option is set.
+  struct linger got_linger = {-1, -1};
+  socklen_t got_len = sizeof(got_linger);
+
+  ASSERT_THAT(getsockopt(sockets->first_fd(), SOL_SOCKET, SO_LINGER,
+                         &got_linger, &got_len),
+              SyscallSucceeds());
+  ASSERT_THAT(got_len, sizeof(got_linger));
+  struct linger want_linger = {};
+  EXPECT_EQ(0, memcmp(&want_linger, &got_linger, got_len));
+
+  char buf[10] = {};
+  ASSERT_THAT(RetryEINTR(write)(sockets->first_fd(), buf, sizeof(buf)),
+              SyscallSucceedsWithValue(sizeof(buf)));
+
+  // Set and get SO_LINGER with zero timeout.
+  struct linger sl;
+  sl.l_onoff = 1;
+  sl.l_linger = 0;
+  ASSERT_THAT(
+      setsockopt(sockets->first_fd(), SOL_SOCKET, SO_LINGER, &sl, sizeof(sl)),
+      SyscallSucceeds());
+  ASSERT_THAT(getsockopt(sockets->first_fd(), SOL_SOCKET, SO_LINGER,
+                         &got_linger, &got_len),
+              SyscallSucceeds());
+  ASSERT_EQ(got_len, sizeof(got_linger));
+  EXPECT_EQ(sl.l_onoff, got_linger.l_onoff);
+  EXPECT_EQ(sl.l_linger, got_linger.l_linger);
+
+  // Wait until the socket sees the data on its side but don't read it.
+  struct pollfd poll_fd = {sockets->second_fd(), POLLIN | POLLHUP, 0};
+  constexpr int kPollTimeoutMs = 20000;  // Wait up to 20 seconds for the data.
+  ASSERT_THAT(RetryEINTR(poll)(&poll_fd, 1, kPollTimeoutMs),
+              SyscallSucceedsWithValue(1));
+
+  ASSERT_THAT(close(sockets->release_first_fd()), SyscallSucceeds());
+
+  // Attempt to write, but not possible because of connection reset.
+  poll_fd = {sockets->second_fd(), POLLHUP, 0};
+  ASSERT_THAT(RetryEINTR(poll)(&poll_fd, 1, kPollTimeoutMs),
+              SyscallSucceedsWithValue(1));
+
+  char buffer[10] = {};
+  ASSERT_THAT(RetryEINTR(write)(sockets->second_fd(), buffer, sizeof(buffer)),
+              SyscallFailsWithErrno(ECONNRESET));
+
+  ASSERT_THAT(RetryEINTR(read)(sockets->second_fd(), buf, sizeof(buf)),
+              SyscallSucceedsWithValue(sizeof(buf)));
+}
+
 }  // namespace testing
 }  // namespace gvisor

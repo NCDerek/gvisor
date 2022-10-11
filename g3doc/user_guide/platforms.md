@@ -5,28 +5,34 @@
 This guide described how to change the
 [platform](../architecture_guide/platforms.md) used by `runsc`.
 
+Configuring the platform provides significant performance benefits, but isn't
+the only step to optimizing gVisor performance. See the [Production guide] for
+more.
+
 ## Prerequisites
 
 If you intend to run the KVM platform, you will also to have KVM installed on
 your system. If you are running a Debian based system like Debian or Ubuntu you
-can usually do this by ensuring the module is loaded, and permissions are
-appropriately set on the `/dev/kvm` device.
+can usually do this by ensuring the module is loaded, and your user has
+permissions to access the `/dev/kvm` device. Usually, it means that the user is
+in the `kvm` group.
 
-If you have an Intel CPU:
+```shell
+# Check that /dev/kvm is owned by the kvm group
+$ ls -l /dev/kvm
+crw-rw----+ 1 root kvm 10, 232 Jul 26 00:04 /dev/kvm
 
-```bash
-sudo modprobe kvm-intel && sudo chmod a+rw /dev/kvm
+# Make sure that the current user is part of the kvm group
+$ groups | grep -qw kvm && echo ok
+ok
 ```
 
-If you have an AMD CPU:
-
-```bash
-sudo modprobe kvm-amd && sudo chmod a+rw /dev/kvm
-```
-
-If you are using a virtual machine you will need to make sure that nested
-virtualization is configured. Here are links to documents on how to set up
-nested virtualization in several popular environments:
+**For best performance, use the KVM platform on bare-metal machines only**. If
+you have to run gVisor within a virtual machine, the `ptrace` platform will
+often yield better performance than KVM. If you still want to use KVM within a
+virtual machine, you will need to make sure that nested virtualization is
+configured. Here are links to documents on how to set up nested virtualization
+in several popular environments:
 
 *   Google Cloud: [Enabling Nested Virtualization for VM Instances][nested-gcp]
 *   Microsoft Azure:
@@ -62,8 +68,8 @@ pass the `--platform` argument:
 You must restart the Docker daemon after making changes to this file, typically
 this is done via `systemd`:
 
-```bash
-sudo systemctl restart docker
+```shell
+$ sudo systemctl restart docker
 ```
 
 Note that you may configure multiple runtimes using different platforms. For
@@ -89,6 +95,7 @@ for the KVM platform:
 }
 ```
 
+[Production guide]: ../production/
 [nested-azure]: https://docs.microsoft.com/en-us/azure/virtual-machines/windows/nested-virtualization
 [nested-gcp]: https://cloud.google.com/compute/docs/instances/enable-nested-virtualization-vm-instances
 [nested-virtualbox]: https://www.virtualbox.org/manual/UserManual.html#nested-virt

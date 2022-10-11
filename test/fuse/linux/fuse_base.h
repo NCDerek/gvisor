@@ -25,8 +25,10 @@
 #include <vector>
 
 #include "gtest/gtest.h"
+#include "absl/memory/memory.h"
 #include "test/util/posix_error.h"
 #include "test/util/temp_path.h"
+#include "test/util/thread_util.h"
 
 namespace gvisor {
 namespace testing {
@@ -168,9 +170,14 @@ class FuseTest : public ::testing::Test {
 
  protected:
   TempPath mount_point_;
+  int dev_fd_;
 
   // Opens /dev/fuse and inherit the file descriptor for the FUSE server.
-  void MountFuse(const char* mountOpts = kMountOpts);
+  void MountFuse(const char* mount_opts = kMountOpts);
+
+  // Mounts a fuse fs with a fuse fd connection at the specified point.
+  void MountFuse(int fd, TempPath& mount_point,
+                 const char* mount_opts = kMountOpts);
 
   // Creates a socketpair for communication and forks FUSE server.
   void SetUpFuseServer(
@@ -234,8 +241,8 @@ class FuseTest : public ::testing::Test {
   // Responds an error header to /dev/fuse when bad thing happens.
   void ServerRespondFuseError(uint64_t unique);
 
-  int dev_fd_;
   int sock_[2];
+  std::unique_ptr<ScopedThread> fuse_server_;
 
   uint64_t nodeid_;
   std::unordered_map<std::string, FuseMemBlock> lookup_map_;

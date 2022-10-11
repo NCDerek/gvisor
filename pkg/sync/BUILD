@@ -5,8 +5,6 @@ package(
     licenses = ["notice"],
 )
 
-exports_files(["LICENSE"])
-
 go_library(
     name = "sync",
     srcs = [
@@ -22,6 +20,9 @@ go_library(
         "race_amd64.s",
         "race_arm64.s",
         "race_unsafe.go",
+        "runtime_amd64.go",
+        "runtime_amd64.s",
+        "runtime_other.go",
         "runtime_unsafe.go",
         "rwmutex_unsafe.go",
         "seqcount.go",

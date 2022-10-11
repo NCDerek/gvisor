@@ -16,6 +16,7 @@
 package fdpipe
 
 import (
+	"fmt"
 	"os"
 
 	"golang.org/x/sys/unix"
@@ -45,7 +46,8 @@ type pipeOperations struct {
 	fsutil.FileNoIoctl              `state:"nosave"`
 	fsutil.FileNoSplice             `state:"nosave"`
 	fsutil.FileUseInodeUnstableAttr `state:"nosave"`
-	waiter.Queue                    `state:"nosave"`
+
+	waiter.Queue
 
 	// flags are the flags used to open the pipe.
 	flags fs.FileFlags `state:".(fs.FileFlags)"`
@@ -98,15 +100,21 @@ func (p *pipeOperations) init() error {
 }
 
 // EventRegister implements waiter.Waitable.EventRegister.
-func (p *pipeOperations) EventRegister(e *waiter.Entry, mask waiter.EventMask) {
-	p.Queue.EventRegister(e, mask)
-	fdnotifier.UpdateFD(int32(p.file.FD()))
+func (p *pipeOperations) EventRegister(e *waiter.Entry) error {
+	p.Queue.EventRegister(e)
+	if err := fdnotifier.UpdateFD(int32(p.file.FD())); err != nil {
+		p.Queue.EventUnregister(e)
+		return err
+	}
+	return nil
 }
 
 // EventUnregister implements waiter.Waitable.EventUnregister.
 func (p *pipeOperations) EventUnregister(e *waiter.Entry) {
 	p.Queue.EventUnregister(e)
-	fdnotifier.UpdateFD(int32(p.file.FD()))
+	if err := fdnotifier.UpdateFD(int32(p.file.FD())); err != nil {
+		panic(fmt.Sprint("UpdateFD:", err))
+	}
 }
 
 // Readiness returns a mask of ready events for stream.

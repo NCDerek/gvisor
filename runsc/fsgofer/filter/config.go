@@ -53,6 +53,7 @@ var allowedSyscalls = seccomp.SyscallRules{
 		},
 	},
 	unix.SYS_FCHMOD:   {},
+	unix.SYS_FCHMODAT: {},
 	unix.SYS_FCHOWNAT: {},
 	unix.SYS_FCNTL: []seccomp.Rule{
 		{
@@ -126,18 +127,6 @@ var allowedSyscalls = seccomp.SyscallRules{
 	unix.SYS_MEMFD_CREATE: {}, /// Used by flipcall.PacketWindowAllocator.Init().
 	unix.SYS_MKDIRAT:      {},
 	unix.SYS_MKNODAT:      {},
-	// Used by the Go runtime as a temporarily workaround for a Linux
-	// 5.2-5.4 bug.
-	//
-	// See src/runtime/os_linux_x86.go.
-	//
-	// TODO(b/148688965): Remove once this is gone from Go.
-	unix.SYS_MLOCK: []seccomp.Rule{
-		{
-			seccomp.MatchAny{},
-			seccomp.EqualTo(4096),
-		},
-	},
 	unix.SYS_MMAP: []seccomp.Rule{
 		{
 			seccomp.MatchAny{},
@@ -224,6 +213,10 @@ var allowedSyscalls = seccomp.SyscallRules{
 }
 
 var udsSyscalls = seccomp.SyscallRules{
+	unix.SYS_ACCEPT4: {},
+	unix.SYS_BIND:    {},
+	unix.SYS_CONNECT: {},
+	unix.SYS_LISTEN:  {},
 	unix.SYS_SOCKET: []seccomp.Rule{
 		{
 			seccomp.EqualTo(unix.AF_UNIX),
@@ -239,11 +232,6 @@ var udsSyscalls = seccomp.SyscallRules{
 			seccomp.EqualTo(unix.AF_UNIX),
 			seccomp.EqualTo(unix.SOCK_SEQPACKET),
 			seccomp.EqualTo(0),
-		},
-	},
-	unix.SYS_CONNECT: []seccomp.Rule{
-		{
-			seccomp.MatchAny{},
 		},
 	},
 }

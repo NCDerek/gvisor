@@ -16,6 +16,7 @@
 package inet
 
 import (
+	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
@@ -78,8 +79,14 @@ type Stack interface {
 	// RouteTable returns the network stack's route table.
 	RouteTable() []Route
 
+	// Pause pauses the network stack before save.
+	Pause()
+
 	// Resume restarts the network stack after restore.
 	Resume()
+
+	// Destroy the network stack.
+	Destroy()
 
 	// RegisteredEndpoints returns all endpoints which are currently registered.
 	RegisteredEndpoints() []stack.TransportEndpoint
@@ -120,6 +127,10 @@ type Interface struct {
 
 	// MTU is the maximum transmission unit.
 	MTU uint32
+
+	// Features are the device features queried from the host at
+	// stack creation time. These are immutable after startup.
+	Features []linux.EthtoolGetFeaturesBlock
 }
 
 // InterfaceAddr contains information about a network interface address.

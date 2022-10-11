@@ -16,9 +16,9 @@ package kernel
 
 import (
 	"fmt"
-	"sync/atomic"
 	"time"
 
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/log"
 	ktime "gvisor.dev/gvisor/pkg/sentry/kernel/time"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
@@ -57,7 +57,7 @@ type Timekeeper struct {
 	monotonicOffset int64 `state:"nosave"`
 
 	// monotonicLowerBound is the lowerBound for monotonic time.
-	monotonicLowerBound int64 `state:"nosave"`
+	monotonicLowerBound atomicbitops.Int64 `state:"nosave"`
 
 	// restored, if non-nil, indicates that this Timekeeper was restored
 	// from a state file. The clocks are not set until restored is closed.
@@ -200,7 +200,7 @@ func (t *Timekeeper) NowMonotonic() tcpip.MonotonicTime {
 
 // AfterFunc implements tcpip.Clock.
 func (t *Timekeeper) AfterFunc(d time.Duration, f func()) tcpip.Timer {
-	return ktime.TcpipAfterFunc(t.realtimeClock, d, f)
+	return ktime.AfterFunc(t.realtimeClock, d, f)
 }
 
 // startUpdater starts an update goroutine that keeps the clocks updated.
@@ -314,12 +314,12 @@ func (t *Timekeeper) GetTime(c sentrytime.ClockID) (int64, error) {
 			// TSC and host TSC, which may not be perfectly in sync. To
 			// work around this issue, ensure that the monotonic time is
 			// always bounded by the last time read.
-			oldLowerBound := atomic.LoadInt64(&t.monotonicLowerBound)
+			oldLowerBound := t.monotonicLowerBound.Load()
 			if now < oldLowerBound {
 				now = oldLowerBound
 				break
 			}
-			if atomic.CompareAndSwapInt64(&t.monotonicLowerBound, oldLowerBound, now) {
+			if t.monotonicLowerBound.CompareAndSwap(oldLowerBound, now) {
 				break
 			}
 		}

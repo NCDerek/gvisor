@@ -30,6 +30,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	ktime "gvisor.dev/gvisor/pkg/sentry/kernel/time"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
+	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/usermem"
@@ -528,7 +529,7 @@ func (rw *fileReadWriter) WriteFromBlocks(srcs safemem.BlockSeq) (uint64, error)
 		case gap.Ok():
 			// Allocate memory for the write.
 			gapMR := gap.Range().Intersect(pgMR)
-			fr, err := mf.Allocate(gapMR.Length(), rw.f.memUsage)
+			fr, err := mf.Allocate(gapMR.Length(), pgalloc.AllocOpts{Kind: rw.f.memUsage})
 			if err != nil {
 				return done, err
 			}
@@ -613,7 +614,7 @@ func (f *fileInodeOperations) Translate(ctx context.Context, required, optional 
 	}
 
 	mf := f.kernel.MemoryFile()
-	cerr := f.data.Fill(ctx, required, optional, uint64(f.attr.Size), mf, f.memUsage, func(_ context.Context, dsts safemem.BlockSeq, _ uint64) (uint64, error) {
+	_, cerr := f.data.Fill(ctx, required, optional, uint64(f.attr.Size), mf, f.memUsage, false /* populate */, func(_ context.Context, dsts safemem.BlockSeq, _ uint64) (uint64, error) {
 		// Newly-allocated pages are zeroed, so we don't need to do anything.
 		return dsts.NumBytes(), nil
 	})

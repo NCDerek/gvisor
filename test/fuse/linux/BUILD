@@ -21,6 +21,21 @@ cc_binary(
 )
 
 cc_binary(
+    name = "statfs_test",
+    testonly = 1,
+    srcs = ["statfs_test.cc"],
+    deps = [
+        gtest,
+        ":fuse_fd_util",
+        "//test/util:cleanup",
+        "//test/util:fs_util",
+        "//test/util:fuse_util",
+        "//test/util:test_main",
+        "//test/util:test_util",
+    ],
+)
+
+cc_binary(
     name = "open_test",
     testonly = 1,
     srcs = ["open_test.cc"],
@@ -155,6 +170,8 @@ cc_library(
         "//test/util:posix_error",
         "//test/util:temp_path",
         "//test/util:test_util",
+        "//test/util:thread_util",
+        "@com_google_absl//absl/memory",
         "@com_google_absl//absl/strings:str_format",
     ],
 )
@@ -235,8 +252,12 @@ cc_binary(
     srcs = ["mount_test.cc"],
     deps = [
         gtest,
+        ":fuse_base",
+        "//test/util:fs_util",
+        "//test/util:fuse_util",
         "//test/util:mount_util",
         "//test/util:temp_path",
+        "//test/util:temp_umask",
         "//test/util:test_main",
         "//test/util:test_util",
     ],

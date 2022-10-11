@@ -20,8 +20,8 @@ import (
 	"time"
 
 	"github.com/google/go-cmp/cmp"
+	"gvisor.dev/gvisor/pkg/bufferv2"
 	"gvisor.dev/gvisor/pkg/tcpip"
-	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/checker"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/link/channel"
@@ -54,7 +54,8 @@ func (*ndpDispatcher) OnOnLinkPrefixDiscovered(tcpip.NICID, tcpip.Subnet) {
 
 func (*ndpDispatcher) OnOnLinkPrefixInvalidated(tcpip.NICID, tcpip.Subnet) {}
 
-func (*ndpDispatcher) OnAutoGenAddress(tcpip.NICID, tcpip.AddressWithPrefix) {
+func (*ndpDispatcher) OnAutoGenAddress(tcpip.NICID, tcpip.AddressWithPrefix) stack.AddressDispatcher {
+	return nil
 }
 
 func (*ndpDispatcher) OnAutoGenAddressDeprecated(tcpip.NICID, tcpip.AddressWithPrefix) {}
@@ -195,8 +196,8 @@ func TestLoopbackAcceptAllInSubnetUDP(t *testing.T) {
 			if err := s.CreateNIC(nicID, loopback.New()); err != nil {
 				t.Fatalf("CreateNIC(%d, _): %s", nicID, err)
 			}
-			if err := s.AddProtocolAddress(nicID, test.addAddress); err != nil {
-				t.Fatalf("AddProtocolAddress(%d, %+v): %s", nicID, test.addAddress, err)
+			if err := s.AddProtocolAddress(nicID, test.addAddress, stack.AddressProperties{}); err != nil {
+				t.Fatalf("AddProtocolAddress(%d, %+v, {}): %s", nicID, test.addAddress, err)
 			}
 			s.SetRouteTable([]tcpip.Route{
 				{
@@ -290,8 +291,8 @@ func TestLoopbackSubnetLifetimeBoundToAddr(t *testing.T) {
 	if err := s.CreateNIC(nicID, loopback.New()); err != nil {
 		t.Fatalf("s.CreateNIC(%d, _): %s", nicID, err)
 	}
-	if err := s.AddProtocolAddress(nicID, protoAddr); err != nil {
-		t.Fatalf("s.AddProtocolAddress(%d, %#v): %s", nicID, protoAddr, err)
+	if err := s.AddProtocolAddress(nicID, protoAddr, stack.AddressProperties{}); err != nil {
+		t.Fatalf("s.AddProtocolAddress(%d, %+v, {}): %s", nicID, protoAddr, err)
 	}
 	s.SetRouteTable([]tcpip.Route{
 		{
@@ -311,10 +312,10 @@ func TestLoopbackSubnetLifetimeBoundToAddr(t *testing.T) {
 		TTL:      64,
 		TOS:      stack.DefaultTOS,
 	}
-	data := buffer.View([]byte{1, 2, 3, 4})
+	data := []byte{1, 2, 3, 4}
 	if err := r.WritePacket(params, stack.NewPacketBuffer(stack.PacketBufferOptions{
 		ReserveHeaderBytes: int(r.MaxHeaderLength()),
-		Data:               data.ToVectorisedView(),
+		Payload:            bufferv2.MakeWithData(data),
 	})); err != nil {
 		t.Fatalf("r.WritePacket(%#v, _): %s", params, err)
 	}
@@ -326,7 +327,7 @@ func TestLoopbackSubnetLifetimeBoundToAddr(t *testing.T) {
 	{
 		err := r.WritePacket(params, stack.NewPacketBuffer(stack.PacketBufferOptions{
 			ReserveHeaderBytes: int(r.MaxHeaderLength()),
-			Data:               data.ToVectorisedView(),
+			Payload:            bufferv2.MakeWithData(data),
 		}))
 		if _, ok := err.(*tcpip.ErrInvalidEndpointState); !ok {
 			t.Fatalf("got r.WritePacket(%#v, _) = %s, want = %s", params, err, &tcpip.ErrInvalidEndpointState{})
@@ -431,8 +432,8 @@ func TestLoopbackAcceptAllInSubnetTCP(t *testing.T) {
 			if err := s.CreateNIC(nicID, loopback.New()); err != nil {
 				t.Fatalf("CreateNIC(%d, _): %s", nicID, err)
 			}
-			if err := s.AddProtocolAddress(nicID, test.addAddress); err != nil {
-				t.Fatalf("AddProtocolAddress(%d, %#v): %s", nicID, test.addAddress, err)
+			if err := s.AddProtocolAddress(nicID, test.addAddress, stack.AddressProperties{}); err != nil {
+				t.Fatalf("AddProtocolAddress(%d, %+v, {}): %s", nicID, test.addAddress, err)
 			}
 			s.SetRouteTable([]tcpip.Route{
 				{
@@ -446,12 +447,12 @@ func TestLoopbackAcceptAllInSubnetTCP(t *testing.T) {
 			})
 
 			var wq waiter.Queue
-			we, ch := waiter.NewChannelEntry(nil)
-			wq.EventRegister(&we, waiter.ReadableEvents)
+			we, ch := waiter.NewChannelEntry(waiter.ReadableEvents)
+			wq.EventRegister(&we)
 			defer wq.EventUnregister(&we)
 			listeningEndpoint, err := s.NewEndpoint(tcp.ProtocolNumber, test.addAddress.Protocol, &wq)
 			if err != nil {
-				t.Fatalf("NewEndpoint(%d, %d, _): %s", udp.ProtocolNumber, test.addAddress.Protocol, err)
+				t.Fatalf("NewEndpoint(%d, %d, _): %s", tcp.ProtocolNumber, test.addAddress.Protocol, err)
 			}
 			defer listeningEndpoint.Close()
 
@@ -466,7 +467,7 @@ func TestLoopbackAcceptAllInSubnetTCP(t *testing.T) {
 
 			connectingEndpoint, err := s.NewEndpoint(tcp.ProtocolNumber, test.addAddress.Protocol, &wq)
 			if err != nil {
-				t.Fatalf("s.NewEndpoint(%d, %d, _): %s", udp.ProtocolNumber, test.addAddress.Protocol, err)
+				t.Fatalf("s.NewEndpoint(%d, %d, _): %s", tcp.ProtocolNumber, test.addAddress.Protocol, err)
 			}
 			defer connectingEndpoint.Close()
 
@@ -693,21 +694,40 @@ func TestExternalLoopbackTraffic(t *testing.T) {
 			if err := s.CreateNIC(nicID1, e); err != nil {
 				t.Fatalf("CreateNIC(%d, _): %s", nicID1, err)
 			}
-			if err := s.AddAddressWithPrefix(nicID1, ipv4.ProtocolNumber, utils.Ipv4Addr); err != nil {
-				t.Fatalf("AddAddressWithPrefix(%d, %d, %s): %s", nicID1, ipv4.ProtocolNumber, utils.Ipv4Addr, err)
+			v4Addr := tcpip.ProtocolAddress{
+				Protocol:          ipv4.ProtocolNumber,
+				AddressWithPrefix: utils.Ipv4Addr,
 			}
-			if err := s.AddAddressWithPrefix(nicID1, ipv6.ProtocolNumber, utils.Ipv6Addr); err != nil {
-				t.Fatalf("AddAddressWithPrefix(%d, %d, %s): %s", nicID1, ipv6.ProtocolNumber, utils.Ipv6Addr, err)
+			if err := s.AddProtocolAddress(nicID1, v4Addr, stack.AddressProperties{}); err != nil {
+				t.Fatalf("AddProtocolAddress(%d, %+v, {}): %s", nicID1, v4Addr, err)
+			}
+			v6Addr := tcpip.ProtocolAddress{
+				Protocol:          ipv6.ProtocolNumber,
+				AddressWithPrefix: utils.Ipv6Addr,
+			}
+			if err := s.AddProtocolAddress(nicID1, v6Addr, stack.AddressProperties{}); err != nil {
+				t.Fatalf("AddProtocolAddress(%d, %+v, {}): %s", nicID1, v6Addr, err)
 			}
 
 			if err := s.CreateNIC(nicID2, loopback.New()); err != nil {
 				t.Fatalf("CreateNIC(%d, _): %s", nicID2, err)
 			}
-			if err := s.AddAddress(nicID2, ipv4.ProtocolNumber, ipv4Loopback); err != nil {
-				t.Fatalf("AddAddress(%d, %d, %s): %s", nicID2, ipv4.ProtocolNumber, ipv4Loopback, err)
+			protocolAddrV4 := tcpip.ProtocolAddress{
+				Protocol: ipv4.ProtocolNumber,
+				AddressWithPrefix: tcpip.AddressWithPrefix{
+					Address:   ipv4Loopback,
+					PrefixLen: 8,
+				},
 			}
-			if err := s.AddAddress(nicID2, ipv6.ProtocolNumber, header.IPv6Loopback); err != nil {
-				t.Fatalf("AddAddress(%d, %d, %s): %s", nicID2, ipv6.ProtocolNumber, header.IPv6Loopback, err)
+			if err := s.AddProtocolAddress(nicID2, protocolAddrV4, stack.AddressProperties{}); err != nil {
+				t.Fatalf("AddProtocolAddress(%d, %+v, {}): %s", nicID2, protocolAddrV4, err)
+			}
+			protocolAddrV6 := tcpip.ProtocolAddress{
+				Protocol:          ipv6.ProtocolNumber,
+				AddressWithPrefix: header.IPv6Loopback.WithPrefix(),
+			}
+			if err := s.AddProtocolAddress(nicID2, protocolAddrV6, stack.AddressProperties{}); err != nil {
+				t.Fatalf("AddProtocolAddress(%d, %+v, {}): %s", nicID2, protocolAddrV6, err)
 			}
 
 			if test.forwarding {
@@ -720,19 +740,19 @@ func TestExternalLoopbackTraffic(t *testing.T) {
 			}
 
 			s.SetRouteTable([]tcpip.Route{
-				tcpip.Route{
+				{
 					Destination: header.IPv4EmptySubnet,
 					NIC:         nicID1,
 				},
-				tcpip.Route{
+				{
 					Destination: header.IPv6EmptySubnet,
 					NIC:         nicID1,
 				},
-				tcpip.Route{
+				{
 					Destination: ipv4Loopback.WithPrefix().Subnet(),
 					NIC:         nicID2,
 				},
-				tcpip.Route{
+				{
 					Destination: header.IPv6Loopback.WithPrefix().Subnet(),
 					NIC:         nicID2,
 				},

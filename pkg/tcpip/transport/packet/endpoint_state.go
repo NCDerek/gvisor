@@ -15,10 +15,10 @@
 package packet
 
 import (
+	"fmt"
 	"time"
 
 	"gvisor.dev/gvisor/pkg/tcpip"
-	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
 
@@ -32,29 +32,26 @@ func (p *packet) loadReceivedAt(nsec int64) {
 	p.receivedAt = time.Unix(0, nsec)
 }
 
-// saveData saves packet.data field.
-func (p *packet) saveData() buffer.VectorisedView {
-	return p.data.Clone(nil)
-}
-
-// loadData loads packet.data field.
-func (p *packet) loadData(data buffer.VectorisedView) {
-	p.data = data
-}
-
 // beforeSave is invoked by stateify.
 func (ep *endpoint) beforeSave() {
-	ep.freeze()
+	ep.rcvMu.Lock()
+	defer ep.rcvMu.Unlock()
+	ep.rcvDisabled = true
 }
 
 // afterLoad is invoked by stateify.
 func (ep *endpoint) afterLoad() {
-	ep.thaw()
+	ep.mu.Lock()
+	defer ep.mu.Unlock()
+
 	ep.stack = stack.StackFromEnv
 	ep.ops.InitHandler(ep, ep.stack, tcpip.GetStackSendBufferLimits, tcpip.GetStackReceiveBufferLimits)
 
-	// TODO(gvisor.dev/173): Once bind is supported, choose the right NIC.
-	if err := ep.stack.RegisterPacketEndpoint(0, ep.netProto, ep); err != nil {
-		panic(err)
+	if err := ep.stack.RegisterPacketEndpoint(ep.boundNIC, ep.boundNetProto, ep); err != nil {
+		panic(fmt.Sprintf("RegisterPacketEndpoint(%d, %d, _): %s", ep.boundNIC, ep.boundNetProto, err))
 	}
+
+	ep.rcvMu.Lock()
+	ep.rcvDisabled = false
+	ep.rcvMu.Unlock()
 }

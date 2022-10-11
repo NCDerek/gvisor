@@ -19,11 +19,15 @@
 # Fixed parameters.
 iperf_port=45201 # Not likely to be privileged.
 proxy_port=44000 # Ditto.
+mask=8
+
 client_addr=10.0.0.1
 client_proxy_addr=10.0.0.2
 server_proxy_addr=10.0.0.3
 server_addr=10.0.0.4
-mask=8
+full_server_addr=${server_addr}:${iperf_port}
+full_server_proxy_addr=${server_proxy_addr}:${proxy_port}
+iperf_version_arg=
 
 # Defaults; this provides a reasonable approximation of a decent internet link.
 # Parameters can be varied independently from this set to see response to
@@ -42,6 +46,7 @@ duration=30             # 30s is enough time to consistent results (experimental
 helper_dir=$(dirname $0)
 netstack_opts=
 disable_linux_gso=
+disable_linux_gro=
 num_client_threads=1
 
 # Check for netem support.
@@ -133,8 +138,33 @@ while [ $# -gt 0 ]; do
       shift
       netstack_opts="${netstack_opts} -memprofile=$1"
       ;;
+    --blockprofile)
+      shift
+      netstack_opts="${netstack_opts} -blockprofile=$1"
+      ;;
+    --mutexprofile)
+      shift
+      netstack_opts="${netstack_opts} -mutexprofile=$1"
+      ;;
+    --traceprofile)
+      shift
+      netstack_opts="${netstack_opts} -traceprofile=$1"
+      ;;
     --disable-linux-gso)
       disable_linux_gso=1
+      ;;
+    --disable-linux-gro)
+      disable_linux_gro=1
+      ;;
+    --ipv6)
+      client_addr=fd::1
+      client_proxy_addr=fd::2
+      server_proxy_addr=fd::3
+      server_addr=fd::4
+      full_server_addr=[${server_addr}]:${iperf_port}
+      full_server_proxy_addr=[${server_proxy_addr}]:${proxy_port}
+      iperf_version_arg=-V
+      netstack_opts="${netstack_opts} -ipv6"
       ;;
     --num-client-threads)
       shift
@@ -165,7 +195,9 @@ while [ $# -gt 0 ]; do
       echo " --duplicate           set the duplicate probability (%)"
       echo " --helpers             set the helper directory"
       echo " --num-client-threads  number of parallel client threads to run"
-      echo " --disable-linux-gso   disable segmentation offload in the Linux network stack"
+      echo " --disable-linux-gso   disable segmentation offload (TSO, GSO, GRO) in the Linux network stack"
+      echo " --disable-linux-gro   disable GRO in the Linux network stack"
+      echo " --ipv6                use ipv6 for benchmarks"
       echo ""
       echo "The output will of the script will be:"
       echo "  <throughput> <client-cpu-usage> <server-cpu-usage>"
@@ -208,24 +240,24 @@ fi
 
 # Client proxy that will listen on the client's iperf target forward traffic
 # using the host networking stack.
-client_args="${proxy_binary} -port ${proxy_port} -forward ${server_proxy_addr}:${proxy_port}"
+client_args="${proxy_binary} -port ${proxy_port} -forward ${full_server_proxy_addr}"
 if ${client}; then
   # Client proxy that will listen on the client's iperf target
   # and forward traffic using netstack.
   client_args="${proxy_binary} ${netstack_opts} -port ${proxy_port} -client \\
       -mtu ${mtu} -iface client.0 -addr ${client_proxy_addr} -mask ${mask} \\
-      -forward ${server_proxy_addr}:${proxy_port} -gso=${gso} -swgso=${swgso}"
+      -forward ${full_server_proxy_addr} -gso=${gso} -swgso=${swgso}"
 fi
 
 # Server proxy that will listen on the proxy port and forward to the server's
 # iperf server using the host networking stack.
-server_args="${proxy_binary} -port ${proxy_port} -forward ${server_addr}:${iperf_port}"
+server_args="${proxy_binary} -port ${proxy_port} -forward ${full_server_addr}"
 if ${server}; then
   # Server proxy that will listen on the proxy port and forward to the servers'
   # iperf server using netstack.
   server_args="${proxy_binary} ${netstack_opts} -port ${proxy_port} -server \\
       -mtu ${mtu} -iface server.0 -addr ${server_proxy_addr} -mask ${mask} \\
-      -forward ${server_addr}:${iperf_port} -gso=${gso} -swgso=${swgso}"
+      -forward ${full_server_addr} -gso=${gso} -swgso=${swgso}"
 fi
 
 # Specify loss and duplicate parameters only if they are non-zero
@@ -322,10 +354,14 @@ ${nsjoin_binary} /tmp/client.netns ip addr add ${client_addr}/${mask} dev client
 ${nsjoin_binary} /tmp/server.netns ip addr add ${server_addr}/${mask} dev server.0
 if [ "${disable_linux_gso}" == "1" ]; then
   ${nsjoin_binary} /tmp/client.netns ethtool -K client.0 tso off
-  ${nsjoin_binary} /tmp/client.netns ethtool -K client.0 gro off
   ${nsjoin_binary} /tmp/client.netns ethtool -K client.0 gso off
+  ${nsjoin_binary} /tmp/client.netns ethtool -K client.0 gro off
   ${nsjoin_binary} /tmp/server.netns ethtool -K server.0 tso off
   ${nsjoin_binary} /tmp/server.netns ethtool -K server.0 gso off
+  ${nsjoin_binary} /tmp/server.netns ethtool -K server.0 gro off
+fi
+if [ "${disable_linux_gro}" == "1" ]; then
+  ${nsjoin_binary} /tmp/client.netns ethtool -K client.0 gro off
   ${nsjoin_binary} /tmp/server.netns ethtool -K server.0 gro off
 fi
 ${nsjoin_binary} /tmp/client.netns ip link set client.0 up
@@ -335,14 +371,18 @@ ${nsjoin_binary} /tmp/server.netns ip link set lo up
 ip link set dev client.1 up
 ip link set dev server.1 up
 
-${nsjoin_binary} /tmp/client.netns ${client_args} &
-client_pid=\$!
 ${nsjoin_binary} /tmp/server.netns ${server_args} &
 server_pid=\$!
 
 # Start the iperf server.
-${nsjoin_binary} /tmp/server.netns iperf -p ${iperf_port} -s >&2 &
+${nsjoin_binary} /tmp/server.netns iperf ${iperf_version_arg} -p ${iperf_port} -s >&2 &
 iperf_pid=\$!
+
+# Give services time to start.
+sleep 5
+
+${nsjoin_binary} /tmp/client.netns ${client_args} &
+client_pid=\$!
 
 # Show traffic information.
 if ! ${client} && ! ${server}; then
@@ -365,7 +405,7 @@ trap cleanup EXIT
 
 # Run the benchmark, recording the results file.
 while ${nsjoin_binary} /tmp/client.netns iperf \\
-    -p ${proxy_port} -c ${client_addr} -t ${duration} -f m -P ${num_client_threads} 2>&1 \\
+    ${iperf_version_arg} -p ${proxy_port} -c ${client_addr} -t ${duration} -f m -P ${num_client_threads} 2>&1 \\
     | tee \$results_file \\
     | grep "connect failed" >/dev/null; do
   sleep 0.1 # Wait for all services.

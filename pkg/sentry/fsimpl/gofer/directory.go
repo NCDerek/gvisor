@@ -16,12 +16,14 @@ package gofer
 
 import (
 	"fmt"
-	"sync/atomic"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/lisafs"
+	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/p9"
 	"gvisor.dev/gvisor/pkg/refsvfs2"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
@@ -36,10 +38,32 @@ func (d *dentry) isDir() bool {
 }
 
 // Preconditions:
-// * filesystem.renameMu must be locked.
-// * d.dirMu must be locked.
-// * d.isDir().
-// * child must be a newly-created dentry that has never had a parent.
+//   - filesystem.renameMu must be locked.
+//   - d.dirMu must be locked.
+//   - d.isDir().
+//   - child must be a newly-created dentry that has never had a parent.
+func (d *dentry) insertCreatedChildLocked(ctx context.Context, childIno *lisafs.Inode, childName string, updateChild func(child *dentry), ds **[]*dentry) error {
+	child, err := d.fs.newDentryLisa(ctx, childIno)
+	if err != nil {
+		if err := d.controlFDLisa.UnlinkAt(ctx, childName, 0 /* flags */); err != nil {
+			log.Warningf("failed to clean up created child %s after newDentryLisa() failed: %v", childName, err)
+		}
+		d.fs.clientLisa.CloseFD(ctx, childIno.ControlFD, false /* flush */)
+		return err
+	}
+	d.cacheNewChildLocked(child, childName)
+	appendNewChildDentry(ds, d, child)
+	if updateChild != nil {
+		updateChild(child)
+	}
+	return nil
+}
+
+// Preconditions:
+//   - filesystem.renameMu must be locked.
+//   - d.dirMu must be locked.
+//   - d.isDir().
+//   - child must be a newly-created dentry that has never had a parent.
 func (d *dentry) cacheNewChildLocked(child *dentry, name string) {
 	d.IncRef() // reference held by child on its parent
 	child.parent = d
@@ -51,8 +75,8 @@ func (d *dentry) cacheNewChildLocked(child *dentry, name string) {
 }
 
 // Preconditions:
-// * d.dirMu must be locked.
-// * d.isDir().
+//   - d.dirMu must be locked.
+//   - d.isDir().
 func (d *dentry) cacheNegativeLookupLocked(name string) {
 	// Don't cache negative lookups if InteropModeShared is in effect (since
 	// this makes remote lookup unavoidable), or if d.isSynthetic() (in which
@@ -86,27 +110,27 @@ type createSyntheticOpts struct {
 // in d.
 //
 // Preconditions:
-// * d.dirMu must be locked.
-// * d.isDir().
-// * d does not already contain a child with the given name.
+//   - d.dirMu must be locked.
+//   - d.isDir().
+//   - d does not already contain a child with the given name.
 func (d *dentry) createSyntheticChildLocked(opts *createSyntheticOpts) {
 	now := d.fs.clock.Now().Nanoseconds()
 	child := &dentry{
-		refs:      1, // held by d
+		refs:      atomicbitops.FromInt64(1), // held by d
 		fs:        d.fs,
 		ino:       d.fs.nextIno(),
-		mode:      uint32(opts.mode),
-		uid:       uint32(opts.kuid),
-		gid:       uint32(opts.kgid),
-		blockSize: hostarch.PageSize, // arbitrary
-		atime:     now,
-		mtime:     now,
-		ctime:     now,
-		btime:     now,
-		readFD:    -1,
-		writeFD:   -1,
-		mmapFD:    -1,
-		nlink:     uint32(2),
+		mode:      atomicbitops.FromUint32(uint32(opts.mode)),
+		uid:       atomicbitops.FromUint32(uint32(opts.kuid)),
+		gid:       atomicbitops.FromUint32(uint32(opts.kgid)),
+		blockSize: atomicbitops.FromUint32(hostarch.PageSize), // arbitrary
+		atime:     atomicbitops.FromInt64(now),
+		mtime:     atomicbitops.FromInt64(now),
+		ctime:     atomicbitops.FromInt64(now),
+		btime:     atomicbitops.FromInt64(now),
+		readFD:    atomicbitops.FromInt32(-1),
+		writeFD:   atomicbitops.FromInt32(-1),
+		mmapFD:    atomicbitops.FromInt32(-1),
+		nlink:     atomicbitops.FromUint32(2),
 	}
 	refsvfs2.Register(child)
 	switch opts.mode.FileType() {
@@ -120,10 +144,19 @@ func (d *dentry) createSyntheticChildLocked(opts *createSyntheticOpts) {
 		panic(fmt.Sprintf("failed to create synthetic file of unrecognized type: %v", opts.mode.FileType()))
 	}
 	child.pf.dentry = child
+	child.cacheEntry.d = child
+	child.syncableListEntry.d = child
 	child.vfsd.Init(child)
 
 	d.cacheNewChildLocked(child, opts.name)
 	d.syntheticChildren++
+}
+
+// Preconditions:
+//   - d.dirMu must be locked.
+func (d *dentry) clearDirentsLocked() {
+	d.dirents = nil
+	d.childrenSet = nil
 }
 
 // +stateify savable
@@ -154,7 +187,6 @@ func (fd *directoryFD) IterDirents(ctx context.Context, cb vfs.IterDirentsCallba
 		fd.dirents = ds
 	}
 
-	d.InotifyWithParent(ctx, linux.IN_ACCESS, 0, vfs.PathEvent)
 	if d.cachedMetadataAuthoritative() {
 		d.touchAtime(fd.vfsfd.Mount())
 	}
@@ -169,8 +201,8 @@ func (fd *directoryFD) IterDirents(ctx context.Context, cb vfs.IterDirentsCallba
 }
 
 // Preconditions:
-// * d.isDir().
-// * There exists at least one directoryFD representing d.
+//   - d.isDir().
+//   - There exists at least one directoryFD representing d.
 func (d *dentry) getDirents(ctx context.Context) ([]vfs.Dirent, error) {
 	// NOTE(b/135560623): 9P2000.L's readdir does not specify behavior in the
 	// presence of concurrent mutation of an iterated directory, so
@@ -207,7 +239,7 @@ func (d *dentry) getDirents(ctx context.Context) ([]vfs.Dirent, error) {
 		},
 		{
 			Name:    "..",
-			Type:    uint8(atomic.LoadUint32(&parent.mode) >> 12),
+			Type:    uint8(parent.mode.Load() >> 12),
 			Ino:     uint64(parent.ino),
 			NextOff: 2,
 		},
@@ -222,47 +254,88 @@ func (d *dentry) getDirents(ctx context.Context) ([]vfs.Dirent, error) {
 		off := uint64(0)
 		const count = 64 * 1024 // for consistency with the vfs1 client
 		d.handleMu.RLock()
-		if d.readFile.isNil() {
+		if !d.isReadFileOk() {
 			// This should not be possible because a readable handle should
 			// have been opened when the calling directoryFD was opened.
 			d.handleMu.RUnlock()
 			panic("gofer.dentry.getDirents called without a readable handle")
 		}
+		// shouldSeek0 indicates whether the server should SEEK to 0 before reading
+		// directory entries.
+		shouldSeek0 := true
 		for {
-			p9ds, err := d.readFile.readdir(ctx, off, count)
-			if err != nil {
-				d.handleMu.RUnlock()
-				return nil, err
+			if d.fs.opts.lisaEnabled {
+				countLisa := int32(count)
+				if shouldSeek0 {
+					// See lisafs.Getdents64Req.Count.
+					countLisa = -countLisa
+					shouldSeek0 = false
+				}
+				lisafsDs, err := d.readFDLisa.Getdents64(ctx, countLisa)
+				if err != nil {
+					d.handleMu.RUnlock()
+					return nil, err
+				}
+				if len(lisafsDs) == 0 {
+					d.handleMu.RUnlock()
+					break
+				}
+				for i := range lisafsDs {
+					name := string(lisafsDs[i].Name)
+					if name == "." || name == ".." {
+						continue
+					}
+					dirent := vfs.Dirent{
+						Name: name,
+						Ino: d.fs.inoFromKey(inoKey{
+							ino:      uint64(lisafsDs[i].Ino),
+							devMinor: uint32(lisafsDs[i].DevMinor),
+							devMajor: uint32(lisafsDs[i].DevMajor),
+						}),
+						NextOff: int64(len(dirents) + 1),
+						Type:    uint8(lisafsDs[i].Type),
+					}
+					dirents = append(dirents, dirent)
+					if realChildren != nil {
+						realChildren[name] = struct{}{}
+					}
+				}
+			} else {
+				p9ds, err := d.readFile.readdir(ctx, off, count)
+				if err != nil {
+					d.handleMu.RUnlock()
+					return nil, err
+				}
+				if len(p9ds) == 0 {
+					d.handleMu.RUnlock()
+					break
+				}
+				for _, p9d := range p9ds {
+					if p9d.Name == "." || p9d.Name == ".." {
+						continue
+					}
+					dirent := vfs.Dirent{
+						Name:    p9d.Name,
+						Ino:     d.fs.inoFromQIDPath(p9d.QID.Path),
+						NextOff: int64(len(dirents) + 1),
+					}
+					// p9 does not expose 9P2000.U's DMDEVICE, DMNAMEDPIPE, or
+					// DMSOCKET.
+					switch p9d.Type {
+					case p9.TypeSymlink:
+						dirent.Type = linux.DT_LNK
+					case p9.TypeDir:
+						dirent.Type = linux.DT_DIR
+					default:
+						dirent.Type = linux.DT_REG
+					}
+					dirents = append(dirents, dirent)
+					if realChildren != nil {
+						realChildren[p9d.Name] = struct{}{}
+					}
+				}
+				off = p9ds[len(p9ds)-1].Offset
 			}
-			if len(p9ds) == 0 {
-				d.handleMu.RUnlock()
-				break
-			}
-			for _, p9d := range p9ds {
-				if p9d.Name == "." || p9d.Name == ".." {
-					continue
-				}
-				dirent := vfs.Dirent{
-					Name:    p9d.Name,
-					Ino:     d.fs.inoFromQIDPath(p9d.QID.Path),
-					NextOff: int64(len(dirents) + 1),
-				}
-				// p9 does not expose 9P2000.U's DMDEVICE, DMNAMEDPIPE, or
-				// DMSOCKET.
-				switch p9d.Type {
-				case p9.TypeSymlink:
-					dirent.Type = linux.DT_LNK
-				case p9.TypeDir:
-					dirent.Type = linux.DT_DIR
-				default:
-					dirent.Type = linux.DT_REG
-				}
-				dirents = append(dirents, dirent)
-				if realChildren != nil {
-					realChildren[p9d.Name] = struct{}{}
-				}
-			}
-			off = p9ds[len(p9ds)-1].Offset
 		}
 	}
 	// Emit entries for synthetic children.
@@ -276,7 +349,7 @@ func (d *dentry) getDirents(ctx context.Context) ([]vfs.Dirent, error) {
 			}
 			dirents = append(dirents, vfs.Dirent{
 				Name:    child.name,
-				Type:    uint8(atomic.LoadUint32(&child.mode) >> 12),
+				Type:    uint8(child.mode.Load() >> 12),
 				Ino:     uint64(child.ino),
 				NextOff: int64(len(dirents) + 1),
 			})
@@ -285,6 +358,10 @@ func (d *dentry) getDirents(ctx context.Context) ([]vfs.Dirent, error) {
 	// Cache dirents for future directoryFDs if permitted.
 	if d.cachedMetadataAuthoritative() {
 		d.dirents = dirents
+		d.childrenSet = make(map[string]struct{}, len(dirents))
+		for _, dirent := range d.dirents {
+			d.childrenSet[dirent.Name] = struct{}{}
+		}
 	}
 	return dirents, nil
 }

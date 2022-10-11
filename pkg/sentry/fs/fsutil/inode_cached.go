@@ -45,11 +45,11 @@ import (
 //
 // CachingInodeOperations implements Mappable for the CachedFileObject:
 //
-// - If CachedFileObject.FD returns a value >= 0 then the file descriptor
-//   will be memory mapped on the host.
+//   - If CachedFileObject.FD returns a value >= 0 then the file descriptor
+//     will be memory mapped on the host.
 //
-// - Otherwise, the contents of CachedFileObject are buffered into memory
-//   managed by the CachingInodeOperations.
+//   - Otherwise, the contents of CachedFileObject are buffered into memory
+//     managed by the CachingInodeOperations.
 //
 // Implementations of FileOperations for a CachedFileObject must read and
 // write through CachingInodeOperations using Read and Write respectively.
@@ -658,7 +658,7 @@ func (rw *inodeReadWriter) ReadToBlocks(dsts safemem.BlockSeq) (uint64, error) {
 					End:   fs.OffsetPageEnd(int64(gapMR.End)),
 				}
 				optMR := gap.Range()
-				err := rw.c.cache.Fill(rw.ctx, reqMR, maxFillRange(reqMR, optMR), uint64(rw.c.attr.Size), mem, usage.PageCache, rw.c.backingFile.ReadToBlocksAt)
+				_, err := rw.c.cache.Fill(rw.ctx, reqMR, maxFillRange(reqMR, optMR), uint64(rw.c.attr.Size), mem, usage.PageCache, false /* populate */, rw.c.backingFile.ReadToBlocksAt)
 				mem.MarkEvictable(rw.c, pgalloc.EvictableRange{optMR.Start, optMR.End})
 				seg, gap = rw.c.cache.Find(uint64(rw.offset))
 				if !seg.Ok() {
@@ -696,8 +696,8 @@ func (rw *inodeReadWriter) ReadToBlocks(dsts safemem.BlockSeq) (uint64, error) {
 // bytes were written.
 //
 // Preconditions:
-// * rw.c.attrMu must be locked.
-// * rw.c.dataMu must be locked.
+//   - rw.c.attrMu must be locked.
+//   - rw.c.dataMu must be locked.
 func (rw *inodeReadWriter) maybeUpdateAttrs(nwritten uint64) {
 	// If the write ends beyond the file's previous size, it causes the
 	// file to grow.
@@ -891,7 +891,7 @@ func (c *CachingInodeOperations) Translate(ctx context.Context, required, option
 	}
 
 	mf := c.mfp.MemoryFile()
-	cerr := c.cache.Fill(ctx, required, maxFillRange(required, optional), uint64(c.attr.Size), mf, usage.PageCache, c.backingFile.ReadToBlocksAt)
+	_, cerr := c.cache.Fill(ctx, required, maxFillRange(required, optional), uint64(c.attr.Size), mf, usage.PageCache, false /* populate */, c.backingFile.ReadToBlocksAt)
 
 	var ts []memmap.Translation
 	var translatedEnd uint64

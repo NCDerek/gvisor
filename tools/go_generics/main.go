@@ -15,44 +15,44 @@
 // go_generics reads a Go source file and writes a new version of that file with
 // a few transformations applied to each. Namely:
 //
-// 1. Global types can be explicitly renamed with the -t option. For example,
-//    if -t=A=B is passed in, all references to A will be replaced with
-//    references to B; a function declaration like:
+//  1. Global types can be explicitly renamed with the -t option. For example,
+//     if -t=A=B is passed in, all references to A will be replaced with
+//     references to B; a function declaration like:
 //
-//    func f(arg *A)
+//     func f(arg *A)
 //
-//    would be renamed to:
+//     would be renamed to:
 //
-//    func f(arg *B)
+//     func f(arg *B)
 //
-// 2. Global type definitions and their method sets will be removed when they're
-//    being renamed with -t. For example, if -t=A=B is passed in, the following
-//    definition and methods that existed in the input file wouldn't exist at
-//    all in the output file:
+//  2. Global type definitions and their method sets will be removed when they're
+//     being renamed with -t. For example, if -t=A=B is passed in, the following
+//     definition and methods that existed in the input file wouldn't exist at
+//     all in the output file:
 //
-//    type A struct{}
+//     type A struct{}
 //
-//    func (*A) f() {}
+//     func (*A) f() {}
 //
-// 3. All global types, variables, constants and functions (not methods) are
-//    prefixed and suffixed based on the option -prefix and -suffix arguments.
-//    For example, if -suffix=A is passed in, the following globals:
+//  3. All global types, variables, constants and functions (not methods) are
+//     prefixed and suffixed based on the option -prefix and -suffix arguments.
+//     For example, if -suffix=A is passed in, the following globals:
 //
-//    func f()
-//    type t struct{}
+//     func f()
+//     type t struct{}
 //
-//    would be renamed to:
+//     would be renamed to:
 //
-//    func fA()
-//    type tA struct{}
+//     func fA()
+//     type tA struct{}
 //
-//    Some special tags are also modified. For example:
+//     Some special tags are also modified. For example:
 //
-//    "state:.(t)"
+//     "state:.(t)"
 //
-//    would become:
+//     would become:
 //
-//    "state:.(tA)"
+//     "state:.(tA)"
 //
 // 4. The package is renamed to the value via the -p argument.
 // 5. Value of constants can be modified with -c argument.
@@ -63,21 +63,21 @@
 //
 // var b = 100
 //
-// func f() {
-//   g(b)
-//   b := 0
-//   g(b)
-// }
+//	func f() {
+//		g(b)
+//		b := 0
+//		g(b)
+//	}
 //
 // Would be replaced with:
 //
 // var bA = 100
 //
-// func f() {
-//   g(bA)
-//   b := 0
-//   g(b)
-// }
+//	func f() {
+//		g(bA)
+//		b := 0
+//		g(b)
+//	}
 //
 // Note that the second call to g() kept "b" as an argument because it refers to
 // the local variable "b".
@@ -117,6 +117,7 @@ var (
 	types       = make(mapValue)
 	consts      = make(mapValue)
 	imports     = make(mapValue)
+	substr      = make(mapValue)
 )
 
 // mapValue implements flag.Value. We use a mapValue flag instead of a regular
@@ -165,6 +166,7 @@ func main() {
 	flag.Var(types, "t", "rename type A to B when `A=B` is passed in. Multiple such mappings are allowed.")
 	flag.Var(consts, "c", "reassign constant A to value B when `A=B` is passed in. Multiple such mappings are allowed.")
 	flag.Var(imports, "import", "specifies the import libraries to use when types are not local. `name=path` specifies that 'name', used in types as name.type, refers to the package living in 'path'.")
+	flag.Var(substr, "s", "replace sub-string A with B when `A=B` is passed in. Multiple such mappings are allowed.")
 	flag.Parse()
 
 	if *input == "" || *output == "" {
@@ -279,7 +281,12 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := ioutil.WriteFile(*output, buf.Bytes(), 0644); err != nil {
+	byteBuf := buf.Bytes()
+	for old, new := range substr {
+		byteBuf = bytes.ReplaceAll(byteBuf, []byte(old), []byte(new))
+	}
+
+	if err := ioutil.WriteFile(*output, byteBuf, 0644); err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
 		os.Exit(1)
 	}

@@ -15,24 +15,23 @@
 package gofer
 
 import (
-	"sync/atomic"
 	"testing"
 
 	"gvisor.dev/gvisor/pkg/p9"
 	"gvisor.dev/gvisor/pkg/sentry/contexttest"
+	"gvisor.dev/gvisor/pkg/sentry/kernel/time"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 )
 
 func TestDestroyIdempotent(t *testing.T) {
 	ctx := contexttest.Context(t)
 	fs := filesystem{
-		mfp: pgalloc.MemoryFileProviderFromContext(ctx),
-		opts: filesystemOptions{
-			// Test relies on no dentry being held in the cache.
-			maxCachedDentries: 0,
-		},
-		syncableDentries: make(map[*dentry]struct{}),
-		inoByQIDPath:     make(map[uint64]uint64),
+		mfp:          pgalloc.MemoryFileProviderFromContext(ctx),
+		inoByQIDPath: make(map[uint64]uint64),
+		inoByKey:     make(map[inoKey]uint64),
+		clock:        time.RealtimeClockFromContext(ctx),
+		// Test relies on no dentry being held in the cache.
+		dentryCache: &dentryCache{maxCachedDentries: 0},
 	}
 
 	attr := &p9.Attr{
@@ -56,11 +55,11 @@ func TestDestroyIdempotent(t *testing.T) {
 	fs.renameMu.Lock()
 	defer fs.renameMu.Unlock()
 	child.checkCachingLocked(ctx, true /* renameMuWriteLocked */)
-	if got := atomic.LoadInt64(&child.refs); got != -1 {
+	if got := child.refs.Load(); got != -1 {
 		t.Fatalf("child.refs=%d, want: -1", got)
 	}
 	// Parent will also be destroyed when child reference is removed.
-	if got := atomic.LoadInt64(&parent.refs); got != -1 {
+	if got := parent.refs.Load(); got != -1 {
 		t.Fatalf("parent.refs=%d, want: -1", got)
 	}
 	child.checkCachingLocked(ctx, true /* renameMuWriteLocked */)

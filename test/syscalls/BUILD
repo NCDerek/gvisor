@@ -84,6 +84,12 @@ syscall_test(
 )
 
 syscall_test(
+    add_overlay = True,
+    test = "//test/syscalls/linux:pivot_root_test",
+    use_tmpfs = True,
+)
+
+syscall_test(
     test = "//test/syscalls/linux:clock_getres_test",
 )
 
@@ -188,6 +194,10 @@ syscall_test(
 )
 
 syscall_test(
+    test = "//test/syscalls/linux:fpsig_mut_test",
+)
+
+syscall_test(
     test = "//test/syscalls/linux:fpsig_nested_test",
 )
 
@@ -216,10 +226,6 @@ syscall_test(
 )
 
 syscall_test(
-    test = "//test/syscalls/linux:verity_getdents_test",
-)
-
-syscall_test(
     test = "//test/syscalls/linux:getrandom_test",
 )
 
@@ -235,12 +241,15 @@ syscall_test(
 
 syscall_test(
     size = "medium",
+    add_hostinet = True,
     add_overlay = True,
     test = "//test/syscalls/linux:ioctl_test",
 )
 
 syscall_test(
-    test = "//test/syscalls/linux:verity_ioctl_test",
+    # Temporarily added due to intermittent ENOMEM failures. See b/216213621.
+    tags = ["notap"],
+    test = "//test/syscalls/linux:iouring_test",
 )
 
 syscall_test(
@@ -307,6 +316,11 @@ syscall_test(
 )
 
 syscall_test(
+    add_overlay = True,
+    test = "//test/syscalls/linux:fifo_test",
+)
+
+syscall_test(
     test = "//test/syscalls/linux:mlock_test",
 )
 
@@ -317,12 +331,12 @@ syscall_test(
 )
 
 syscall_test(
-    test = "//test/syscalls/linux:verity_mmap_test",
+    add_overlay = True,
+    test = "//test/syscalls/linux:mount_test",
 )
 
 syscall_test(
-    add_overlay = True,
-    test = "//test/syscalls/linux:mount_test",
+    test = "//test/syscalls/linux:mq_test",
 )
 
 syscall_test(
@@ -356,6 +370,10 @@ syscall_test(
     add_overlay = True,
     shard_count = more_shards,
     test = "//test/syscalls/linux:open_test",
+)
+
+syscall_test(
+    test = "//test/syscalls/linux:packet_socket_dgram_test",
 )
 
 syscall_test(
@@ -427,6 +445,11 @@ syscall_test(
 syscall_test(
     size = "medium",
     test = "//test/syscalls/linux:proc_test",
+)
+
+syscall_test(
+    container = True,
+    test = "//test/syscalls/linux:proc_isolated_test",
 )
 
 syscall_test(
@@ -580,7 +603,7 @@ syscall_test(
 )
 
 # TODO(b/119826902): Enable once the test passes in runsc.
-# syscall_test(vfs2="True",test = "//test/syscalls/linux:sigaltstack_test")
+# syscall_test(test = "//test/syscalls/linux:sigaltstack_test")
 
 syscall_test(
     test = "//test/syscalls/linux:sigreturn_test",
@@ -651,8 +674,8 @@ syscall_test(
 
 syscall_test(
     size = "large",
+    container = True,
     shard_count = most_shards,
-    tags = ["container"],
     test = "//test/syscalls/linux:socket_inet_loopback_isolated_test",
 )
 
@@ -740,6 +763,11 @@ syscall_test(
 syscall_test(
     shard_count = more_shards,
     test = "//test/syscalls/linux:socket_ip_unbound_test",
+)
+
+syscall_test(
+    shard_count = more_shards,
+    test = "//test/syscalls/linux:socket_ipv6_unbound_test",
 )
 
 syscall_test(
@@ -893,10 +921,6 @@ syscall_test(
 )
 
 syscall_test(
-    test = "//test/syscalls/linux:verity_symlink_test",
-)
-
-syscall_test(
     add_overlay = True,
     test = "//test/syscalls/linux:sync_test",
 )
@@ -1038,5 +1062,17 @@ syscall_test(
 )
 
 syscall_test(
-    test = "//test/syscalls/linux:verity_mount_test",
+    test = "//test/syscalls/linux:deleted_test",
+)
+
+syscall_test(
+    size = "small",
+    test = "//test/syscalls/linux:close_range_test",
+)
+
+syscall_test(
+    size = "small",
+    # TODO(b/245647342): These tests are flaky on native.
+    allow_native = False,
+    test = "//test/syscalls/linux:process_vm_read_write",
 )

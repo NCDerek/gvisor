@@ -25,38 +25,52 @@ go_library(
         "stdclock.go",
         "stdclock_state.go",
         "tcpip.go",
+        "tcpip_state.go",
         "timer.go",
     ],
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/atomicbitops",
+        "//pkg/bufferv2",
         "//pkg/sync",
-        "//pkg/tcpip/buffer",
         "//pkg/waiter",
     ],
 )
 
 deps_test(
     name = "netstack_deps_test",
+    # NOTE: Try not to let allowed or allowed_prefixes to grow large.
+    #
+    # Netstack is intentionally somewhat separate from the rest of gVisor; it is
+    # intended to be usable separately as a library. Therefore we limit its
+    # dependencies to a small set of packages. If you're adding dependencies,
+    # consider whether netstack should really depend on them.
     allowed = [
         # gVisor deps.
         "//pkg/atomicbitops",
-        "//pkg/buffer",
+        "//pkg/bits",
         "//pkg/context",
+        "//pkg/bufferv2",
+        "//pkg/cpuid",
         "//pkg/gohacks",
         "//pkg/goid",
         "//pkg/ilist",
         "//pkg/linewriter",
         "//pkg/log",
+        "//pkg/pool",
         "//pkg/rand",
+        "//pkg/refs",
+        "//pkg/refsvfs2",
         "//pkg/sleep",
         "//pkg/state",
         "//pkg/state/wire",
         "//pkg/sync",
         "//pkg/waiter",
+        "//pkg/xdp",
 
         # Other deps.
         "@com_github_google_btree//:go_default_library",
+        "@org_golang_x_sys//cpu:go_default_library",
         "@org_golang_x_sys//unix:go_default_library",
         "@org_golang_x_time//rate:go_default_library",
     ],
@@ -66,6 +80,8 @@ deps_test(
     ],
     targets = [
         "//pkg/tcpip",
+        "//pkg/tcpip/adapters/gonet",
+        "//pkg/tcpip/link/channel",
         "//pkg/tcpip/header",
         "//pkg/tcpip/link/fdbased",
         "//pkg/tcpip/link/loopback",

@@ -20,9 +20,9 @@ import (
 	"testing"
 	"time"
 
+	"gvisor.dev/gvisor/pkg/bufferv2"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
-	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/faketime"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 )
@@ -80,12 +80,12 @@ func (*fwdTestNetworkEndpoint) DefaultTTL() uint8 {
 	return 123
 }
 
-func (f *fwdTestNetworkEndpoint) HandlePacket(pkt *PacketBuffer) {
+func (f *fwdTestNetworkEndpoint) HandlePacket(pkt PacketBufferPtr) {
 	if _, _, ok := f.proto.Parse(pkt); !ok {
 		return
 	}
 
-	netHdr := pkt.NetworkHeader().View()
+	netHdr := pkt.NetworkHeader().Slice()
 	_, dst := f.proto.ParseAddresses(netHdr)
 
 	addressEndpoint := f.AcquireAssignedAddress(dst, f.nic.Promiscuous(), CanBePrimaryEndpoint)
@@ -102,10 +102,9 @@ func (f *fwdTestNetworkEndpoint) HandlePacket(pkt *PacketBuffer) {
 	}
 	defer r.Release()
 
-	vv := buffer.NewVectorisedView(pkt.Size(), pkt.Views())
 	pkt = NewPacketBuffer(PacketBufferOptions{
 		ReserveHeaderBytes: int(r.MaxHeaderLength()),
-		Data:               vv.ToView().ToVectorisedView(),
+		Payload:            pkt.ToBuffer(),
 	})
 	// TODO(gvisor.dev/issue/1085) Decrease the TTL field in forwarded packets.
 	_ = r.WriteHeaderIncludedPacket(pkt)
@@ -119,29 +118,26 @@ func (f *fwdTestNetworkEndpoint) NetworkProtocolNumber() tcpip.NetworkProtocolNu
 	return f.proto.Number()
 }
 
-func (f *fwdTestNetworkEndpoint) WritePacket(r *Route, params NetworkHeaderParams, pkt *PacketBuffer) tcpip.Error {
+func (f *fwdTestNetworkEndpoint) WritePacket(r *Route, params NetworkHeaderParams, pkt PacketBufferPtr) tcpip.Error {
 	// Add the protocol's header to the packet and send it to the link
 	// endpoint.
 	b := pkt.NetworkHeader().Push(fwdTestNetHeaderLen)
 	b[dstAddrOffset] = r.RemoteAddress()[0]
 	b[srcAddrOffset] = r.LocalAddress()[0]
 	b[protocolNumberOffset] = byte(params.Protocol)
+	pkt.NetworkProtocolNumber = fwdTestNetNumber
 
-	return f.nic.WritePacket(r, fwdTestNetNumber, pkt)
+	return f.nic.WritePacket(r, pkt)
 }
 
-// WritePackets implements LinkEndpoint.WritePackets.
-func (*fwdTestNetworkEndpoint) WritePackets(*Route, PacketBufferList, NetworkHeaderParams) (int, tcpip.Error) {
-	panic("not implemented")
-}
-
-func (f *fwdTestNetworkEndpoint) WriteHeaderIncludedPacket(r *Route, pkt *PacketBuffer) tcpip.Error {
+func (f *fwdTestNetworkEndpoint) WriteHeaderIncludedPacket(r *Route, pkt PacketBufferPtr) tcpip.Error {
 	// The network header should not already be populated.
 	if _, ok := pkt.NetworkHeader().Consume(fwdTestNetHeaderLen); !ok {
 		return &tcpip.ErrMalformedHeader{}
 	}
+	pkt.NetworkProtocolNumber = fwdTestNetNumber
 
-	return f.nic.WritePacket(r, fwdTestNetNumber, pkt)
+	return f.nic.WritePacket(r, pkt)
 }
 
 func (f *fwdTestNetworkEndpoint) Close() {
@@ -181,15 +177,11 @@ func (*fwdTestNetworkProtocol) MinimumPacketSize() int {
 	return fwdTestNetHeaderLen
 }
 
-func (*fwdTestNetworkProtocol) DefaultPrefixLen() int {
-	return fwdTestNetDefaultPrefixLen
-}
-
-func (*fwdTestNetworkProtocol) ParseAddresses(v buffer.View) (src, dst tcpip.Address) {
+func (*fwdTestNetworkProtocol) ParseAddresses(v []byte) (src, dst tcpip.Address) {
 	return tcpip.Address(v[srcAddrOffset : srcAddrOffset+1]), tcpip.Address(v[dstAddrOffset : dstAddrOffset+1])
 }
 
-func (*fwdTestNetworkProtocol) Parse(pkt *PacketBuffer) (tcpip.TransportProtocolNumber, bool, bool) {
+func (*fwdTestNetworkProtocol) Parse(pkt PacketBufferPtr) (tcpip.TransportProtocolNumber, bool, bool) {
 	netHeader, ok := pkt.NetworkHeader().Consume(fwdTestNetHeaderLen)
 	if !ok {
 		return 0, false, false
@@ -203,7 +195,7 @@ func (f *fwdTestNetworkProtocol) NewEndpoint(nic NetworkInterface, dispatcher Tr
 		proto:      f,
 		dispatcher: dispatcher,
 	}
-	e.AddressableEndpointState.Init(e)
+	e.AddressableEndpointState.Init(e, AddressableEndpointStateOptions{HiddenWhileDisabled: false})
 	return e
 }
 
@@ -248,17 +240,12 @@ func (f *fwdTestNetworkEndpoint) Forwarding() bool {
 }
 
 // SetForwarding implements stack.ForwardingNetworkEndpoint.
-func (f *fwdTestNetworkEndpoint) SetForwarding(v bool) {
+func (f *fwdTestNetworkEndpoint) SetForwarding(v bool) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	prev := f.mu.forwarding
 	f.mu.forwarding = v
-}
-
-// fwdTestPacketInfo holds all the information about an outbound packet.
-type fwdTestPacketInfo struct {
-	RemoteLinkAddress tcpip.LinkAddress
-	LocalLinkAddress  tcpip.LinkAddress
-	Pkt               *PacketBuffer
+	return prev
 }
 
 var _ LinkEndpoint = (*fwdTestLinkEndpoint)(nil)
@@ -269,17 +256,17 @@ type fwdTestLinkEndpoint struct {
 	linkAddr   tcpip.LinkAddress
 
 	// C is where outbound packets are queued.
-	C chan fwdTestPacketInfo
+	C chan PacketBufferPtr
 }
 
 // InjectInbound injects an inbound packet.
-func (e *fwdTestLinkEndpoint) InjectInbound(protocol tcpip.NetworkProtocolNumber, pkt *PacketBuffer) {
+func (e *fwdTestLinkEndpoint) InjectInbound(protocol tcpip.NetworkProtocolNumber, pkt PacketBufferPtr) {
 	e.InjectLinkAddr(protocol, "", pkt)
 }
 
 // InjectLinkAddr injects an inbound packet with a remote link address.
-func (e *fwdTestLinkEndpoint) InjectLinkAddr(protocol tcpip.NetworkProtocolNumber, remote tcpip.LinkAddress, pkt *PacketBuffer) {
-	e.dispatcher.DeliverNetworkPacket(remote, "" /* local */, protocol, pkt)
+func (e *fwdTestLinkEndpoint) InjectLinkAddr(protocol tcpip.NetworkProtocolNumber, remote tcpip.LinkAddress, pkt PacketBufferPtr) {
+	e.dispatcher.DeliverNetworkPacket(protocol, pkt)
 }
 
 // Attach saves the stack network-layer dispatcher for use later when packets
@@ -316,34 +303,19 @@ func (e *fwdTestLinkEndpoint) LinkAddress() tcpip.LinkAddress {
 	return e.linkAddr
 }
 
-func (e fwdTestLinkEndpoint) WritePacket(r RouteInfo, _ tcpip.NetworkProtocolNumber, pkt *PacketBuffer) tcpip.Error {
-	p := fwdTestPacketInfo{
-		RemoteLinkAddress: r.RemoteLinkAddress,
-		LocalLinkAddress:  r.LocalLinkAddress,
-		Pkt:               pkt,
-	}
-
-	select {
-	case e.C <- p:
-	default:
-	}
-
-	return nil
-}
-
 // WritePackets stores outbound packets into the channel.
-func (e *fwdTestLinkEndpoint) WritePackets(r RouteInfo, pkts PacketBufferList, protocol tcpip.NetworkProtocolNumber) (int, tcpip.Error) {
+func (e *fwdTestLinkEndpoint) WritePackets(pkts PacketBufferList) (int, tcpip.Error) {
 	n := 0
-	for pkt := pkts.Front(); pkt != nil; pkt = pkt.Next() {
-		e.WritePacket(r, protocol, pkt)
+	for _, pkt := range pkts.AsSlice() {
+		select {
+		case e.C <- pkt:
+		default:
+		}
+
 		n++
 	}
 
 	return n, nil
-}
-
-func (*fwdTestLinkEndpoint) WriteRawPacket(*PacketBuffer) tcpip.Error {
-	return &tcpip.ErrNotSupported{}
 }
 
 // Wait implements stack.LinkEndpoint.Wait.
@@ -355,9 +327,7 @@ func (*fwdTestLinkEndpoint) ARPHardwareType() header.ARPHardwareType {
 }
 
 // AddHeader implements stack.LinkEndpoint.AddHeader.
-func (e *fwdTestLinkEndpoint) AddHeader(tcpip.LinkAddress, tcpip.LinkAddress, tcpip.NetworkProtocolNumber, *PacketBuffer) {
-	panic("not implemented")
-}
+func (*fwdTestLinkEndpoint) AddHeader(PacketBufferPtr) {}
 
 func fwdTestNetFactory(t *testing.T, proto *fwdTestNetworkProtocol) (*faketime.ManualClock, *fwdTestLinkEndpoint, *fwdTestLinkEndpoint) {
 	clock := faketime.NewManualClock()
@@ -377,28 +347,42 @@ func fwdTestNetFactory(t *testing.T, proto *fwdTestNetworkProtocol) (*faketime.M
 
 	// NIC 1 has the link address "a", and added the network address 1.
 	ep1 := &fwdTestLinkEndpoint{
-		C:        make(chan fwdTestPacketInfo, 300),
+		C:        make(chan PacketBufferPtr, 300),
 		mtu:      fwdTestNetDefaultMTU,
 		linkAddr: "a",
 	}
 	if err := s.CreateNIC(1, ep1); err != nil {
 		t.Fatal("CreateNIC #1 failed:", err)
 	}
-	if err := s.AddAddress(1, fwdTestNetNumber, "\x01"); err != nil {
-		t.Fatal("AddAddress #1 failed:", err)
+	protocolAddr1 := tcpip.ProtocolAddress{
+		Protocol: fwdTestNetNumber,
+		AddressWithPrefix: tcpip.AddressWithPrefix{
+			Address:   "\x01",
+			PrefixLen: fwdTestNetDefaultPrefixLen,
+		},
+	}
+	if err := s.AddProtocolAddress(1, protocolAddr1, AddressProperties{}); err != nil {
+		t.Fatalf("AddProtocolAddress(%d, %+v, {}): %s", 1, protocolAddr1, err)
 	}
 
 	// NIC 2 has the link address "b", and added the network address 2.
 	ep2 := &fwdTestLinkEndpoint{
-		C:        make(chan fwdTestPacketInfo, 300),
+		C:        make(chan PacketBufferPtr, 300),
 		mtu:      fwdTestNetDefaultMTU,
 		linkAddr: "b",
 	}
 	if err := s.CreateNIC(2, ep2); err != nil {
 		t.Fatal("CreateNIC #2 failed:", err)
 	}
-	if err := s.AddAddress(2, fwdTestNetNumber, "\x02"); err != nil {
-		t.Fatal("AddAddress #2 failed:", err)
+	protocolAddr2 := tcpip.ProtocolAddress{
+		Protocol: fwdTestNetNumber,
+		AddressWithPrefix: tcpip.AddressWithPrefix{
+			Address:   "\x02",
+			PrefixLen: fwdTestNetDefaultPrefixLen,
+		},
+	}
+	if err := s.AddProtocolAddress(2, protocolAddr2, AddressProperties{}); err != nil {
+		t.Fatalf("AddProtocolAddress(%d, %+v, {}): %s", 2, protocolAddr2, err)
 	}
 
 	nic, ok := s.nics[2]
@@ -439,13 +423,13 @@ func TestForwardingWithStaticResolver(t *testing.T) {
 
 	// Inject an inbound packet to address 3 on NIC 1, and see if it is
 	// forwarded to NIC 2.
-	buf := buffer.NewView(30)
+	buf := make([]byte, 30)
 	buf[dstAddrOffset] = 3
 	ep1.InjectInbound(fwdTestNetNumber, NewPacketBuffer(PacketBufferOptions{
-		Data: buf.ToVectorisedView(),
+		Payload: bufferv2.MakeWithData(buf),
 	}))
 
-	var p fwdTestPacketInfo
+	var p PacketBufferPtr
 
 	clock.Advance(proto.addrResolveDelay)
 	select {
@@ -455,11 +439,11 @@ func TestForwardingWithStaticResolver(t *testing.T) {
 	}
 
 	// Test that the static address resolution happened correctly.
-	if p.RemoteLinkAddress != "c" {
-		t.Fatalf("got p.RemoteLinkAddress = %s, want = c", p.RemoteLinkAddress)
+	if p.EgressRoute.RemoteLinkAddress != "c" {
+		t.Fatalf("got p.EgressRoute.RemoteLinkAddress = %s, want = c", p.EgressRoute.RemoteLinkAddress)
 	}
-	if p.LocalLinkAddress != "b" {
-		t.Fatalf("got p.LocalLinkAddress = %s, want = b", p.LocalLinkAddress)
+	if p.EgressRoute.LocalLinkAddress != "b" {
+		t.Fatalf("got p.EgressRoute.LocalLinkAddress = %s, want = b", p.EgressRoute.LocalLinkAddress)
 	}
 }
 
@@ -483,13 +467,13 @@ func TestForwardingWithFakeResolver(t *testing.T) {
 
 	// Inject an inbound packet to address 3 on NIC 1, and see if it is
 	// forwarded to NIC 2.
-	buf := buffer.NewView(30)
+	buf := make([]byte, 30)
 	buf[dstAddrOffset] = 3
 	ep1.InjectInbound(fwdTestNetNumber, NewPacketBuffer(PacketBufferOptions{
-		Data: buf.ToVectorisedView(),
+		Payload: bufferv2.MakeWithData(buf),
 	}))
 
-	var p fwdTestPacketInfo
+	var p PacketBufferPtr
 
 	clock.Advance(proto.addrResolveDelay)
 	select {
@@ -499,11 +483,11 @@ func TestForwardingWithFakeResolver(t *testing.T) {
 	}
 
 	// Test that the address resolution happened correctly.
-	if p.RemoteLinkAddress != "c" {
-		t.Fatalf("got p.RemoteLinkAddress = %s, want = c", p.RemoteLinkAddress)
+	if p.EgressRoute.RemoteLinkAddress != "c" {
+		t.Fatalf("got p.EgressRoute.RemoteLinkAddress = %s, want = c", p.EgressRoute.RemoteLinkAddress)
 	}
-	if p.LocalLinkAddress != "b" {
-		t.Fatalf("got p.LocalLinkAddress = %s, want = b", p.LocalLinkAddress)
+	if p.EgressRoute.LocalLinkAddress != "b" {
+		t.Fatalf("got p.EgressRoute.LocalLinkAddress = %s, want = b", p.EgressRoute.LocalLinkAddress)
 	}
 }
 
@@ -517,10 +501,10 @@ func TestForwardingWithNoResolver(t *testing.T) {
 
 	// inject an inbound packet to address 3 on NIC 1, and see if it is
 	// forwarded to NIC 2.
-	buf := buffer.NewView(30)
+	buf := make([]byte, 30)
 	buf[dstAddrOffset] = 3
 	ep1.InjectInbound(fwdTestNetNumber, NewPacketBuffer(PacketBufferOptions{
-		Data: buf.ToVectorisedView(),
+		Payload: bufferv2.MakeWithData(buf),
 	}))
 
 	clock.Advance(proto.addrResolveDelay)
@@ -545,10 +529,10 @@ func TestForwardingResolutionFailsForQueuedPackets(t *testing.T) {
 	// These packets will all be enqueued in the packet queue to wait for link
 	// address resolution.
 	for i := 0; i < numPackets; i++ {
-		buf := buffer.NewView(30)
+		buf := make([]byte, 30)
 		buf[dstAddrOffset] = 3
 		ep1.InjectInbound(fwdTestNetNumber, NewPacketBuffer(PacketBufferOptions{
-			Data: buf.ToVectorisedView(),
+			Payload: bufferv2.MakeWithData(buf),
 		}))
 	}
 
@@ -586,21 +570,21 @@ func TestForwardingWithFakeResolverPartialTimeout(t *testing.T) {
 
 	// Inject an inbound packet to address 4 on NIC 1. This packet should
 	// not be forwarded.
-	buf := buffer.NewView(30)
+	buf := make([]byte, 30)
 	buf[dstAddrOffset] = 4
 	ep1.InjectInbound(fwdTestNetNumber, NewPacketBuffer(PacketBufferOptions{
-		Data: buf.ToVectorisedView(),
+		Payload: bufferv2.MakeWithData(buf),
 	}))
 
 	// Inject an inbound packet to address 3 on NIC 1, and see if it is
 	// forwarded to NIC 2.
-	buf = buffer.NewView(30)
+	buf = make([]byte, 30)
 	buf[dstAddrOffset] = 3
 	ep1.InjectInbound(fwdTestNetNumber, NewPacketBuffer(PacketBufferOptions{
-		Data: buf.ToVectorisedView(),
+		Payload: bufferv2.MakeWithData(buf),
 	}))
 
-	var p fwdTestPacketInfo
+	var p PacketBufferPtr
 
 	clock.Advance(proto.addrResolveDelay)
 	select {
@@ -609,16 +593,18 @@ func TestForwardingWithFakeResolverPartialTimeout(t *testing.T) {
 		t.Fatal("packet not forwarded")
 	}
 
-	if nh := PayloadSince(p.Pkt.NetworkHeader()); nh[dstAddrOffset] != 3 {
-		t.Fatalf("got p.Pkt.NetworkHeader[dstAddrOffset] = %d, want = 3", nh[dstAddrOffset])
+	nh := PayloadSince(p.NetworkHeader())
+	defer nh.Release()
+	if nh.AsSlice()[dstAddrOffset] != 3 {
+		t.Fatalf("got p.NetworkHeader[dstAddrOffset] = %d, want = 3", nh.AsSlice()[dstAddrOffset])
 	}
 
 	// Test that the address resolution happened correctly.
-	if p.RemoteLinkAddress != "c" {
-		t.Fatalf("got p.RemoteLinkAddress = %s, want = c", p.RemoteLinkAddress)
+	if p.EgressRoute.RemoteLinkAddress != "c" {
+		t.Fatalf("got p.EgressRoute.RemoteLinkAddress = %s, want = c", p.EgressRoute.RemoteLinkAddress)
 	}
-	if p.LocalLinkAddress != "b" {
-		t.Fatalf("got p.LocalLinkAddress = %s, want = b", p.LocalLinkAddress)
+	if p.EgressRoute.LocalLinkAddress != "b" {
+		t.Fatalf("got p.EgressRoute.LocalLinkAddress = %s, want = b", p.EgressRoute.LocalLinkAddress)
 	}
 }
 
@@ -642,15 +628,15 @@ func TestForwardingWithFakeResolverTwoPackets(t *testing.T) {
 
 	// Inject two inbound packets to address 3 on NIC 1.
 	for i := 0; i < 2; i++ {
-		buf := buffer.NewView(30)
+		buf := make([]byte, 30)
 		buf[dstAddrOffset] = 3
 		ep1.InjectInbound(fwdTestNetNumber, NewPacketBuffer(PacketBufferOptions{
-			Data: buf.ToVectorisedView(),
+			Payload: bufferv2.MakeWithData(buf),
 		}))
 	}
 
 	for i := 0; i < 2; i++ {
-		var p fwdTestPacketInfo
+		var p PacketBufferPtr
 
 		clock.Advance(proto.addrResolveDelay)
 		select {
@@ -659,16 +645,18 @@ func TestForwardingWithFakeResolverTwoPackets(t *testing.T) {
 			t.Fatal("packet not forwarded")
 		}
 
-		if nh := PayloadSince(p.Pkt.NetworkHeader()); nh[dstAddrOffset] != 3 {
-			t.Fatalf("got p.Pkt.NetworkHeader[dstAddrOffset] = %d, want = 3", nh[dstAddrOffset])
+		nh := PayloadSince(p.NetworkHeader())
+		defer nh.Release()
+		if nh.AsSlice()[dstAddrOffset] != 3 {
+			t.Fatalf("got p.NetworkHeader[dstAddrOffset] = %d, want = 3", nh.AsSlice()[dstAddrOffset])
 		}
 
 		// Test that the address resolution happened correctly.
-		if p.RemoteLinkAddress != "c" {
-			t.Fatalf("got p.RemoteLinkAddress = %s, want = c", p.RemoteLinkAddress)
+		if p.EgressRoute.RemoteLinkAddress != "c" {
+			t.Fatalf("got p.EgressRoute.RemoteLinkAddress = %s, want = c", p.EgressRoute.RemoteLinkAddress)
 		}
-		if p.LocalLinkAddress != "b" {
-			t.Fatalf("got p.LocalLinkAddress = %s, want = b", p.LocalLinkAddress)
+		if p.EgressRoute.LocalLinkAddress != "b" {
+			t.Fatalf("got p.EgressRoute.LocalLinkAddress = %s, want = b", p.EgressRoute.LocalLinkAddress)
 		}
 	}
 }
@@ -693,17 +681,17 @@ func TestForwardingWithFakeResolverManyPackets(t *testing.T) {
 
 	for i := 0; i < maxPendingPacketsPerResolution+5; i++ {
 		// Inject inbound 'maxPendingPacketsPerResolution + 5' packets on NIC 1.
-		buf := buffer.NewView(30)
+		buf := make([]byte, 30)
 		buf[dstAddrOffset] = 3
 		// Set the packet sequence number.
 		binary.BigEndian.PutUint16(buf[fwdTestNetHeaderLen:], uint16(i))
 		ep1.InjectInbound(fwdTestNetNumber, NewPacketBuffer(PacketBufferOptions{
-			Data: buf.ToVectorisedView(),
+			Payload: bufferv2.MakeWithData(buf),
 		}))
 	}
 
 	for i := 0; i < maxPendingPacketsPerResolution; i++ {
-		var p fwdTestPacketInfo
+		var p PacketBufferPtr
 
 		clock.Advance(proto.addrResolveDelay)
 		select {
@@ -712,14 +700,15 @@ func TestForwardingWithFakeResolverManyPackets(t *testing.T) {
 			t.Fatal("packet not forwarded")
 		}
 
-		b := PayloadSince(p.Pkt.NetworkHeader())
-		if b[dstAddrOffset] != 3 {
-			t.Fatalf("got b[dstAddrOffset] = %d, want = 3", b[dstAddrOffset])
+		b := PayloadSince(p.NetworkHeader())
+		defer b.Release()
+		if b.AsSlice()[dstAddrOffset] != 3 {
+			t.Fatalf("got b[dstAddrOffset] = %d, want = 3", b.AsSlice()[dstAddrOffset])
 		}
-		if len(b) < fwdTestNetHeaderLen+2 {
-			t.Fatalf("packet is too short to hold a sequence number: len(b) = %d", b)
+		if b.Size() < fwdTestNetHeaderLen+2 {
+			t.Fatalf("packet is too short to hold a sequence number: len(b) = %d", b.Size())
 		}
-		seqNumBuf := b[fwdTestNetHeaderLen:]
+		seqNumBuf := b.AsSlice()[fwdTestNetHeaderLen:]
 
 		// The first 5 packets should not be forwarded so the sequence number should
 		// start with 5.
@@ -729,11 +718,11 @@ func TestForwardingWithFakeResolverManyPackets(t *testing.T) {
 		}
 
 		// Test that the address resolution happened correctly.
-		if p.RemoteLinkAddress != "c" {
-			t.Fatalf("got p.RemoteLinkAddress = %s, want = c", p.RemoteLinkAddress)
+		if p.EgressRoute.RemoteLinkAddress != "c" {
+			t.Fatalf("got p.EgressRoute.RemoteLinkAddress = %s, want = c", p.EgressRoute.RemoteLinkAddress)
 		}
-		if p.LocalLinkAddress != "b" {
-			t.Fatalf("got p.LocalLinkAddress = %s, want = b", p.LocalLinkAddress)
+		if p.EgressRoute.LocalLinkAddress != "b" {
+			t.Fatalf("got p.EgressRoute.LocalLinkAddress = %s, want = b", p.EgressRoute.LocalLinkAddress)
 		}
 	}
 }
@@ -760,15 +749,15 @@ func TestForwardingWithFakeResolverManyResolutions(t *testing.T) {
 		// Inject inbound 'maxPendingResolutions + 5' packets on NIC 1.
 		// Each packet has a different destination address (3 to
 		// maxPendingResolutions + 7).
-		buf := buffer.NewView(30)
+		buf := make([]byte, 30)
 		buf[dstAddrOffset] = byte(3 + i)
 		ep1.InjectInbound(fwdTestNetNumber, NewPacketBuffer(PacketBufferOptions{
-			Data: buf.ToVectorisedView(),
+			Payload: bufferv2.MakeWithData(buf),
 		}))
 	}
 
 	for i := 0; i < maxPendingResolutions; i++ {
-		var p fwdTestPacketInfo
+		var p PacketBufferPtr
 
 		clock.Advance(proto.addrResolveDelay)
 		select {
@@ -779,16 +768,18 @@ func TestForwardingWithFakeResolverManyResolutions(t *testing.T) {
 
 		// The first 5 packets (address 3 to 7) should not be forwarded
 		// because their address resolutions are interrupted.
-		if nh := PayloadSince(p.Pkt.NetworkHeader()); nh[dstAddrOffset] < 8 {
-			t.Fatalf("got p.Pkt.NetworkHeader[dstAddrOffset] = %d, want p.Pkt.NetworkHeader[dstAddrOffset] >= 8", nh[dstAddrOffset])
+		nh := PayloadSince(p.NetworkHeader())
+		defer nh.Release()
+		if nh.AsSlice()[dstAddrOffset] < 8 {
+			t.Fatalf("got p.NetworkHeader[dstAddrOffset] = %d, want p.NetworkHeader[dstAddrOffset] >= 8", nh.AsSlice()[dstAddrOffset])
 		}
 
 		// Test that the address resolution happened correctly.
-		if p.RemoteLinkAddress != "c" {
-			t.Fatalf("got p.RemoteLinkAddress = %s, want = c", p.RemoteLinkAddress)
+		if p.EgressRoute.RemoteLinkAddress != "c" {
+			t.Fatalf("got p.EgressRoute.RemoteLinkAddress = %s, want = c", p.EgressRoute.RemoteLinkAddress)
 		}
-		if p.LocalLinkAddress != "b" {
-			t.Fatalf("got p.LocalLinkAddress = %s, want = b", p.LocalLinkAddress)
+		if p.EgressRoute.LocalLinkAddress != "b" {
+			t.Fatalf("got p.EgressRoute.LocalLinkAddress = %s, want = b", p.EgressRoute.LocalLinkAddress)
 		}
 	}
 }

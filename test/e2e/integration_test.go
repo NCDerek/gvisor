@@ -29,6 +29,8 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -37,12 +39,17 @@ import (
 	"time"
 
 	"github.com/docker/docker/api/types/mount"
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/test/dockerutil"
 	"gvisor.dev/gvisor/pkg/test/testutil"
 )
 
-// defaultWait is the default wait time used for tests.
-const defaultWait = time.Minute
+const (
+	// defaultWait is the default wait time used for tests.
+	defaultWait = time.Minute
+
+	memInfoCmd = "cat /proc/meminfo | grep MemTotal: | awk '{print $2}'"
+)
 
 func TestMain(m *testing.M) {
 	dockerutil.EnsureSupportedDockerVersion()
@@ -174,6 +181,7 @@ func TestCheckpointRestore(t *testing.T) {
 	if !testutil.IsCheckpointSupported() {
 		t.Skip("Pause/resume is not supported.")
 	}
+	dockerutil.EnsureDockerExperimentalEnabled()
 
 	ctx := context.Background()
 	d := dockerutil.MakeContainer(ctx, t)
@@ -255,16 +263,47 @@ func TestConnectToSelf(t *testing.T) {
 	}
 }
 
+func TestMemory(t *testing.T) {
+	// Find total amount of memory in the host.
+	host, err := exec.Command("sh", "-c", memInfoCmd).CombinedOutput()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := strconv.ParseUint(strings.TrimSpace(string(host)), 10, 64)
+	if err != nil {
+		t.Fatalf("failed to parse %q: %v", host, err)
+	}
+
+	ctx := context.Background()
+	d := dockerutil.MakeContainer(ctx, t)
+	defer d.CleanUp(ctx)
+
+	out, err := d.Run(ctx, dockerutil.RunOpts{Image: "basic/alpine"}, "sh", "-c", memInfoCmd)
+	if err != nil {
+		t.Fatalf("docker run failed: %v", err)
+	}
+
+	// Get memory from inside the container and ensure it matches the host.
+	got, err := strconv.ParseUint(strings.TrimSpace(out), 10, 64)
+	if err != nil {
+		t.Fatalf("failed to parse %q: %v", out, err)
+	}
+	if got != want {
+		t.Errorf("MemTotal got: %d, want: %d", got, want)
+	}
+}
+
 func TestMemLimit(t *testing.T) {
 	ctx := context.Background()
 	d := dockerutil.MakeContainer(ctx, t)
 	defer d.CleanUp(ctx)
 
-	allocMemoryKb := 50 * 1024
-	out, err := d.Run(ctx, dockerutil.RunOpts{
+	allocMemoryKb := 128 * 1024
+	opts := dockerutil.RunOpts{
 		Image:  "basic/alpine",
 		Memory: allocMemoryKb * 1024, // In bytes.
-	}, "sh", "-c", "cat /proc/meminfo | grep MemTotal: | awk '{print $2}'")
+	}
+	out, err := d.Run(ctx, opts, "sh", "-c", memInfoCmd)
 	if err != nil {
 		t.Fatalf("docker run failed: %v", err)
 	}
@@ -433,12 +472,6 @@ func TestTmpMount(t *testing.T) {
 // Test that it is allowed to mount a file on top of /dev files, e.g.
 // /dev/random.
 func TestMountOverDev(t *testing.T) {
-	if vfs2, err := dockerutil.UsingVFS2(); err != nil {
-		t.Fatalf("Failed to read config for runtime %s: %v", dockerutil.Runtime(), err)
-	} else if !vfs2 {
-		t.Skip("VFS1 doesn't allow /dev/random to be mounted.")
-	}
-
 	random, err := ioutil.TempFile(testutil.TmpDir(), "random")
 	if err != nil {
 		t.Fatal("ioutil.TempFile() failed:", err)
@@ -567,13 +600,11 @@ func TestPing6Loopback(t *testing.T) {
 // can always delete its file when the file is inside a sticky directory owned
 // by another user.
 func TestStickyDir(t *testing.T) {
-	if vfs2Used, err := dockerutil.UsingVFS2(); err != nil {
-		t.Fatalf("failed to read config for runtime %s: %v", dockerutil.Runtime(), err)
-	} else if !vfs2Used {
-		t.Skip("sticky bit test fails on VFS1.")
-	}
-
 	runIntegrationTest(t, nil, "./test_sticky")
+}
+
+func TestHostFD(t *testing.T) {
+	runIntegrationTest(t, nil, "./host_fd")
 }
 
 func runIntegrationTest(t *testing.T, capAdd []string, args ...string) {
@@ -618,12 +649,6 @@ func TestBindOverlay(t *testing.T) {
 }
 
 func TestStdios(t *testing.T) {
-	if vfs2, err := dockerutil.UsingVFS2(); err != nil {
-		t.Fatalf("Failed to read config for runtime %s: %v", dockerutil.Runtime(), err)
-	} else if !vfs2 {
-		t.Skip("VFS1 doesn't adjust stdios user")
-	}
-
 	ctx := context.Background()
 	d := dockerutil.MakeContainer(ctx, t)
 	defer d.CleanUp(ctx)
@@ -639,12 +664,6 @@ func TestStdios(t *testing.T) {
 }
 
 func TestStdiosExec(t *testing.T) {
-	if vfs2, err := dockerutil.UsingVFS2(); err != nil {
-		t.Fatalf("Failed to read config for runtime %s: %v", dockerutil.Runtime(), err)
-	} else if !vfs2 {
-		t.Skip("VFS1 doesn't adjust stdios user")
-	}
-
 	ctx := context.Background()
 	d := dockerutil.MakeContainer(ctx, t)
 	defer d.CleanUp(ctx)
@@ -702,12 +721,6 @@ func testStdios(t *testing.T, run func(string, ...string) (string, error)) {
 }
 
 func TestStdiosChown(t *testing.T) {
-	if vfs2, err := dockerutil.UsingVFS2(); err != nil {
-		t.Fatalf("Failed to read config for runtime %s: %v", dockerutil.Runtime(), err)
-	} else if !vfs2 {
-		t.Skip("VFS1 doesn't adjust stdios user")
-	}
-
 	ctx := context.Background()
 	d := dockerutil.MakeContainer(ctx, t)
 	defer d.CleanUp(ctx)
@@ -786,5 +799,227 @@ func TestDeleteInterface(t *testing.T) {
 	}
 	if !strings.Contains(output, "lo") {
 		t.Fatalf("loopback interface is removed")
+	}
+}
+
+func TestProductName(t *testing.T) {
+	want, err := ioutil.ReadFile("/sys/devices/virtual/dmi/id/product_name")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	d := dockerutil.MakeContainer(ctx, t)
+	defer d.CleanUp(ctx)
+
+	opts := dockerutil.RunOpts{Image: "basic/alpine"}
+	got, err := d.Run(ctx, opts, "cat", "/sys/devices/virtual/dmi/id/product_name")
+	if err != nil {
+		t.Fatalf("docker run failed: %v", err)
+	}
+	if string(want) != got {
+		t.Errorf("invalid product name, want: %q, got: %q", want, got)
+	}
+}
+
+// TestRevalidateSymlinkChain tests that when a symlink in the middle of chain
+// gets updated externally, the change is noticed and the internal cache is
+// updated accordingly.
+func TestRevalidateSymlinkChain(t *testing.T) {
+	ctx := context.Background()
+	d := dockerutil.MakeContainer(ctx, t)
+	defer d.CleanUp(ctx)
+
+	// Create the following structure:
+	// dir
+	//  + gen1
+	//  |  + file [content: 123]
+	//  |
+	//  + gen2
+	//  |  + file [content: 456]
+	//  |
+	//  + file -> sym1/file
+	//  + sym1 -> sym2
+	//  + sym2 -> gen1
+	//
+	dir, err := ioutil.TempDir(testutil.TmpDir(), "sub-mount")
+	if err != nil {
+		t.Fatalf("TempDir(): %v", err)
+	}
+	if err := os.Mkdir(filepath.Join(dir, "gen1"), 0777); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(dir, "gen2"), 0777); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "gen1", "file"), []byte("123"), 0666); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "gen2", "file"), []byte("456"), 0666); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("sym1/file", filepath.Join(dir, "file")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("sym2", filepath.Join(dir, "sym1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("gen1", filepath.Join(dir, "sym2")); err != nil {
+		t.Fatal(err)
+	}
+
+	// Mount dir inside the container so that external changes are propagated to
+	// the container.
+	opts := dockerutil.RunOpts{
+		Image:      "basic/alpine",
+		Privileged: true, // Required for umount
+		Mounts: []mount.Mount{
+			{
+				Type:   mount.TypeBind,
+				Source: dir,
+				Target: "/foo",
+			},
+		},
+	}
+	if err := d.Create(ctx, opts, "sleep", "1000"); err != nil {
+		t.Fatalf("docker run failed: %v", err)
+	}
+	if err := d.Start(ctx); err != nil {
+		t.Fatalf("docker run failed: %v", err)
+	}
+
+	// Read and cache symlinks pointing to gen1/file.
+	got, err := d.Exec(ctx, dockerutil.ExecOpts{}, "cat", "/foo/file")
+	if err != nil {
+		t.Fatalf("docker run failed: %v", err)
+	}
+	if want := "123"; got != want {
+		t.Fatalf("Read wrong file, want: %q, got: %q", want, got)
+	}
+
+	// Change the symlink to point to gen2 file.
+	if err := os.Remove(filepath.Join(dir, "sym2")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("gen2", filepath.Join(dir, "sym2")); err != nil {
+		t.Fatal(err)
+	}
+
+	// Read symlink chain again and check that it got updated to gen2/file.
+	got, err = d.Exec(ctx, dockerutil.ExecOpts{}, "cat", "/foo/file")
+	if err != nil {
+		t.Fatalf("docker run failed: %v", err)
+	}
+	if want := "456"; got != want {
+		t.Fatalf("Read wrong file, want: %q, got: %q", want, got)
+	}
+}
+
+// TestTmpMountWithSize checks when 'tmpfs' is mounted
+// with size option the limit is not exceeded.
+func TestTmpMountWithSize(t *testing.T) {
+	ctx := context.Background()
+	d := dockerutil.MakeContainer(ctx, t)
+	defer d.CleanUp(ctx)
+
+	opts := dockerutil.RunOpts{
+		Image: "basic/alpine",
+		Mounts: []mount.Mount{
+			{
+				Type:   mount.TypeTmpfs,
+				Target: "/tmp/foo",
+				TmpfsOptions: &mount.TmpfsOptions{
+					SizeBytes: 4096,
+				},
+			},
+		},
+	}
+	if err := d.Create(ctx, opts, "sleep", "1000"); err != nil {
+		t.Fatalf("docker create failed: %v", err)
+	}
+	if err := d.Start(ctx); err != nil {
+		t.Fatalf("docker start failed: %v", err)
+	}
+
+	if _, err := d.Exec(ctx, dockerutil.ExecOpts{}, "/bin/sh", "-c", "echo hello > /tmp/foo/test1.txt"); err != nil {
+		t.Fatalf("docker exec failed: %v", err)
+	}
+	echoOutput, err := d.Exec(ctx, dockerutil.ExecOpts{}, "/bin/sh", "-c", "echo world > /tmp/foo/test2.txt")
+	if err == nil {
+		t.Fatalf("docker exec size check unexpectedly succeeded (output: %v)", echoOutput)
+	}
+	wantErr := "No space left on device"
+	if !strings.Contains(echoOutput, wantErr) {
+		t.Errorf("unexpected echo error:Expected: %v, Got: %v", wantErr, echoOutput)
+	}
+}
+
+// NOTE(b/236028361): Regression test. Check we can handle a working directory
+// without execute permissions. See comment in
+// pkg/sentry/kernel/kernel.go:CreateProcess() for more context.
+func TestNonSearchableWorkingDirectory(t *testing.T) {
+	dir, err := os.MkdirTemp(testutil.TmpDir(), "tmp-mount")
+	if err != nil {
+		t.Fatalf("MkdirTemp() failed: %v", err)
+	}
+	defer os.RemoveAll(dir)
+
+	// The container will run as a non-root user. Make dir not searchable by
+	// others by removing execute bit for others.
+	if err := os.Chmod(dir, 0766); err != nil {
+		t.Fatalf("Chmod() failed: %v", err)
+	}
+	ctx := context.Background()
+	d := dockerutil.MakeContainer(ctx, t)
+	defer d.CleanUp(ctx)
+
+	targetMount := "/foo"
+	opts := dockerutil.RunOpts{
+		Image: "basic/alpine",
+		Mounts: []mount.Mount{
+			{
+				Type:   mount.TypeBind,
+				Source: dir,
+				Target: targetMount,
+			},
+		},
+		WorkDir: targetMount,
+		User:    "nobody",
+	}
+
+	echoPhrase := "All izz well"
+	got, err := d.Run(ctx, opts, "sh", "-c", "echo "+echoPhrase+" && (ls || true)")
+	if err != nil {
+		t.Fatalf("docker run failed: %v", err)
+	}
+	if !strings.Contains(got, echoPhrase) {
+		t.Errorf("echo output not found, want: %q, got: %q", echoPhrase, got)
+	}
+	if wantErrorMsg := "Permission denied"; !strings.Contains(got, wantErrorMsg) {
+		t.Errorf("ls error message not found, want: %q, got: %q", wantErrorMsg, got)
+	}
+}
+
+func TestPipeMountFails(t *testing.T) {
+	ctx := context.Background()
+	d := dockerutil.MakeContainer(ctx, t)
+	defer d.CleanUp(ctx)
+
+	fifoPath := path.Join(testutil.TmpDir(), "fifo")
+	if err := unix.Mkfifo(fifoPath, 0666); err != nil {
+		t.Fatalf("Mkfifo(%q) failed: %v", fifoPath, err)
+	}
+	opts := dockerutil.RunOpts{
+		Image: "basic/alpine",
+		Mounts: []mount.Mount{
+			{
+				Type:   mount.TypeBind,
+				Source: fifoPath,
+				Target: "/foo",
+			},
+		},
+	}
+	if _, err := d.Run(ctx, opts, "ls"); err == nil {
+		t.Errorf("docker run succeded, but mounting a named pipe should not work")
 	}
 }

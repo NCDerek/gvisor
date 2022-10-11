@@ -15,6 +15,8 @@
 package vfs2
 
 import (
+	"math"
+
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
@@ -42,6 +44,60 @@ func Close(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscall
 
 	err := file.OnClose(t)
 	return 0, nil, slinux.HandleIOErrorVFS2(t, false /* partial */, err, linuxerr.EINTR, "close", file)
+}
+
+// CloseRange implements linux syscall close_range(2).
+func CloseRange(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+	first := args[0].Uint()
+	last := args[1].Uint()
+	flags := args[2].Uint()
+
+	if (first > last) || (last > math.MaxInt32) {
+		return 0, nil, linuxerr.EINVAL
+	}
+
+	if (flags & ^(linux.CLOSE_RANGE_CLOEXEC | linux.CLOSE_RANGE_UNSHARE)) != 0 {
+		return 0, nil, linuxerr.EINVAL
+	}
+
+	cloexec := flags & linux.CLOSE_RANGE_CLOEXEC
+	unshare := flags & linux.CLOSE_RANGE_UNSHARE
+
+	if unshare != 0 {
+		// If possible, we don't want to copy FDs to the new unshared table, because those FDs will
+		// be promptly closed and no longer used. So in the case where we know the range extends all
+		// the way to the end of the FdTable, we can simply copy the FdTable only up to the start of
+		// the range that we are closing.
+		if cloexec == 0 && int32(last) >= t.FDTable().GetLastFd() {
+			t.UnshareFdTable(int32(first))
+		} else {
+			t.UnshareFdTable(math.MaxInt32)
+		}
+	}
+
+	if cloexec != 0 {
+		flagToApply := kernel.FDFlags{
+			CloseOnExec: true,
+		}
+		t.FDTable().SetFlagsForRangeVFS2(t.AsyncContext(), int32(first), int32(last), flagToApply)
+		return 0, nil, nil
+	}
+
+	fdTable := t.FDTable()
+	fd := int32(first)
+	for {
+		fd, _, file := fdTable.RemoveNextInRange(t, fd, int32(last))
+		if file == nil {
+			break
+		}
+
+		fd++
+		// Per the close_range(2) documentation, errors upon closing file descriptors are ignored.
+		_ = file.OnClose(t)
+		file.DecRef(t)
+	}
+
+	return 0, nil, nil
 }
 
 // Dup implements Linux syscall dup(2).
@@ -215,9 +271,9 @@ func Fcntl(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscall
 		err := tmpfs.AddSeals(file, args[2].Uint())
 		return 0, nil, err
 	case linux.F_SETLK:
-		return 0, nil, posixLock(t, args, file, false /* blocking */)
+		return 0, nil, posixLock(t, args, file, false /* block */)
 	case linux.F_SETLKW:
-		return 0, nil, posixLock(t, args, file, true /* blocking */)
+		return 0, nil, posixLock(t, args, file, true /* block */)
 	case linux.F_GETLK:
 		return 0, nil, posixTestLock(t, args, file)
 	case linux.F_GETSIG:
@@ -228,8 +284,12 @@ func Fcntl(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscall
 		}
 		return uintptr(a.(*fasync.FileAsync).Signal()), nil, nil
 	case linux.F_SETSIG:
-		a := file.SetAsyncHandler(fasync.NewVFS2(int(fd))).(*fasync.FileAsync)
-		return 0, nil, a.SetSignal(linux.Signal(args[2].Int()))
+		a, err := file.SetAsyncHandler(fasync.NewVFS2(int(fd)))
+		if err != nil {
+			return 0, nil, err
+		}
+		async := a.(*fasync.FileAsync)
+		return 0, nil, async.SetSignal(linux.Signal(args[2].Int()))
 	default:
 		// Everything else is not yet supported.
 		return 0, nil, linuxerr.EINVAL
@@ -272,9 +332,13 @@ func setAsyncOwner(t *kernel.Task, fd int, file *vfs.FileDescription, ownerType,
 		return linuxerr.EINVAL
 	}
 
-	a := file.SetAsyncHandler(fasync.NewVFS2(fd)).(*fasync.FileAsync)
+	a, err := file.SetAsyncHandler(fasync.NewVFS2(fd))
+	if err != nil {
+		return err
+	}
+	async := a.(*fasync.FileAsync)
 	if pid == 0 {
-		a.ClearOwner()
+		async.ClearOwner()
 		return nil
 	}
 
@@ -284,21 +348,21 @@ func setAsyncOwner(t *kernel.Task, fd int, file *vfs.FileDescription, ownerType,
 		if task == nil {
 			return linuxerr.ESRCH
 		}
-		a.SetOwnerTask(t, task)
+		async.SetOwnerTask(t, task)
 		return nil
 	case linux.F_OWNER_PID:
 		tg := t.PIDNamespace().ThreadGroupWithID(kernel.ThreadID(pid))
 		if tg == nil {
 			return linuxerr.ESRCH
 		}
-		a.SetOwnerThreadGroup(t, tg)
+		async.SetOwnerThreadGroup(t, tg)
 		return nil
 	case linux.F_OWNER_PGRP:
 		pg := t.PIDNamespace().ProcessGroupWithID(kernel.ProcessGroupID(pid))
 		if pg == nil {
 			return linuxerr.ESRCH
 		}
-		a.SetOwnerProcessGroup(t, pg)
+		async.SetOwnerProcessGroup(t, pg)
 		return nil
 	default:
 		return linuxerr.EINVAL
@@ -347,17 +411,12 @@ func translatePID(old, new *kernel.PIDNamespace, pid int32) int32 {
 	return int32(new.IDOfTask(old.TaskWithID(kernel.ThreadID(pid))))
 }
 
-func posixLock(t *kernel.Task, args arch.SyscallArguments, file *vfs.FileDescription, blocking bool) error {
+func posixLock(t *kernel.Task, args arch.SyscallArguments, file *vfs.FileDescription, block bool) error {
 	// Copy in the lock request.
 	flockAddr := args[2].Pointer()
 	var flock linux.Flock
 	if _, err := flock.CopyIn(t, flockAddr); err != nil {
 		return err
-	}
-
-	var blocker lock.Blocker
-	if blocking {
-		blocker = t
 	}
 
 	r, err := file.ComputeLockRange(t, uint64(flock.Start), uint64(flock.Len), flock.Whence)
@@ -370,13 +429,13 @@ func posixLock(t *kernel.Task, args arch.SyscallArguments, file *vfs.FileDescrip
 		if !file.IsReadable() {
 			return linuxerr.EBADF
 		}
-		return file.LockPOSIX(t, t.FDTable(), int32(t.TGIDInRoot()), lock.ReadLock, r, blocker)
+		return file.LockPOSIX(t, t.FDTable(), int32(t.TGIDInRoot()), lock.ReadLock, r, block)
 
 	case linux.F_WRLCK:
 		if !file.IsWritable() {
 			return linuxerr.EBADF
 		}
-		return file.LockPOSIX(t, t.FDTable(), int32(t.TGIDInRoot()), lock.WriteLock, r, blocker)
+		return file.LockPOSIX(t, t.FDTable(), int32(t.TGIDInRoot()), lock.WriteLock, r, block)
 
 	case linux.F_UNLCK:
 		return file.UnlockPOSIX(t, t.FDTable(), r)

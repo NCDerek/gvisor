@@ -15,60 +15,26 @@
 package metric
 
 import (
+	"fmt"
+	"math"
+	"reflect"
 	"testing"
 	"time"
 
 	"google.golang.org/protobuf/proto"
-	"gvisor.dev/gvisor/pkg/eventchannel"
 	pb "gvisor.dev/gvisor/pkg/metric/metric_go_proto"
+	"gvisor.dev/gvisor/pkg/sync"
 )
-
-// sliceEmitter implements eventchannel.Emitter by appending all messages to a
-// slice.
-type sliceEmitter []proto.Message
-
-// Emit implements eventchannel.Emitter.Emit.
-func (s *sliceEmitter) Emit(msg proto.Message) (bool, error) {
-	*s = append(*s, msg)
-	return false, nil
-}
-
-// Emit implements eventchannel.Emitter.Close.
-func (s *sliceEmitter) Close() error {
-	return nil
-}
-
-// Reset clears all events in s.
-func (s *sliceEmitter) Reset() {
-	*s = nil
-}
-
-// emitter is the eventchannel.Emitter used for all tests. Package eventchannel
-// doesn't allow removing Emitters, so we must use one global emitter for all
-// test cases.
-var emitter sliceEmitter
-
-func init() {
-	reset()
-
-	eventchannel.AddEmitter(&emitter)
-}
-
-// reset clears all global state in the metric package.
-func reset() {
-	initialized = false
-	allMetrics = makeMetricSet()
-	emitter.Reset()
-}
 
 const (
 	fooDescription     = "Foo!"
 	barDescription     = "Bar Baz"
 	counterDescription = "Counter"
+	distribDescription = "A distribution metric for testing"
 )
 
 func TestInitialize(t *testing.T) {
-	defer reset()
+	defer resetTest()
 
 	_, err := NewUint64Metric("/foo", false, pb.MetricMetadata_UNITS_NONE, fooDescription)
 	if err != nil {
@@ -78,6 +44,14 @@ func TestInitialize(t *testing.T) {
 	_, err = NewUint64Metric("/bar", true, pb.MetricMetadata_UNITS_NANOSECONDS, barDescription)
 	if err != nil {
 		t.Fatalf("NewUint64Metric got err %v want nil", err)
+	}
+
+	bucketer := NewExponentialBucketer(3, 2, 0, 1)
+	field1 := NewField("field1", []string{"foo", "bar"})
+	field2 := NewField("field2", []string{"baz", "quux"})
+	_, err = NewDistributionMetric("/distrib", true, bucketer, pb.MetricMetadata_UNITS_NANOSECONDS, distribDescription, field1, field2)
+	if err != nil {
+		t.Fatalf("NewDistributionMetric got err %v want nil", err)
 	}
 
 	if err := Initialize(); err != nil {
@@ -93,23 +67,23 @@ func TestInitialize(t *testing.T) {
 		t.Fatalf("emitter %v got %T want pb.MetricRegistration", emitter[0], emitter[0])
 	}
 
-	if len(mr.Metrics) != 2 {
-		t.Errorf("MetricRegistration got %d metrics want 2", len(mr.Metrics))
+	if len(mr.Metrics) != 3 {
+		t.Errorf("MetricRegistration got %d metrics want %d", len(mr.Metrics), 3)
 	}
 
 	foundFoo := false
 	foundBar := false
+	foundDistrib := false
 	for _, m := range mr.Metrics {
-		if m.Type != pb.MetricMetadata_TYPE_UINT64 {
-			t.Errorf("Metadata %+v Type got %v want pb.MetricMetadata_TYPE_UINT64", m, m.Type)
-		}
-		if !m.Cumulative {
-			t.Errorf("Metadata %+v Cumulative got false want true", m)
-		}
-
 		switch m.Name {
 		case "/foo":
 			foundFoo = true
+			if m.Type != pb.MetricMetadata_TYPE_UINT64 {
+				t.Errorf("Metadata %+v Type got %v want pb.MetricMetadata_TYPE_UINT64", m, m.Type)
+			}
+			if !m.Cumulative {
+				t.Errorf("Metadata %+v Cumulative got false want true", m)
+			}
 			if m.Description != fooDescription {
 				t.Errorf("/foo %+v Description got %q want %q", m, m.Description, fooDescription)
 			}
@@ -121,6 +95,12 @@ func TestInitialize(t *testing.T) {
 			}
 		case "/bar":
 			foundBar = true
+			if m.Type != pb.MetricMetadata_TYPE_UINT64 {
+				t.Errorf("Metadata %+v Type got %v want pb.MetricMetadata_TYPE_UINT64", m, m.Type)
+			}
+			if !m.Cumulative {
+				t.Errorf("Metadata %+v Cumulative got false want true", m)
+			}
 			if m.Description != barDescription {
 				t.Errorf("/bar %+v Description got %q want %q", m, m.Description, barDescription)
 			}
@@ -129,6 +109,23 @@ func TestInitialize(t *testing.T) {
 			}
 			if m.Units != pb.MetricMetadata_UNITS_NANOSECONDS {
 				t.Errorf("/bar %+v Units got %v want %v", m, m.Units, pb.MetricMetadata_UNITS_NANOSECONDS)
+			}
+		case "/distrib":
+			foundDistrib = true
+			want := &pb.MetricMetadata{
+				Name:        "/distrib",
+				Type:        pb.MetricMetadata_TYPE_DISTRIBUTION,
+				Units:       pb.MetricMetadata_UNITS_NANOSECONDS,
+				Description: distribDescription,
+				Sync:        true,
+				Fields: []*pb.MetricMetadata_Field{
+					{FieldName: "field1", AllowedValues: []string{"foo", "bar"}},
+					{FieldName: "field2", AllowedValues: []string{"baz", "quux"}},
+				},
+				DistributionBucketLowerBounds: []int64{0, 2, 4, 6},
+			}
+			if !proto.Equal(m, want) {
+				t.Fatalf("got /distrib metadata:\n%v\nwant:\n%v", m, want)
 			}
 		}
 	}
@@ -139,10 +136,13 @@ func TestInitialize(t *testing.T) {
 	if !foundBar {
 		t.Errorf("/bar not found: %+v", emitter)
 	}
+	if !foundDistrib {
+		t.Errorf("/distrib not found: %+v", emitter)
+	}
 }
 
 func TestDisable(t *testing.T) {
-	defer reset()
+	defer resetTest()
 
 	_, err := NewUint64Metric("/foo", false, pb.MetricMetadata_UNITS_NONE, fooDescription)
 	if err != nil {
@@ -152,6 +152,11 @@ func TestDisable(t *testing.T) {
 	_, err = NewUint64Metric("/bar", true, pb.MetricMetadata_UNITS_NONE, barDescription)
 	if err != nil {
 		t.Fatalf("NewUint64Metric got err %v want nil", err)
+	}
+
+	_, err = NewDistributionMetric("/distrib", false, NewExponentialBucketer(2, 2, 0, 1), pb.MetricMetadata_UNITS_NONE, distribDescription)
+	if err != nil {
+		t.Fatalf("NewDistributionMetric got err %v want nil", err)
 	}
 
 	if err := Disable(); err != nil {
@@ -173,7 +178,7 @@ func TestDisable(t *testing.T) {
 }
 
 func TestEmitMetricUpdate(t *testing.T) {
-	defer reset()
+	defer resetTest()
 
 	foo, err := NewUint64Metric("/foo", false, pb.MetricMetadata_UNITS_NONE, fooDescription)
 	if err != nil {
@@ -185,6 +190,14 @@ func TestEmitMetricUpdate(t *testing.T) {
 		t.Fatalf("NewUint64Metric got err %v want nil", err)
 	}
 
+	bucketer := NewExponentialBucketer(2, 2, 0, 1)
+	field1 := NewField("field1", []string{"foo", "bar"})
+	field2 := NewField("field2", []string{"baz", "quux"})
+	distrib, err := NewDistributionMetric("/distrib", false, bucketer, pb.MetricMetadata_UNITS_NONE, distribDescription, field1, field2)
+	if err != nil {
+		t.Fatalf("NewDistributionMetric: %v", err)
+	}
+
 	if err := Initialize(); err != nil {
 		t.Fatalf("Initialize(): %s", err)
 	}
@@ -194,7 +207,7 @@ func TestEmitMetricUpdate(t *testing.T) {
 	EmitMetricUpdate()
 
 	if len(emitter) != 1 {
-		t.Fatalf("EmitMetricUpdate emitted %d events want 1", len(emitter))
+		t.Fatalf("EmitMetricUpdate emitted %d events want %d", len(emitter), 1)
 	}
 
 	update, ok := emitter[0].(*pb.MetricUpdate)
@@ -203,26 +216,31 @@ func TestEmitMetricUpdate(t *testing.T) {
 	}
 
 	if len(update.Metrics) != 2 {
-		t.Errorf("MetricUpdate got %d metrics want 2", len(update.Metrics))
+		t.Errorf("MetricUpdate got %d metrics want %d", len(update.Metrics), 2)
 	}
 
 	// Both are included for their initial values.
 	foundFoo := false
 	foundBar := false
+	foundDistrib := false
 	for _, m := range update.Metrics {
 		switch m.Name {
 		case "/foo":
 			foundFoo = true
 		case "/bar":
 			foundBar = true
+		case "/distrib":
+			foundDistrib = true
 		}
-		uv, ok := m.Value.(*pb.MetricValue_Uint64Value)
-		if !ok {
-			t.Errorf("%+v: value %v got %T want pb.MetricValue_Uint64Value", m, m.Value, m.Value)
-			continue
-		}
-		if uv.Uint64Value != 0 {
-			t.Errorf("%v: Value got %v want 0", m, uv.Uint64Value)
+		if m.Name != "/distrib" {
+			uv, ok := m.Value.(*pb.MetricValue_Uint64Value)
+			if !ok {
+				t.Errorf("%+v: value %v got %T want pb.MetricValue_Uint64Value", m, m.Value, m.Value)
+				continue
+			}
+			if uv.Uint64Value != 0 {
+				t.Errorf("%v: Value got %v want %d", m, uv.Uint64Value, 0)
+			}
 		}
 	}
 
@@ -232,43 +250,129 @@ func TestEmitMetricUpdate(t *testing.T) {
 	if !foundBar {
 		t.Errorf("/bar not found: %+v", emitter)
 	}
+	if foundDistrib {
+		t.Errorf("/distrib unexpectedly found: %+v", emitter)
+	}
+	if t.Failed() {
+		t.Fatal("Aborting test so far due to earlier errors.")
+	}
 
 	// Increment foo. Only it is included in the next update.
 	foo.Increment()
-
+	foo.Increment()
+	foo.Increment()
 	emitter.Reset()
 	EmitMetricUpdate()
-
 	if len(emitter) != 1 {
 		t.Fatalf("EmitMetricUpdate emitted %d events want 1", len(emitter))
 	}
-
 	update, ok = emitter[0].(*pb.MetricUpdate)
 	if !ok {
 		t.Fatalf("emitter %v got %T want pb.MetricUpdate", emitter[0], emitter[0])
 	}
-
 	if len(update.Metrics) != 1 {
-		t.Errorf("MetricUpdate got %d metrics want 1", len(update.Metrics))
+		t.Fatalf("MetricUpdate got %d metrics want %d", len(update.Metrics), 1)
 	}
-
 	m := update.Metrics[0]
-
 	if m.Name != "/foo" {
-		t.Errorf("Metric %+v name got %q want '/foo'", m, m.Name)
+		t.Fatalf("Metric %+v name got %q want '/foo'", m, m.Name)
 	}
-
 	uv, ok := m.Value.(*pb.MetricValue_Uint64Value)
 	if !ok {
-		t.Errorf("%+v: value %v got %T want pb.MetricValue_Uint64Value", m, m.Value, m.Value)
+		t.Fatalf("%+v: value %v got %T want pb.MetricValue_Uint64Value", m, m.Value, m.Value)
 	}
-	if uv.Uint64Value != 1 {
-		t.Errorf("%v: Value got %v want 1", m, uv.Uint64Value)
+	if uv.Uint64Value != 3 {
+		t.Errorf("%v: Value got %v want %d", m, uv.Uint64Value, 3)
+	}
+
+	// Add a few samples to the distribution metric.
+	distrib.AddSample(1, "foo", "baz")
+	distrib.AddSample(1, "foo", "baz")
+	distrib.AddSample(3, "foo", "baz")
+	distrib.AddSample(-1, "foo", "quux")
+	distrib.AddSample(1, "foo", "quux")
+	distrib.AddSample(100, "foo", "quux")
+	emitter.Reset()
+	EmitMetricUpdate()
+	if len(emitter) != 1 {
+		t.Fatalf("EmitMetricUpdate emitted %d events want %d", len(emitter), 1)
+	}
+	update, ok = emitter[0].(*pb.MetricUpdate)
+	if !ok {
+		t.Fatalf("emitter %v got %T want pb.MetricUpdate", emitter[0], emitter[0])
+	}
+	if len(update.Metrics) != 2 {
+		t.Fatalf("MetricUpdate got %d metrics want %d", len(update.Metrics), 1)
+	}
+	for _, m := range update.Metrics {
+		if m.Name != "/distrib" {
+			t.Fatalf("Metric %+v name got %q want '/distrib'", m, m.Name)
+		}
+		if len(m.FieldValues) != 2 {
+			t.Fatalf("Metric %+v fields: got %v want %d fields", m, m.FieldValues, 2)
+		}
+		if m.FieldValues[0] != "foo" {
+			t.Fatalf("Metric %+v field 0: got %v want %v", m, m.FieldValues[0], "foo")
+		}
+		dv, ok := m.Value.(*pb.MetricValue_DistributionValue)
+		if !ok {
+			t.Fatalf("%+v: value %v got %T want pb.MetricValue_DistributionValue", m, m.Value, m.Value)
+		}
+		samples := dv.DistributionValue.GetNewSamples()
+		if len(samples) != 4 {
+			t.Fatalf("%+v: got %d buckets, want %d", dv.DistributionValue, len(samples), 4)
+		}
+		var wantSamples []uint64
+		switch m.FieldValues[1] {
+		case "baz":
+			wantSamples = []uint64{0, 2, 1, 0}
+		case "quux":
+			wantSamples = []uint64{1, 1, 0, 1}
+		default:
+			t.Fatalf("%+v: got unexpected field[1]: %q", m, m.FieldValues[1])
+		}
+		for i, s := range samples {
+			if s != wantSamples[i] {
+				t.Errorf("%+v [fields %v]: sample %d: got %d want %d", dv.DistributionValue, m.FieldValues, i, s, wantSamples[i])
+			}
+		}
+	}
+
+	// Add more samples to the distribution metric, check that we get the delta.
+	distrib.AddSample(3, "foo", "baz")
+	distrib.AddSample(2, "foo", "baz")
+	distrib.AddSample(1, "foo", "baz")
+	distrib.AddSample(3, "foo", "baz")
+	emitter.Reset()
+	EmitMetricUpdate()
+	if len(emitter) != 1 {
+		t.Fatalf("EmitMetricUpdate emitted %d events want %d", len(emitter), 1)
+	}
+	dv, ok := emitter[0].(*pb.MetricUpdate).Metrics[0].Value.(*pb.MetricValue_DistributionValue)
+	if !ok {
+		t.Fatalf("%+v: want pb.MetricValue_DistributionValue", emitter)
+	}
+	samples := dv.DistributionValue.GetNewSamples()
+	if len(samples) != 4 {
+		t.Fatalf("%+v: got %d buckets, want %d", dv.DistributionValue, len(samples), 4)
+	}
+	wantSamples := []uint64{0, 1, 3, 0}
+	for i, s := range samples {
+		if s != wantSamples[i] {
+			t.Errorf("%+v: sample %d: got %d want %d", dv.DistributionValue, i, s, wantSamples[i])
+		}
+	}
+
+	// Change nothing but still call EmitMetricUpdate. Verify that nothing gets sent.
+	emitter.Reset()
+	EmitMetricUpdate()
+	if len(emitter) != 0 {
+		t.Fatalf("EmitMetricUpdate emitted %d events want %d", len(emitter), 0)
 	}
 }
 
 func TestEmitMetricUpdateWithFields(t *testing.T) {
-	defer reset()
+	defer resetTest()
 
 	field := Field{
 		name:          "weirdness_type",
@@ -355,7 +459,7 @@ func TestEmitMetricUpdateWithFields(t *testing.T) {
 }
 
 func TestMetricUpdateStageTiming(t *testing.T) {
-	defer reset()
+	defer resetTest()
 
 	expectedTimings := map[InitStage]struct{ min, max time.Duration }{}
 	measureStage := func(stage InitStage, body func()) {
@@ -495,5 +599,314 @@ func TestMetricUpdateStageTiming(t *testing.T) {
 	} else {
 		checkStage(update.StageTiming[0], "last_stage_1")
 		checkStage(update.StageTiming[1], "last_stage_2")
+	}
+}
+
+func TestTimerMetric(t *testing.T) {
+	defer resetTest()
+	// This bucketer just has 2 finite buckets: [0, 500ms) and [500ms, 1s).
+	bucketer := NewExponentialBucketer(2, uint64((500 * time.Millisecond).Nanoseconds()), 0, 1)
+	field1 := NewField("field1", []string{"foo", "bar"})
+	field2 := NewField("field2", []string{"baz", "quux"})
+	timer, err := NewTimerMetric("/timer", bucketer, "a timer metric", field1, field2)
+	if err != nil {
+		t.Fatalf("NewTimerMetric: %v", err)
+	}
+	if err := Initialize(); err != nil {
+		t.Fatalf("Initialize(): %s", err)
+	}
+	// Don't care about the registration metrics.
+	emitter.Reset()
+
+	// Create timer data.
+	var wg sync.WaitGroup
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			op := timer.Start("foo")
+			defer op.Finish("quux")
+			time.Sleep(250 * time.Millisecond)
+		}()
+	}
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			op := timer.Start()
+			defer op.Finish("foo", "quux")
+			time.Sleep(750 * time.Millisecond)
+		}()
+	}
+	wg.Wait()
+	EmitMetricUpdate()
+	if len(emitter) != 1 {
+		t.Fatalf("EmitMetricUpdate emitted %d events want %d", len(emitter), 1)
+	}
+	m := emitter[0].(*pb.MetricUpdate).Metrics[0]
+	wantFields := []string{"foo", "quux"}
+	if !reflect.DeepEqual(m.GetFieldValues(), wantFields) {
+		t.Errorf("%+v: got fields %v want %v", m, m.GetFieldValues(), wantFields)
+	}
+	dv, ok := m.Value.(*pb.MetricValue_DistributionValue)
+	if !ok {
+		t.Fatalf("%+v: want pb.MetricValue_DistributionValue", m)
+	}
+	samples := dv.DistributionValue.GetNewSamples()
+	if len(samples) != 4 {
+		t.Fatalf("%+v: got %d buckets, want %d", dv.DistributionValue, len(samples), 4)
+	}
+	wantSamples := []uint64{0, 5, 3, 0}
+	for i, s := range samples {
+		if s != wantSamples[i] {
+			t.Errorf("%+v: sample %d: got %d want %d", dv.DistributionValue, i, s, wantSamples[i])
+		}
+	}
+}
+
+func TestBucketer(t *testing.T) {
+	for _, test := range []struct {
+		name                    string
+		bucketer                Bucketer
+		minSample               int64
+		maxSample               int64
+		step                    int64
+		firstFewLowerBounds     []int64
+		successiveBucketSamples []int64
+	}{
+		{
+			name:                "static-sized buckets",
+			bucketer:            NewExponentialBucketer(10, 10, 0, 1),
+			minSample:           -5,
+			maxSample:           105,
+			firstFewLowerBounds: []int64{0, 10, 20, 30, 40, 50},
+		},
+		{
+			name:      "exponential buckets",
+			bucketer:  NewExponentialBucketer(10, 10, 2, 1.5),
+			minSample: -5,
+			maxSample: int64(20 * math.Pow(1.5, 12)),
+			firstFewLowerBounds: []int64{
+				0,
+				10 + 2,
+				20 + int64(2*1.5),
+				30 + int64(math.Floor(2*1.5*1.5)),
+				40 + int64(math.Floor(2*1.5*1.5*1.5)),
+				50 + int64(math.Floor(2*1.5*1.5*1.5*1.5)),
+			},
+		},
+		{
+			name:      "timer buckets",
+			bucketer:  NewDurationBucketer(8, time.Second, time.Minute),
+			minSample: 0,
+			maxSample: (5 * time.Minute).Nanoseconds(),
+			step:      (500 * time.Millisecond).Nanoseconds(),
+			successiveBucketSamples: []int64{
+				// Roughly exponential successive durations:
+				(500 * time.Millisecond).Nanoseconds(),
+				(1200 * time.Millisecond).Nanoseconds(),
+				(2500 * time.Millisecond).Nanoseconds(),
+				(5 * time.Second).Nanoseconds(),
+				(15 * time.Second).Nanoseconds(),
+				(35 * time.Second).Nanoseconds(),
+				(75 * time.Second).Nanoseconds(),
+				(3 * time.Minute).Nanoseconds(),
+				(7 * time.Minute).Nanoseconds(),
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			numFiniteBuckets := test.bucketer.NumFiniteBuckets()
+			t.Logf("Underflow bucket has bounds (-inf, %d)", test.bucketer.LowerBound(0))
+			for b := 0; b < numFiniteBuckets; b++ {
+				t.Logf("Bucket %d has bounds [%d, %d)", b, test.bucketer.LowerBound(b), test.bucketer.LowerBound(b+1))
+			}
+			t.Logf("Overflow bucket has bounds [%d, +inf)", test.bucketer.LowerBound(numFiniteBuckets))
+			testAround := func(bound int64, bucketIndex int) {
+				for sample := bound - 2; sample <= bound+2; sample++ {
+					gotIndex := test.bucketer.BucketIndex(sample)
+					if sample < bound && gotIndex != bucketIndex-1 || sample >= bound && gotIndex != bucketIndex {
+						t.Errorf("LowerBound(%d) = %d, yet BucketIndex(%d) = %d", bucketIndex, bound, sample, gotIndex)
+					}
+				}
+			}
+			step := test.step
+			if step == 0 {
+				step = 1
+			}
+			for sample := test.minSample; sample <= test.maxSample; sample += step {
+				bucket := test.bucketer.BucketIndex(sample)
+				if bucket == -1 {
+					lowestBound := test.bucketer.LowerBound(0)
+					if sample >= lowestBound {
+						t.Errorf("sample %d: got bucket %d but lowest bound %d", sample, bucket, lowestBound)
+					}
+					testAround(lowestBound, 0)
+				} else if bucket > numFiniteBuckets {
+					t.Errorf("sample %d: got bucket with 0-based index %d but bucketer supposedly only has %d buckets", sample, bucket, numFiniteBuckets)
+				} else if bucket == numFiniteBuckets {
+					lastBucketBound := test.bucketer.LowerBound(bucket)
+					if sample < lastBucketBound {
+						t.Errorf("sample %d: got bucket %d but it has lower bound %d", sample, bucket, lastBucketBound)
+					}
+					testAround(lastBucketBound, bucket)
+				} else {
+					lowerBound := test.bucketer.LowerBound(bucket)
+					upperBound := test.bucketer.LowerBound(bucket + 1)
+					if upperBound <= lowerBound {
+						t.Errorf("sample %d: got bucket %d, upperbound %d <= lowerbound %d", sample, bucket, upperBound, lowerBound)
+					}
+					if sample < lowerBound || sample >= upperBound {
+						t.Errorf("sample %d: got bucket %d which has range [%d, %d)", sample, bucket, lowerBound, upperBound)
+					}
+					testAround(lowerBound, bucket)
+					testAround(upperBound, bucket+1)
+				}
+			}
+			for bi, want := range test.firstFewLowerBounds {
+				if got := test.bucketer.LowerBound(bi); got != want {
+					t.Errorf("bucket %d has lower bound %d, want %d", bi, got, want)
+				}
+			}
+			previousBucket := -1
+			for i, sample := range test.successiveBucketSamples {
+				gotBucket := test.bucketer.BucketIndex(sample)
+				if gotBucket != previousBucket+1 {
+					t.Errorf("successive-bucket sample #%d (%d) fell in bucket %d whereas previous sample fell in bucket %d", i, sample, gotBucket, previousBucket)
+				}
+				previousBucket = gotBucket
+			}
+		})
+	}
+}
+
+func TestBucketerPanics(t *testing.T) {
+	for name, fn := range map[string]func(){
+		"NewExponentialBucketer @ 0": func() {
+			NewExponentialBucketer(0, 2, 0, 1)
+		},
+		"NewExponentialBucketer @ 120": func() {
+			NewExponentialBucketer(120, 2, 0, 1)
+		},
+		"NewDurationBucketer @ 2": func() {
+			NewDurationBucketer(2, time.Second, time.Minute)
+		},
+		"NewDurationBucketer @ 80": func() {
+			NewDurationBucketer(80, time.Microsecond, 50*time.Microsecond)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var recovered interface{}
+			func() {
+				defer func() {
+					recovered = recover()
+				}()
+				fn()
+			}()
+			if recovered == nil {
+				t.Error("did not panic")
+			}
+		})
+	}
+}
+
+func TestFieldMapperWithFields(t *testing.T) {
+	generateFields := func(fieldSizes []int) []Field {
+		fields := make([]Field, len(fieldSizes))
+		for i, fieldSize := range fieldSizes {
+			fieldName := fmt.Sprintf("%c", 'A'+i)
+			allowedValues := make([]string, fieldSize)
+			for val := range allowedValues {
+				allowedValues[val] = fmt.Sprintf("%s%d", fieldName, val)
+			}
+			fields[i] = NewField(fieldName, allowedValues)
+		}
+		return fields
+	}
+
+	for _, test := range []struct {
+		name          string
+		fields        []Field
+		errOnCreation error
+	}{
+		{
+			name:          "FieldMapper8x10",
+			fields:        generateFields([]int{8, 10}),
+			errOnCreation: nil,
+		},
+		{
+			name:          "FieldMapper3x4x5",
+			fields:        generateFields([]int{3, 4, 5}),
+			errOnCreation: nil,
+		},
+		{
+			name:          "FieldMapper4x5x6x7",
+			fields:        generateFields([]int{4, 5, 6, 7}),
+			errOnCreation: nil,
+		},
+		{
+			name:          "FieldMapperErrNoAllowedValues",
+			fields:        []Field{NewField("TheNoValuesField", []string{})},
+			errOnCreation: ErrFieldHasNoAllowedValues,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			m, err := newFieldMapper(test.fields...)
+			if err != test.errOnCreation {
+				t.Fatalf("newFieldMapper err: got %v wanted %v", err, test.errOnCreation)
+			}
+
+			// Test that every field value combination corresponds to just one entry.
+			mapping := make([]int, m.numKeys())
+			var visitCombinations func(curFields []string, remFields []Field)
+			visitCombinations = func(curFields []string, remFields []Field) {
+				depth := len(remFields)
+				if depth == 0 {
+					return
+				}
+				if depth == 1 {
+					for _, val := range remFields[0].allowedValues {
+						fields := append(curFields, val)
+						key := m.lookup(fields...)
+						mapping[key]++
+
+						// Assert that the reverse operation is also correct.
+						fields2 := m.keyToMultiField(key)
+						for i, f1val := range fields {
+							if f1val != fields2[i] {
+								t.Errorf("Field values put into the map are not the same as ones returned: got %v wanted %v", fields2, f1val)
+							}
+						}
+					}
+				} else {
+					for _, val := range remFields[0].allowedValues {
+						visitCombinations(append(curFields, val), remFields[1:])
+					}
+				}
+			}
+			visitCombinations(nil, test.fields)
+
+			for i, numVisits := range mapping {
+				if numVisits != 1 {
+					t.Errorf("Index key %d incorrect number of mappings: got %d wanted 1", i, numVisits)
+				}
+			}
+		})
+	}
+}
+
+func TestFieldMapperNoFields(t *testing.T) {
+	m, err := newFieldMapper()
+	if err != nil {
+		t.Fatalf("newFieldMapper err: got %v wanted nil", err)
+	}
+
+	if n := m.numKeys(); n > 1 {
+		t.Fatalf("m.numKeys() err: got %d wanted 1", n)
+	}
+
+	key := m.lookup()
+	if len(m.keyToMultiField(key)) != 0 {
+		t.Errorf("keyToMultiField using key %v (corresponding to no field values): expected no values, got some", key)
 	}
 }

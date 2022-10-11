@@ -15,9 +15,94 @@
 #include "funcdata.h"
 #include "textflag.h"
 
-// NB: Offsets are programatically generated (see BUILD).
-//
-// This file is concatenated with the definitions.
+#define CPU_SELF             {{ .CPU.self.Offset }}
+#define CPU_REGISTERS        {{ .CPU.registers.Offset }}
+#define CPU_STACK_TOP        ({{ .CPU.CPUArchState.Offset }}+{{ .CPUArchState.stack.Offset }} + {{ .CPUArchState.stack.Size }})
+#define CPU_ERROR_CODE       ({{ .CPU.CPUArchState.Offset }}+{{ .CPUArchState.errorCode.Offset }})
+#define CPU_ERROR_TYPE       ({{ .CPU.CPUArchState.Offset }}+{{ .CPUArchState.errorType.Offset }})
+#define CPU_FAULT_ADDR       ({{ .CPU.CPUArchState.Offset }}+{{ .CPUArchState.faultAddr.Offset }})
+#define CPU_FPSTATE_EL0      ({{ .CPU.CPUArchState.Offset }}+{{ .CPUArchState.el0Fp.Offset }})
+#define CPU_TTBR0_KVM       ({{ .CPU.CPUArchState.Offset }}+{{ .CPUArchState.ttbr0Kvm.Offset }})
+#define CPU_TTBR0_APP        ({{ .CPU.CPUArchState.Offset }}+{{ .CPUArchState.ttbr0App.Offset }})
+#define CPU_VECTOR_CODE      ({{ .CPU.CPUArchState.Offset }}+{{ .CPUArchState.vecCode.Offset }})
+#define CPU_APP_ADDR         ({{ .CPU.CPUArchState.Offset }}+{{ .CPUArchState.appAddr.Offset }})
+#define CPU_LAZY_VFP         ({{ .CPU.CPUArchState.Offset }}+{{ .CPUArchState.lazyVFP.Offset }})
+#define CPU_APP_ASID         ({{ .CPU.CPUArchState.Offset }}+{{ .CPUArchState.appASID.Offset }})
+
+// Bits.
+#define _KERNEL_FLAGS {{ .KernelFlagsSet.Value }}
+
+// Vectors.
+#define El1Sync                 {{ .El1Sync.Value }}
+#define El1Irq                  {{ .El1Irq.Value }}
+#define El1Fiq                  {{ .El1Fiq.Value }}
+#define El1Err                  {{ .El1Err.Value }}
+#define El0Sync                 {{ .El0Sync.Value }}
+#define El0Irq                  {{ .El0Irq.Value }}
+#define El0Fiq                  {{ .El0Fiq.Value }}
+#define El0Err                  {{ .El0Err.Value }}
+#define El1SyncDa               {{ .El1SyncDa.Value }}
+#define El1SyncIa               {{ .El1SyncIa.Value }}
+#define El1SyncSpPc             {{ .El1SyncSpPc.Value }}
+#define El1SyncUndef            {{ .El1SyncUndef.Value }}
+#define El1SyncDbg              {{ .El1SyncDbg.Value }}
+#define El1SyncInv              {{ .El1SyncInv.Value }}
+#define El0SyncSVC              {{ .El0SyncSVC.Value }}
+#define El0SyncDa               {{ .El0SyncDa.Value }}
+#define El0SyncIa               {{ .El0SyncIa.Value }}
+#define El0SyncFpsimdAcc        {{ .El0SyncFpsimdAcc.Value }}
+#define El0SyncSveAcc           {{ .El0SyncSveAcc.Value }}
+#define El0SyncFpsimdExc        {{ .El0SyncFpsimdExc.Value }}
+#define El0SyncSys              {{ .El0SyncSys.Value }}
+#define El0SyncSpPc             {{ .El0SyncSpPc.Value }}
+#define El0SyncUndef            {{ .El0SyncUndef.Value }}
+#define El0SyncDbg              {{ .El0SyncDbg.Value }}
+#define El0SyncWfx              {{ .El0SyncWfx.Value }}
+#define El0SyncInv              {{ .El0SyncInv.Value }}
+#define El0ErrNMI               {{ .El0ErrNMI.Value }}
+#define PageFault               {{ .PageFault.Value }}
+#define Syscall                 {{ .Syscall.Value }}
+#define VirtualizationException {{ .VirtualizationException.Value }}
+
+{{ with .import.linux.PtraceRegs }}
+#define PTRACE_R0       ({{ .Regs.Offset }} + 0*8)
+#define PTRACE_R1       ({{ .Regs.Offset }} + 1*8)
+#define PTRACE_R2       ({{ .Regs.Offset }} + 2*8)
+#define PTRACE_R3       ({{ .Regs.Offset }} + 3*8)
+#define PTRACE_R4       ({{ .Regs.Offset }} + 4*8)
+#define PTRACE_R5       ({{ .Regs.Offset }} + 5*8)
+#define PTRACE_R6       ({{ .Regs.Offset }} + 6*8)
+#define PTRACE_R7       ({{ .Regs.Offset }} + 7*8)
+#define PTRACE_R8       ({{ .Regs.Offset }} + 8*8)
+#define PTRACE_R9       ({{ .Regs.Offset }} + 9*8)
+#define PTRACE_R10      ({{ .Regs.Offset }} + 10*8)
+#define PTRACE_R11      ({{ .Regs.Offset }} + 11*8)
+#define PTRACE_R12      ({{ .Regs.Offset }} + 12*8)
+#define PTRACE_R13      ({{ .Regs.Offset }} + 13*8)
+#define PTRACE_R14      ({{ .Regs.Offset }} + 14*8)
+#define PTRACE_R15      ({{ .Regs.Offset }} + 15*8)
+#define PTRACE_R16      ({{ .Regs.Offset }} + 16*8)
+#define PTRACE_R17      ({{ .Regs.Offset }} + 17*8)
+#define PTRACE_R18      ({{ .Regs.Offset }} + 18*8)
+#define PTRACE_R19      ({{ .Regs.Offset }} + 19*8)
+#define PTRACE_R20      ({{ .Regs.Offset }} + 20*8)
+#define PTRACE_R21      ({{ .Regs.Offset }} + 21*8)
+#define PTRACE_R22      ({{ .Regs.Offset }} + 22*8)
+#define PTRACE_R23      ({{ .Regs.Offset }} + 23*8)
+#define PTRACE_R24      ({{ .Regs.Offset }} + 24*8)
+#define PTRACE_R25      ({{ .Regs.Offset }} + 25*8)
+#define PTRACE_R26      ({{ .Regs.Offset }} + 26*8)
+#define PTRACE_R27      ({{ .Regs.Offset }} + 27*8)
+#define PTRACE_R28      ({{ .Regs.Offset }} + 28*8)
+#define PTRACE_R29      ({{ .Regs.Offset }} + 29*8)
+#define PTRACE_R30      ({{ .Regs.Offset }} + 30*8)
+#define PTRACE_SP       {{ .Sp.Offset }}
+#define PTRACE_PC       {{ .Pc.Offset }}
+#define PTRACE_PSTATE   {{ .Pstate.Offset }}
+{{ end }}
+{{ with .import.arch.Registers }}
+#define PTRACE_TLS      {{ .TPIDR_EL0.Offset }}
+{{ end }}
 
 // Saves a register set.
 //
@@ -526,8 +611,8 @@ TEXT ·kernelExitToEl1(SB),NOSPLIT,$0
 
 	ERET()
 
-// Start is the CPU entrypoint.
-TEXT ·Start(SB),NOSPLIT,$0
+// start is the CPU entrypoint.
+TEXT ·start(SB),NOSPLIT,$0
 	// Init.
 	WORD $0xd508871f    // __tlbi(vmalle1)
 	DSB $7          // dsb(nsh)
@@ -560,6 +645,12 @@ TEXT ·Start(SB),NOSPLIT,$0
 	ISB $15
 
 	B ·kernelExitToEl1(SB)
+
+// func AddrOfStart() uintptr
+TEXT ·AddrOfStart(SB), $0-8
+	MOVD	$·start(SB), R0
+	MOVD	R0, ret+0(FP)
+	RET
 
 // El1_sync_invalid is the handler for an invalid EL1_sync.
 TEXT ·El1_sync_invalid(SB),NOSPLIT,$0
@@ -754,12 +845,12 @@ TEXT ·El0_fiq_invalid(SB),NOSPLIT,$0
 TEXT ·El0_error_invalid(SB),NOSPLIT,$0
 	B ·Shutdown(SB)
 
-// Vectors implements exception vector table.
+// vectors implements exception vector table.
 // The start address of exception vector table should be 11-bits aligned.
 // For detail, please refer to arm developer document:
 // https://developer.arm.com/documentation/100933/0100/AArch64-exception-vector-table
 // Also can refer to the code in linux kernel: arch/arm64/kernel/entry.S
-TEXT ·Vectors(SB),NOSPLIT,$0
+TEXT ·vectors(SB),NOSPLIT,$0
 	PCALIGN $2048
 	B ·El1_sync_invalid(SB)
 	PCALIGN $128
@@ -795,3 +886,9 @@ TEXT ·Vectors(SB),NOSPLIT,$0
 	B ·El0_fiq_invalid(SB)
 	PCALIGN $128
 	B ·El0_error_invalid(SB)
+
+// func AddrOfVectors() uintptr
+TEXT ·AddrOfVectors(SB), $0-8
+       MOVD    $·vectors(SB), R0
+       MOVD    R0, ret+0(FP)
+       RET

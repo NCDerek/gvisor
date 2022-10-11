@@ -59,6 +59,27 @@ doc(
     permalink = "/blog/2021/08/31/gvisor-rack/",
 )
 
+doc(
+    name = "tune_gvisor_for_production_adoption",
+    src = "2021-12-02-running-gvisor-in-production-at-scale-in-ant.md",
+    authors = [
+        "jianfengt",
+        "yonghe",
+    ],
+    layout = "post",
+    permalink = "/blog/2021/12/02/running-gvisor-in-production-at-scale-in-ant/",
+)
+
+doc(
+    name = "threat_detection",
+    src = "2022-08-31-threat-detection.md",
+    authors = [
+        "fvoznika",
+    ],
+    layout = "post",
+    permalink = "/blog/2022/08/01/threat-detection/",
+)
+
 docs(
     name = "posts",
     deps = [

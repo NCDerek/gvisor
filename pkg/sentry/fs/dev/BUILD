@@ -17,6 +17,7 @@ go_library(
     visibility = ["//pkg/sentry:internal"],
     deps = [
         "//pkg/abi/linux",
+        "//pkg/bufferv2",
         "//pkg/context",
         "//pkg/errors/linuxerr",
         "//pkg/hostarch",
@@ -37,5 +38,6 @@ go_library(
         "//pkg/tcpip/link/tun",
         "//pkg/usermem",
         "//pkg/waiter",
+        "@org_golang_x_sys//unix:go_default_library",
     ],
 )

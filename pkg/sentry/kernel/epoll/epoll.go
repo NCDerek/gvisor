@@ -16,10 +16,11 @@
 // facility. See epoll(7) for more details.
 //
 // Lock order:
-// EventPoll.mu
-//   fdnotifier.notifier.mu
-//     EventPoll.listsMu
-//       unix.baseEndpoint.Mutex
+//
+//	 EventPoll.mu
+//		fdnotifier.notifier.mu
+//		  EventPoll.listsMu
+//		    unix.baseEndpoint.Mutex
 package epoll
 
 import (
@@ -66,7 +67,7 @@ type pollEntry struct {
 	file     *refs.WeakRef  `state:"manual"`
 	id       FileIdentifier `state:"wait"`
 	userData [2]int32
-	waiter   waiter.Entry `state:"manual"`
+	waiter   waiter.Entry
 	mask     waiter.EventMask
 	flags    EntryFlags
 
@@ -77,6 +78,8 @@ type pollEntry struct {
 	// in-struct pointers. Instead, EventPoll will properly set this field
 	// in its loading logic.
 	curList *pollEntryList `state:"nosave"`
+
+	readySeq uint32
 }
 
 // WeakRefGone implements refs.WeakRefUser.WeakRefGone.
@@ -102,18 +105,18 @@ type EventPoll struct {
 
 	// Wait queue is used to notify interested parties when the event poll
 	// object itself becomes readable or writable.
-	waiter.Queue `state:"zerovalue"`
+	waiter.Queue
 
 	// files is the map of all the files currently being observed, it is
 	// protected by mu.
-	mu    sync.Mutex `state:"nosave"`
+	mu    epollMutex `state:"nosave"`
 	files map[FileIdentifier]*pollEntry
 
 	// listsMu protects manipulation of the lists below. It needs to be a
 	// different lock to avoid circular lock acquisition order involving
 	// the wait queue mutexes and mu. The full order is mu, observed file
 	// wait queue mutex, then listsMu; this allows listsMu to be acquired
-	// when (*pollEntry).Callback is called.
+	// when (*pollEntry).NotifyEvent is called.
 	//
 	// An entry is always in one of the following lists:
 	//	readyList -- when there's a chance that it's ready to have
@@ -122,14 +125,20 @@ type EventPoll struct {
 	//		readEvents() functions always call the entry's file
 	//		Readiness() function to confirm it's ready.
 	//	waitingList -- when there's no chance that the entry is ready,
-	//		so it's waiting for the (*pollEntry).Callback to be called
-	//		on it before it gets moved to the readyList.
+	//		so it's waiting for the (*pollEntry).NotifyEvent to be
+	//		called on it before it gets moved to the readyList.
 	//	disabledList -- when the entry is disabled. This happens when
 	//		a one-shot entry gets delivered via readEvents().
-	listsMu      sync.Mutex `state:"nosave"`
+	listsMu      epollListMutex `state:"nosave"`
 	readyList    pollEntryList
 	waitingList  pollEntryList
 	disabledList pollEntryList
+
+	// readySeq is used to detect calls to pollEntry.NotifyEvent() while
+	// eventsAvailable() or ReadEvents() are running with listsMu unlocked.
+	// readySeq is protected by both mu and listsMu; reading requires either
+	// mutex to be locked, but mutation requires both mutexes to be locked.
+	readySeq uint32
 }
 
 // cycleMu is used to serialize all the cycle checks. This is only used when
@@ -183,9 +192,50 @@ func (*EventPoll) Write(context.Context, *fs.File, usermem.IOSequence, int64) (i
 
 // eventsAvailable determines if 'e' has events available for delivery.
 func (e *EventPoll) eventsAvailable() bool {
-	e.listsMu.Lock()
+	e.mu.Lock()
+	defer e.mu.Unlock()
 
-	for it := e.readyList.Front(); it != nil; {
+	// We can't call fs.File.Readiness() while holding e.listsMu due to lock
+	// ordering requirements. Instead, hold e.mu to prevent changes to the set
+	// of pollEntries, then temporarily move all pollEntries already on
+	// e.readyList to a local list that we can iterate without holding
+	// e.listsMu. pollEntry.curList is left set to &e.readyList so that
+	// pollEntry.NotifyEvent() doesn't touch pollEntryEntry.
+	var (
+		readyList   pollEntryList
+		waitingList pollEntryList
+	)
+	e.listsMu.Lock()
+	readyList.PushBackList(&e.readyList)
+	e.readySeq++
+	e.listsMu.Unlock()
+	if readyList.Empty() {
+		return false
+	}
+	defer func() {
+		notify := true
+		e.listsMu.Lock()
+		e.readyList.PushFrontList(&readyList)
+		var next *pollEntry
+		for entry := waitingList.Front(); entry != nil; entry = next {
+			next = entry.Next()
+			if entry.readySeq == e.readySeq {
+				// entry.NotifyEvent() was called while we were running.
+				waitingList.Remove(entry)
+				e.readyList.PushBack(entry)
+				notify = true
+			} else {
+				entry.curList = &e.waitingList
+			}
+		}
+		e.waitingList.PushBackList(&waitingList)
+		e.listsMu.Unlock()
+		if notify {
+			e.Notify(waiter.ReadableEvents)
+		}
+	}()
+
+	for it := readyList.Front(); it != nil; {
 		entry := it
 		it = it.Next()
 
@@ -193,17 +243,14 @@ func (e *EventPoll) eventsAvailable() bool {
 		// ready for delivery.
 		ready := entry.id.File.Readiness(entry.mask)
 		if ready != 0 {
-			e.listsMu.Unlock()
 			return true
 		}
 
-		// Entry is not ready, so move it to waiting list.
-		e.readyList.Remove(entry)
-		e.waitingList.PushBack(entry)
-		entry.curList = &e.waitingList
+		// Entry is not ready, so move it to waiting list. entry.curList will
+		// be updated with e.listsMu locked in the deferred function above.
+		readyList.Remove(entry)
+		waitingList.PushBack(entry)
 	}
-
-	e.listsMu.Unlock()
 
 	return false
 }
@@ -222,13 +269,59 @@ func (e *EventPoll) Readiness(mask waiter.EventMask) waiter.EventMask {
 
 // ReadEvents returns up to max available events.
 func (e *EventPoll) ReadEvents(max int) []linux.EpollEvent {
-	var local pollEntryList
-	var ret []linux.EpollEvent
+	e.mu.Lock()
+	defer e.mu.Unlock()
 
+	// We can't call fs.File.Readiness() while holding e.listsMu due to lock
+	// ordering requirements. Instead, hold e.mu to prevent changes to the set
+	// of pollEntries, then temporarily move all pollEntries already on
+	// e.readyList to a local list that we can iterate without holding
+	// e.listsMu. pollEntry.curList is left set to &e.readyList so that
+	// pollEntry.NotifyEvent() doesn't touch pollEntryEntry.
+	var (
+		readyList    pollEntryList
+		waitingList  pollEntryList
+		requeueList  pollEntryList
+		disabledList pollEntryList
+		ret          []linux.EpollEvent
+	)
 	e.listsMu.Lock()
+	readyList.PushBackList(&e.readyList)
+	e.readySeq++
+	e.listsMu.Unlock()
+	if readyList.Empty() {
+		return nil
+	}
+	defer func() {
+		notify := false
+		e.listsMu.Lock()
+		e.readyList.PushFrontList(&readyList)
+		var next *pollEntry
+		for entry := waitingList.Front(); entry != nil; entry = next {
+			next = entry.Next()
+			if entry.readySeq == e.readySeq {
+				// entry.NotifyEvent() was called while we were running.
+				waitingList.Remove(entry)
+				e.readyList.PushBack(entry)
+				notify = true
+			} else {
+				entry.curList = &e.waitingList
+			}
+		}
+		e.readyList.PushBackList(&requeueList)
+		e.waitingList.PushBackList(&waitingList)
+		for entry := disabledList.Front(); entry != nil; entry = entry.Next() {
+			entry.curList = &e.disabledList
+		}
+		e.disabledList.PushBackList(&disabledList)
+		e.listsMu.Unlock()
+		if notify {
+			e.Notify(waiter.ReadableEvents)
+		}
+	}()
 
 	// Go through all entries we believe may be ready.
-	for it := e.readyList.Front(); it != nil && len(ret) < max; {
+	for it := readyList.Front(); it != nil && len(ret) < max; {
 		entry := it
 		it = it.Next()
 
@@ -237,10 +330,8 @@ func (e *EventPoll) ReadEvents(max int) []linux.EpollEvent {
 		// entry.
 		ready := entry.id.File.Readiness(entry.mask) & entry.mask
 		if ready == 0 {
-			e.readyList.Remove(entry)
-			e.waitingList.PushBack(entry)
-			entry.curList = &e.waitingList
-
+			readyList.Remove(entry)
+			waitingList.PushBack(entry)
 			continue
 		}
 
@@ -256,33 +347,29 @@ func (e *EventPoll) ReadEvents(max int) []linux.EpollEvent {
 		// list so that its readiness can be checked the next time
 		// around; however, we must move it to the end of the list so
 		// that other events can be delivered as well.
-		e.readyList.Remove(entry)
+		readyList.Remove(entry)
 		if entry.flags&OneShot != 0 {
-			e.disabledList.PushBack(entry)
-			entry.curList = &e.disabledList
+			disabledList.PushBack(entry)
 		} else if entry.flags&EdgeTriggered != 0 {
-			e.waitingList.PushBack(entry)
-			entry.curList = &e.waitingList
+			waitingList.PushBack(entry)
 		} else {
-			local.PushBack(entry)
+			requeueList.PushBack(entry)
 		}
 	}
-
-	e.readyList.PushBackList(&local)
-
-	e.listsMu.Unlock()
 
 	return ret
 }
 
-// Callback implements waiter.EntryCallback.Callback.
+// NotifyEvent implements waiter.EventListener.NotifyEvent.
 //
-// Callback is called when one of the files we're polling becomes ready. It
+// NotifyEvent is called when one of the files we're polling becomes ready. It
 // moves said file to the readyList if it's currently in the waiting list.
-func (p *pollEntry) Callback(*waiter.Entry, waiter.EventMask) {
+func (p *pollEntry) NotifyEvent(waiter.EventMask) {
 	e := p.epoll
 
 	e.listsMu.Lock()
+
+	p.readySeq = e.readySeq
 
 	if p.curList == &e.waitingList {
 		e.waitingList.Remove(p)
@@ -309,11 +396,12 @@ func (e *EventPoll) initEntryReadiness(entry *pollEntry) {
 
 	// Register for event notifications.
 	f := entry.id.File
-	f.EventRegister(&entry.waiter, entry.mask)
+	entry.waiter.Init(entry, entry.mask)
+	f.EventRegister(&entry.waiter)
 
 	// Check if the file happens to already be in a ready state.
 	if ready := f.Readiness(entry.mask) & entry.mask; ready != 0 {
-		entry.Callback(&entry.waiter, ready)
+		entry.NotifyEvent(ready)
 	}
 }
 
@@ -385,7 +473,7 @@ func (e *EventPoll) AddEntry(id FileIdentifier, flags EntryFlags, mask waiter.Ev
 		flags:    flags,
 		mask:     mask,
 	}
-	entry.waiter.Callback = entry
+	entry.waiter.Init(entry, mask)
 	e.files[id] = entry
 	entry.file = refs.NewWeakRef(id.File, entry)
 
@@ -408,7 +496,8 @@ func (e *EventPoll) UpdateEntry(id FileIdentifier, flags EntryFlags, mask waiter
 	}
 
 	// Unregister the old mask and remove entry from the list it's in, so
-	// (*pollEntry).Callback is guaranteed to not be called on this entry anymore.
+	// (*pollEntry).NotifyEvent is guaranteed to not be called on this
+	// entry anymore.
 	entry.id.File.EventUnregister(&entry.waiter)
 
 	// Remove entry from whatever list it's in. This ensure that no other
@@ -455,13 +544,8 @@ func (e *EventPoll) RemoveEntry(ctx context.Context, id FileIdentifier) error {
 	return nil
 }
 
-// UnregisterEpollWaiters removes the epoll waiter objects from the waiting
-// queues. This is different from Release() as the file is not dereferenced.
-func (e *EventPoll) UnregisterEpollWaiters() {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
-	for _, entry := range e.files {
-		entry.id.File.EventUnregister(&entry.waiter)
-	}
+// EventRegister implements waiter.Waitable.
+func (e *EventPoll) EventRegister(entry *waiter.Entry) error {
+	e.Queue.EventRegister(entry)
+	return nil
 }

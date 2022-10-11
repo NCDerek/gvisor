@@ -112,8 +112,8 @@ class SocketPair {
 // descriptors.
 class FDSocketPair : public SocketPair {
  public:
-  FDSocketPair(int first_fd, int second_fd)
-      : first_(first_fd), second_(second_fd) {}
+  FDSocketPair(FileDescriptor first_fd, FileDescriptor second_fd)
+      : first_(std::move(first_fd)), second_(std::move(second_fd)) {}
   FDSocketPair(std::unique_ptr<FileDescriptor> first_fd,
                std::unique_ptr<FileDescriptor> second_fd)
       : first_(first_fd->release()), second_(second_fd->release()) {}
@@ -142,11 +142,11 @@ size_t CalculateUnixSockAddrLen(const char* sun_path);
 // descriptors in addition to a pair of socket addresses.
 class AddrFDSocketPair : public SocketPair {
  public:
-  AddrFDSocketPair(int first_fd, int second_fd,
+  AddrFDSocketPair(FileDescriptor first_fd, FileDescriptor second_fd,
                    const struct sockaddr_un& first_address,
                    const struct sockaddr_un& second_address)
-      : first_(first_fd),
-        second_(second_fd),
+      : first_(std::move(first_fd)),
+        second_(std::move(second_fd)),
         first_addr_(to_storage(first_address)),
         second_addr_(to_storage(second_address)),
         first_len_(CalculateUnixSockAddrLen(first_address.sun_path)),
@@ -154,11 +154,11 @@ class AddrFDSocketPair : public SocketPair {
         first_size_(sizeof(first_address)),
         second_size_(sizeof(second_address)) {}
 
-  AddrFDSocketPair(int first_fd, int second_fd,
+  AddrFDSocketPair(FileDescriptor first_fd, FileDescriptor second_fd,
                    const struct sockaddr_in& first_address,
                    const struct sockaddr_in& second_address)
-      : first_(first_fd),
-        second_(second_fd),
+      : first_(std::move(first_fd)),
+        second_(std::move(second_fd)),
         first_addr_(to_storage(first_address)),
         second_addr_(to_storage(second_address)),
         first_len_(sizeof(first_address)),
@@ -166,11 +166,11 @@ class AddrFDSocketPair : public SocketPair {
         first_size_(sizeof(first_address)),
         second_size_(sizeof(second_address)) {}
 
-  AddrFDSocketPair(int first_fd, int second_fd,
+  AddrFDSocketPair(FileDescriptor first_fd, FileDescriptor second_fd,
                    const struct sockaddr_in6& first_address,
                    const struct sockaddr_in6& second_address)
-      : first_(first_fd),
-        second_(second_fd),
+      : first_(std::move(first_fd)),
+        second_(std::move(second_fd)),
         first_addr_(to_storage(first_address)),
         second_addr_(to_storage(second_address)),
         first_len_(sizeof(first_address)),
@@ -554,14 +554,26 @@ uint16_t ICMPChecksum(struct icmphdr icmphdr, const char* payload,
 inline sockaddr* AsSockAddr(sockaddr_storage* s) {
   return reinterpret_cast<sockaddr*>(s);
 }
+inline const sockaddr* AsSockAddr(const sockaddr_storage* s) {
+  return reinterpret_cast<const sockaddr*>(s);
+}
 inline sockaddr* AsSockAddr(sockaddr_in* s) {
   return reinterpret_cast<sockaddr*>(s);
+}
+inline const sockaddr* AsSockAddr(const sockaddr_in* s) {
+  return reinterpret_cast<const sockaddr*>(s);
 }
 inline sockaddr* AsSockAddr(sockaddr_in6* s) {
   return reinterpret_cast<sockaddr*>(s);
 }
+inline const sockaddr* AsSockAddr(const sockaddr_in6* s) {
+  return reinterpret_cast<const sockaddr*>(s);
+}
 inline sockaddr* AsSockAddr(sockaddr_un* s) {
   return reinterpret_cast<sockaddr*>(s);
+}
+inline const sockaddr* AsSockAddr(const sockaddr_un* s) {
+  return reinterpret_cast<const sockaddr*>(s);
 }
 
 PosixErrorOr<uint16_t> AddrPort(int family, sockaddr_storage const& addr);
@@ -579,6 +591,10 @@ void SetupTimeWaitClose(const TestAddress* listener,
 // MaybeLimitEphemeralPorts attempts to reduce the number of ephemeral ports and
 // returns the number of ephemeral ports.
 PosixErrorOr<int> MaybeLimitEphemeralPorts();
+
+// AllowMartianPacketsOnLoopback tells the kernel to not drop martian packets,
+// and returns a function to restore the original configuration.
+PosixErrorOr<std::function<PosixError()>> AllowMartianPacketsOnLoopback();
 
 namespace internal {
 PosixErrorOr<int> TryPortAvailable(int port, AddressFamily family,

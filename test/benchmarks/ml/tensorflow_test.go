@@ -4,7 +4,7 @@
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+//	http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -49,7 +49,7 @@ func BenchmarkTensorflow(b *testing.B) {
 			Value: name,
 		})
 		if err != nil {
-			b.Fatalf("Faile to parse param: %v", err)
+			b.Fatalf("Failed to parse param: %v", err)
 		}
 
 		b.Run(runName, func(b *testing.B) {
@@ -72,7 +72,7 @@ func BenchmarkTensorflow(b *testing.B) {
 					Env:     []string{"PYTHONPATH=$PYTHONPATH:/TensorFlow-Examples/examples"},
 					WorkDir: "/TensorFlow-Examples/examples",
 				}, "python", workload); err != nil {
-					b.Fatalf("failed to run container: %v logs: %s", err, out)
+					b.Errorf("failed to run container: %v logs: %s", err, out)
 				}
 				b.StopTimer()
 			}

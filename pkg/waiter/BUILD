@@ -22,7 +22,9 @@ go_library(
         "waiter_list.go",
     ],
     visibility = ["//visibility:public"],
-    deps = ["//pkg/sync"],
+    deps = [
+        "//pkg/sync",
+    ],
 )
 
 go_test(
@@ -32,4 +34,5 @@ go_test(
         "waiter_test.go",
     ],
     library = ":waiter",
+    deps = ["//pkg/atomicbitops"],
 )
