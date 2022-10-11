@@ -255,7 +255,9 @@ func (e *endpoint) handleICMP(pkt stack.PacketBufferPtr) {
 		localAddressBroadcast := pkt.NetworkPacketInfo.LocalAddressBroadcast
 
 		// It's possible that a raw socket expects to receive this.
-		e.dispatcher.DeliverTransportPacket(header.ICMPv4ProtocolNumber, pkt)
+		if res := e.dispatcher.DeliverTransportPacket(header.ICMPv4ProtocolNumber, pkt); res == stack.TransportPacketHandled {
+			return
+		}
 		pkt = nil
 
 		sent := e.stats.icmp.packetsSent

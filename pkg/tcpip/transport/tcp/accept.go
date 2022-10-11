@@ -278,7 +278,7 @@ func (l *listenContext) startHandshake(s *segment, opts header.TCPSynOptions, qu
 		ep.TransportEndpointInfo.ID,
 		ep,
 		ep.boundPortFlags,
-		ep.boundBindToDevice,
+		ep.boundNICID,
 	); err != nil {
 		ep.mu.Unlock()
 		ep.Close()
