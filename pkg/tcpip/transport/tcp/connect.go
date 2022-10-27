@@ -1073,7 +1073,7 @@ func (e *endpoint) tryDeliverSegmentFromClosedEndpoint(s *segment) {
 			s.pkt.NICID,
 		)
 	}
-	if ep == nil || ep == e {
+	if ep == nil {
 		if !s.flags.Contains(header.TCPFlagRst) {
 			replyWithReset(e.stack, s, stack.DefaultTOS, tcpip.UseDefaultIPv4TTL, tcpip.UseDefaultIPv6HopLimit)
 		}

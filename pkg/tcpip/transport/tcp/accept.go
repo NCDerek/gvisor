@@ -271,6 +271,7 @@ func (l *listenContext) startHandshake(s *segment, opts header.TCPSynOptions, qu
 		deferAccept = l.listenEP.deferAccept
 	}
 
+	ep.boundBindToDevice = ep.BindNICID
 	// Register new endpoint so that packets are routed to it.
 	if err := ep.stack.RegisterTransportEndpoint(
 		ep.effectiveNetProtos,
@@ -278,7 +279,7 @@ func (l *listenContext) startHandshake(s *segment, opts header.TCPSynOptions, qu
 		ep.TransportEndpointInfo.ID,
 		ep,
 		ep.boundPortFlags,
-		ep.boundNICID,
+		ep.boundBindToDevice,
 	); err != nil {
 		ep.mu.Unlock()
 		ep.Close()
